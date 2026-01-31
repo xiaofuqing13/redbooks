@@ -663,7 +663,7 @@ class CrawlerApp:
         row1.pack(fill=tk.X, pady=2)
         
         ttk.Label(row1, text="搜索关键词:").pack(side=tk.LEFT)
-        self.keyword_var = tk.StringVar()
+        self.keyword_var = tk.StringVar(value="鞋子")
         self.keyword_entry = ttk.Entry(row1, textvariable=self.keyword_var, width=40)
         self.keyword_entry.pack(side=tk.LEFT, padx=5)
         
