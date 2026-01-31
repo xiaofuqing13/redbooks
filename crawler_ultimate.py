@@ -1311,6 +1311,23 @@ class CrawlerApp:
                     page.get(search_url)
                     time.sleep(1.5)
                     
+                    # 再次检查登录状态（搜索页可能弹出登录框）
+                    if not self._check_login(page):
+                        self.log("搜索页需要登录", "WARNING")
+                        # 尝试关闭登录弹窗
+                        try:
+                            close_btn = page.ele('css:.close-icon, [class*="close"]', timeout=0.5)
+                            if close_btn:
+                                close_btn.click()
+                                time.sleep(0.3)
+                        except Exception:
+                            pass
+                        # 如果还是没登录，等待用户登录
+                        if not self._check_login(page):
+                            self._wait_for_login(page)
+                            page.get(search_url)
+                            time.sleep(1.5)
+                    
                     # 智能滚动加载
                     prev_count = 0
                     for i in range(self.config.scroll_times):
@@ -1427,33 +1444,46 @@ class CrawlerApp:
             self.root.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
     
     def _check_login(self, page) -> bool:
-        """检查是否已登录（改进版）"""
+        """检查是否已登录（基于实际DOM结构）"""
         try:
-            # 方法1：检查是否有用户头像（已登录标志）
-            avatar = page.ele('xpath://img[contains(@class, "avatar") or contains(@class, "user")]', timeout=0.5)
+            # 方法1：检查侧边栏"我"是否有用户主页链接（最可靠）
+            # 已登录: <a href="/user/profile/xxxx">
+            user_profile = page.ele('css:a[href*="/user/profile/"]', timeout=0.5)
+            if user_profile:
+                return True
+            
+            # 方法2：检查侧边栏是否有用户头像
+            # 已登录时有 .reds-avatar 或 .side-bar img
+            avatar = page.ele('css:.side-bar .reds-avatar, .side-bar img[src*="avatar"]', timeout=0.3)
             if avatar:
                 return True
             
-            # 方法2：检查是否有"我"或用户相关的导航项
-            user_nav = page.ele('xpath://a[contains(@href, "/user/") or contains(text(), "我")]', timeout=0.5)
-            if user_nav:
-                return True
-            
-            # 方法3：检查是否有明确的登录按钮（未登录标志）
-            login_btn = page.ele('xpath://button[contains(text(), "登录")] | //span[text()="登录"]', timeout=0.5)
+            # 方法3：检查是否有红色登录按钮（未登录标志）
+            login_btn = page.ele('css:.login-btn, button.login-btn', timeout=0.3)
             if login_btn:
                 return False
             
-            # 方法4：检查登录弹窗（更精确的选择器）
-            login_modal = page.ele('xpath://div[contains(@class, "login-modal") or contains(@class, "login-container")]', timeout=0.5)
+            # 方法4：检查登录弹窗（包含二维码的弹窗）
+            login_modal = page.ele('xpath://div[contains(@class, "qrcode") or contains(text(), "扫码登录") or contains(text(), "手机号登录")]', timeout=0.3)
             if login_modal:
                 return False
             
-            # 默认认为已登录（避免误判）
+            # 方法5：检查侧边栏文本，已登录有"我"但没有"登录"
+            try:
+                sidebar = page.ele('css:.side-bar', timeout=0.2)
+                if sidebar:
+                    text = sidebar.text or ""
+                    if "登录" in text and "我" not in text:
+                        return False
+                    if "我" in text:
+                        return True
+            except Exception:
+                pass
+            
+            # 默认认为已登录（避免误判导致弹窗）
             return True
             
         except Exception:
-            # 出错时默认认为已登录，让用户自己判断
             return True
     
     def _wait_for_login(self, page):
