@@ -1481,60 +1481,121 @@ class CrawlerApp:
             raise InterruptedError("用户取消")
     
     def _standard_crawl(self, page, note_elements, keyword: str, start_time: float) -> Tuple[int, int, int]:
-        """标准模式爬取（优化版，增强页面状态检查）"""
+        """标准模式爬取（按顺序爬取，先收集链接再逐个访问）"""
         success = 0
         images = 0
         videos = 0
-        total = len(note_elements)
         images_dir = f"images/{keyword}"
         timestamp = int(time.time())
-        consecutive_fails = 0
-        MAX_CONSECUTIVE_FAILS = 3
         
         # 保存搜索页URL用于恢复
         keyword_code = quote(quote(keyword.encode('utf-8')).encode('gb2312'))
         search_url = f'https://www.xiaohongshu.com/search_result?keyword={keyword_code}&source=web_search_result_notes'
         
+        # 第一步：收集所有笔记链接（确保按顺序）
+        self.log("正在收集笔记链接...", "INFO")
+        note_links = []
+        elements = page.eles("xpath://section", timeout=2)
+        
+        for idx, elem in enumerate(elements[:self.config.max_notes]):
+            if self.should_stop:
+                break
+            try:
+                # 尝试获取笔记链接
+                link_elem = elem.ele('xpath:.//a[contains(@href, "/explore/") or contains(@href, "/search_result/")]', timeout=0.3)
+                if link_elem:
+                    href = link_elem.attr('href') or ""
+                    if '/explore/' in href:
+                        full_url = 'https://www.xiaohongshu.com' + href if href.startswith('/') else href
+                        note_links.append((idx + 1, full_url))
+            except Exception:
+                pass
+        
+        # 如果没有收集到链接，使用点击方式
+        if not note_links:
+            self.log("未收集到链接，使用点击方式", "WARNING")
+            return self._standard_crawl_by_click(page, elements, keyword, start_time, search_url, images_dir, timestamp)
+        
+        self.log(f"收集到 {len(note_links)} 个笔记链接", "SUCCESS")
+        total = len(note_links)
+        
+        # 第二步：按顺序访问每个笔记
+        for i, (note_idx, note_url) in enumerate(note_links):
+            if self.should_stop:
+                break
+            
+            elapsed = int(time.time() - start_time)
+            progress = ((i + 1) / total) * 100
+            self._update_ui(
+                status=f"爬取 {i+1}/{total}",
+                notes=f"笔记: {success}",
+                images=f"图片: {images}",
+                videos=f"视频: {videos}",
+                time=f"用时: {elapsed}秒",
+                progress=progress
+            )
+            
+            try:
+                # 直接访问笔记页面
+                page.get(note_url)
+                time.sleep(random.uniform(*self.config.click_delay) + 0.3)
+                
+                # 提取数据
+                note_data = self._extract_full_note(page, note_idx, images_dir, timestamp, keyword)
+                
+                if note_data and note_data.get('title'):
+                    self.all_notes_data.append(note_data)
+                    success += 1
+                    images += note_data.get('image_count', 0)
+                    videos += 1 if note_data.get('video_url') else 0
+                    
+                    # 保存到数据库
+                    if self.config.export_to_db:
+                        self.db_mgr.insert_note(note_data)
+                    
+                    # 显示简短日志
+                    title = note_data.get('title', '')[:25]
+                    likes = note_data.get('like_count', 0)
+                    self.log(f"[{note_idx}] {title}... 👍{likes}", "SUCCESS")
+                else:
+                    self.log(f"[{note_idx}] 数据提取失败", "WARNING")
+                
+            except Exception as e:
+                error_msg = str(e)[:50] if str(e) else "未知错误"
+                self.log(f"笔记 {note_idx} 失败: {error_msg}", "ERROR")
+        
+        return success, images, videos
+    
+    def _standard_crawl_by_click(self, page, elements, keyword: str, start_time: float, 
+                                  search_url: str, images_dir: str, timestamp: int) -> Tuple[int, int, int]:
+        """备用方法：通过点击方式按顺序爬取"""
+        success = 0
+        images = 0
+        videos = 0
+        total = min(len(elements), self.config.max_notes)
+        consecutive_fails = 0
+        MAX_CONSECUTIVE_FAILS = 3
+        
         for idx in range(total):
             if self.should_stop:
                 break
             
-            # 检查是否还在小红书页面
-            current_url = page.url or ""
-            if 'xiaohongshu.com' not in current_url:
-                self.log("检测到页面跳转，正在恢复...", "WARNING")
+            # 连续失败检查
+            if consecutive_fails >= MAX_CONSECUTIVE_FAILS:
+                self.log("连续失败，重新加载页面", "WARNING")
                 try:
                     page.get(search_url)
                     time.sleep(2)
-                    # 重新滚动加载
                     for _ in range(3):
                         page.scroll.to_bottom()
                         time.sleep(0.5)
-                except Exception as e:
-                    self.log(f"恢复失败: {e}", "ERROR")
-                    break
-            
-            # 连续失败检查 - 改进恢复逻辑
-            if consecutive_fails >= MAX_CONSECUTIVE_FAILS:
-                self.log(f"连续{MAX_CONSECUTIVE_FAILS}次失败，重新加载页面", "WARNING")
-                try:
-                    # 先尝试关闭可能的弹窗
-                    page.actions.key_down('Escape').key_up('Escape')
-                    time.sleep(0.3)
-                    
-                    # 检查是否需要重新加载搜索页
-                    if 'search_result' not in (page.url or ""):
-                        page.get(search_url)
-                        time.sleep(2)
-                        for _ in range(3):
-                            page.scroll.to_bottom()
-                            time.sleep(0.5)
+                    elements = page.eles("xpath://section", timeout=2)
                 except Exception:
-                    pass
+                    break
                 consecutive_fails = 0
             
             elapsed = int(time.time() - start_time)
-            progress = (idx / total) * 100
+            progress = ((idx + 1) / total) * 100
             self._update_ui(
                 status=f"爬取 {idx+1}/{total}",
                 notes=f"笔记: {success}",
@@ -1545,36 +1606,23 @@ class CrawlerApp:
             )
             
             try:
-                # 确保在搜索结果页
-                if 'search_result' not in (page.url or ""):
-                    self.log("不在搜索页，跳过", "WARNING")
+                # 确保在搜索页
+                if 'xiaohongshu.com' not in (page.url or ""):
+                    page.get(search_url)
+                    time.sleep(2)
+                    elements = page.eles("xpath://section", timeout=2)
+                
+                if idx >= len(elements):
+                    self.log(f"笔记 {idx+1} 不存在", "WARNING")
                     consecutive_fails += 1
                     continue
                 
-                # 重新获取元素列表（页面可能有变化）
-                elements = page.eles("xpath://section", timeout=1)
-                if not elements or idx >= len(elements):
-                    self.log(f"笔记 {idx+1} 不存在，跳过", "WARNING")
-                    consecutive_fails += 1
-                    continue
-                
-                # 滚动到可见并点击
                 elem = elements[idx]
                 elem.scroll.to_see()
                 time.sleep(0.05)
-                
-                # 记录点击前的URL
-                url_before = page.url
                 elem.click()
                 time.sleep(random.uniform(*self.config.click_delay))
                 
-                # 检查点击后是否打开了详情弹窗（URL应该变成/explore/xxx）
-                url_after = page.url or ""
-                if '/explore/' not in url_after and url_after == url_before:
-                    # 弹窗可能没打开，等待一下
-                    time.sleep(0.3)
-                
-                # 提取数据
                 note_data = self._extract_full_note(page, idx, images_dir, timestamp, keyword)
                 
                 if note_data and note_data.get('title'):
@@ -1584,37 +1632,31 @@ class CrawlerApp:
                     videos += 1 if note_data.get('video_url') else 0
                     consecutive_fails = 0
                     
-                    # 保存到数据库
                     if self.config.export_to_db:
                         self.db_mgr.insert_note(note_data)
                     
-                    # 显示简短日志
                     title = note_data.get('title', '')[:25]
                     likes = note_data.get('like_count', 0)
                     self.log(f"[{idx+1}] {title}... 👍{likes}", "SUCCESS")
                 else:
                     consecutive_fails += 1
                 
-                # 关闭详情页 - 多次尝试确保关闭
-                for _ in range(2):
-                    try:
-                        page.actions.key_down('Escape').key_up('Escape')
-                        time.sleep(0.1)
-                        # 检查是否回到搜索页
-                        if 'search_result' in (page.url or ""):
-                            break
-                    except Exception:
-                        pass
+                # 返回搜索页
+                page.get(search_url)
+                time.sleep(1)
+                # 滚动到之前的位置
+                for _ in range(min(idx // 3 + 1, 5)):
+                    page.scroll.to_bottom()
+                    time.sleep(0.3)
+                elements = page.eles("xpath://section", timeout=2)
                 
             except Exception as e:
                 consecutive_fails += 1
-                error_msg = str(e)[:50] if str(e) else "未知错误"
-                self.log(f"笔记 {idx+1} 失败: {error_msg}", "ERROR")
-                
-                # 尝试恢复
+                self.log(f"笔记 {idx+1} 失败: {str(e)[:50]}", "ERROR")
                 try:
-                    page.actions.key_down('Escape').key_up('Escape')
-                    time.sleep(0.2)
+                    page.get(search_url)
+                    time.sleep(1)
+                    elements = page.eles("xpath://section", timeout=2)
                 except Exception:
                     pass
         
