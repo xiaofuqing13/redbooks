@@ -66,15 +66,15 @@ class CrawlerConfig:
     retry_times: int = 2
     save_interval: int = 10
     
-    # 爬取内容选项
+    # 爬取内容选项（默认全部开启）
     download_images: bool = True
-    download_videos: bool = False
-    get_all_images: bool = False
+    download_videos: bool = True
+    get_all_images: bool = True
     get_content: bool = True
     get_tags: bool = True
     get_publish_time: bool = True
-    get_comments: bool = False
-    comments_count: int = 10
+    get_comments: bool = True
+    comments_count: int = 20
     get_interactions: bool = True
     
     # 爬取模式
@@ -90,7 +90,7 @@ class CrawlerConfig:
     
     # 导出选项
     export_format: str = "xlsx"
-    export_to_db: bool = False
+    export_to_db: bool = True
     db_path: str = "data/redbook.db"
     
     # 速度控制（元组默认值需要用field）
@@ -837,10 +837,10 @@ class CrawlerApp:
         self.download_images_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row3, text="🖼️ 下载图片", variable=self.download_images_var).pack(side=tk.LEFT, padx=(0, 20))
         
-        self.get_all_images_var = tk.BooleanVar(value=False)
+        self.get_all_images_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row3, text="📸 获取全部图片（切换轮播）", variable=self.get_all_images_var).pack(side=tk.LEFT, padx=(0, 20))
         
-        self.download_videos_var = tk.BooleanVar(value=False)
+        self.download_videos_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row3, text="🎬 下载视频", variable=self.download_videos_var).pack(side=tk.LEFT)
         
         # === 评论 ===
@@ -850,7 +850,7 @@ class CrawlerApp:
         row4 = ttk.Frame(comment_frame)
         row4.pack(fill=tk.X, pady=2)
         
-        self.get_comments_var = tk.BooleanVar(value=False)
+        self.get_comments_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row4, text="💬 获取热门评论", variable=self.get_comments_var).pack(side=tk.LEFT, padx=(0, 20))
         
         ttk.Label(row4, text="评论数量:").pack(side=tk.LEFT)
@@ -869,7 +869,7 @@ class CrawlerApp:
         ttk.Combobox(row5, textvariable=self.export_format_var,
                     values=["xlsx", "csv", "json"], width=10, state="readonly").pack(side=tk.LEFT, padx=(5, 20))
         
-        self.export_db_var = tk.BooleanVar(value=False)
+        self.export_db_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row5, text="💾 同时保存到SQLite数据库", variable=self.export_db_var).pack(side=tk.LEFT)
         
         # === 快捷预设 ===
