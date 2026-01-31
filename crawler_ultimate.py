@@ -28,7 +28,7 @@ import requests
 from DrissionPage import ChromiumPage
 
 # 版本信息
-VERSION = "5.0"
+VERSION = "5.1"
 APP_NAME = f"小红书爬虫终极版 v{VERSION}"
 
 # 可选依赖
@@ -1444,38 +1444,52 @@ class CrawlerApp:
             self.root.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
     
     def _check_login(self, page) -> bool:
-        """检查是否已登录（基于实际DOM结构）"""
+        """检查是否已登录（基于浏览器自动化分析的实际DOM结构）"""
         try:
-            # 方法1：检查侧边栏"我"是否有用户主页链接（最可靠）
-            # 已登录: <a href="/user/profile/xxxx">
-            user_profile = page.ele('css:a[href*="/user/profile/"]', timeout=0.5)
+            # 方法1：检查侧边栏"我"区域是否有用户主页链接（最可靠）
+            # 已登录时有: .user.side-bar-component a[href="/user/profile/xxxxx"]
+            user_profile = page.ele('css:.user.side-bar-component a[href*="/user/profile/"]', timeout=0.5)
             if user_profile:
                 return True
             
-            # 方法2：检查侧边栏是否有用户头像
-            # 已登录时有 .reds-avatar 或 .side-bar img
-            avatar = page.ele('css:.side-bar .reds-avatar, .side-bar img[src*="avatar"]', timeout=0.3)
+            # 方法2：备用 - 检查任意位置的用户主页链接
+            user_profile2 = page.ele('css:a[href*="/user/profile/"]', timeout=0.3)
+            if user_profile2:
+                return True
+            
+            # 方法3：检查侧边栏是否有用户头像 (.reds-avatar)
+            avatar = page.ele('css:.side-bar .reds-avatar, .reds-avatar img[src*="avatar"]', timeout=0.3)
             if avatar:
                 return True
             
-            # 方法3：检查是否有红色登录按钮（未登录标志）
-            login_btn = page.ele('css:.login-btn, button.login-btn', timeout=0.3)
+            # 方法4：检查是否有登录按钮（未登录标志）
+            login_btn = page.ele('css:.login-btn, button.login-btn, .side-bar .login-btn', timeout=0.3)
             if login_btn:
                 return False
             
-            # 方法4：检查登录弹窗（包含二维码的弹窗）
-            login_modal = page.ele('xpath://div[contains(@class, "qrcode") or contains(text(), "扫码登录") or contains(text(), "手机号登录")]', timeout=0.3)
+            # 方法5：检查登录弹窗（二维码或手机号登录界面）
+            login_modal = page.ele('xpath://div[contains(text(), "扫码登录") or contains(text(), "手机号登录") or contains(text(), "登录后查看")]', timeout=0.3)
             if login_modal:
                 return False
             
-            # 方法5：检查侧边栏文本，已登录有"我"但没有"登录"
+            # 方法6：检查关闭按钮旁边是否有登录相关内容
+            close_icon = page.ele('css:.close-icon', timeout=0.2)
+            if close_icon:
+                # 有关闭按钮可能是登录弹窗
+                qrcode = page.ele('xpath://img[contains(@src, "qrcode") or contains(@class, "qrcode")]', timeout=0.2)
+                if qrcode:
+                    return False
+            
+            # 方法7：检查侧边栏文本
             try:
                 sidebar = page.ele('css:.side-bar', timeout=0.2)
                 if sidebar:
                     text = sidebar.text or ""
+                    # 未登录时侧边栏只有"登录"按钮，没有"我"
                     if "登录" in text and "我" not in text:
                         return False
-                    if "我" in text:
+                    # 已登录时有"发现、发布、通知、我"
+                    if "发现" in text and "我" in text:
                         return True
             except Exception:
                 pass
@@ -1935,61 +1949,85 @@ class CrawlerApp:
             self.log(f"提取数据失败: {e}", "ERROR")
             return None
     
-    def _extract_comments(self, page) -> List[str]:
-        """提取评论内容（基于实际页面结构）"""
+    def _extract_comments(self, page) -> List[Dict]:
+        """提取评论内容（基于浏览器自动化分析的实际DOM结构）
+        返回包含评论者、内容、时间的字典列表
+        """
         comments = []
         max_count = self.config.comments_count
         
-        # 实际的评论选择器（从浏览器分析得到）
-        comment_selectors = [
-            'css:.comment-item .content',           # 评论内容
-            'css:.parent-comment .content',         # 父评论内容
-            'css:.comment-inner-container .content',
-            'xpath://div[contains(@class, "comment-item")]//div[@class="content"]',
-        ]
-        
         # 排除词列表
-        exclude_words = {'关注', '点赞', '收藏', '分享', '复制', '举报', '回复', '查看', '展开', '赞', '条评论', '说点什么'}
+        exclude_words = {'关注', '点赞', '收藏', '分享', '复制', '举报', '回复', '查看', '展开', '赞', '条评论', '说点什么', '取消', '发送'}
         
-        for selector in comment_selectors:
-            if len(comments) >= max_count:
-                break
-            try:
-                elements = page.eles(selector, timeout=0.3)
-                for elem in elements:
-                    if len(comments) >= max_count:
-                        break
-                    text = (elem.text or "").strip()
-                    # 智能过滤
-                    if (3 < len(text) < 500 and 
-                        text not in comments and
-                        not any(w == text for w in exclude_words) and
-                        not text.isdigit()):
-                        comments.append(text)
-            except Exception:
-                continue
-        
-        # 如果还没有足够的评论，尝试滚动评论区
-        if len(comments) < max_count:
-            try:
-                # 滚动评论区加载更多
-                comments_container = page.ele('css:.comments-container, .comments-el', timeout=0.3)
-                if comments_container:
-                    comments_container.scroll.to_bottom()
-                    time.sleep(0.3)
+        try:
+            # 获取所有评论项
+            comment_items = page.eles('css:.comment-item', timeout=0.5)
+            
+            for item in comment_items:
+                if len(comments) >= max_count:
+                    break
                     
-                    # 再次获取评论
-                    elements = page.eles('css:.comment-item .content', timeout=0.3)
-                    for elem in elements:
-                        if len(comments) >= max_count:
-                            break
-                        text = (elem.text or "").strip()
-                        if (3 < len(text) < 500 and 
-                            text not in comments and
-                            not any(w == text for w in exclude_words)):
-                            comments.append(text)
-            except Exception:
-                pass
+                try:
+                    # 获取评论者名字
+                    name_el = item.ele('css:.name', timeout=0.1)
+                    name = (name_el.text if name_el else "").strip()
+                    
+                    # 获取评论内容
+                    content_el = item.ele('css:.content', timeout=0.1)
+                    content = (content_el.text if content_el else "").strip()
+                    
+                    # 获取时间和地区
+                    time_el = item.ele('css:.time, .date', timeout=0.1)
+                    time_text = (time_el.text if time_el else "").strip()
+                    
+                    # 过滤无效评论
+                    if (content and 
+                        3 < len(content) < 500 and 
+                        content not in [c.get('content', '') for c in comments] and
+                        not any(w == content for w in exclude_words) and
+                        not content.isdigit()):
+                        
+                        comments.append({
+                            'author': name,
+                            'content': content,
+                            'time': time_text
+                        })
+                except Exception:
+                    continue
+            
+            # 如果还没有足够的评论，尝试滚动评论区加载更多
+            if len(comments) < max_count:
+                try:
+                    comments_container = page.ele('css:.comments-container, .comments-el, .note-scroller', timeout=0.3)
+                    if comments_container:
+                        comments_container.scroll.to_bottom()
+                        time.sleep(0.3)
+                        
+                        # 再次获取新加载的评论
+                        new_items = page.eles('css:.comment-item', timeout=0.3)
+                        for item in new_items[len(comments):]:
+                            if len(comments) >= max_count:
+                                break
+                            try:
+                                name_el = item.ele('css:.name', timeout=0.1)
+                                content_el = item.ele('css:.content', timeout=0.1)
+                                time_el = item.ele('css:.time, .date', timeout=0.1)
+                                
+                                content = (content_el.text if content_el else "").strip()
+                                if (content and 3 < len(content) < 500 and
+                                    content not in [c.get('content', '') for c in comments]):
+                                    comments.append({
+                                        'author': (name_el.text if name_el else "").strip(),
+                                        'content': content,
+                                        'time': (time_el.text if time_el else "").strip()
+                                    })
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+                    
+        except Exception:
+            pass
         
         return comments
     
@@ -2012,8 +2050,46 @@ class CrawlerApp:
         os.makedirs("data", exist_ok=True)
         timestamp = int(time.time())
         
+        # 预处理数据 - 将复杂类型转换为字符串
+        processed_data = []
+        for item in data:
+            processed_item = item.copy()
+            
+            # 处理评论 - 将字典列表转为可读字符串
+            if 'comments' in processed_item and isinstance(processed_item['comments'], list):
+                comments = processed_item['comments']
+                if comments and isinstance(comments[0], dict):
+                    # 格式: "用户名: 评论内容 (时间)"
+                    comment_strs = []
+                    for c in comments:
+                        author = c.get('author', '')
+                        content = c.get('content', '')
+                        time_str = c.get('time', '')
+                        if content:
+                            if author:
+                                comment_strs.append(f"{author}: {content}")
+                            else:
+                                comment_strs.append(content)
+                    processed_item['comments'] = ' | '.join(comment_strs)
+                else:
+                    processed_item['comments'] = ' | '.join(str(c) for c in comments)
+            
+            # 处理标签列表
+            if 'tags' in processed_item and isinstance(processed_item['tags'], list):
+                processed_item['tags'] = ', '.join(processed_item['tags'])
+            
+            # 处理图片URL列表
+            if 'image_urls' in processed_item and isinstance(processed_item['image_urls'], list):
+                processed_item['image_urls'] = ' | '.join(processed_item['image_urls'])
+            
+            # 处理本地图片路径列表
+            if 'local_images' in processed_item and isinstance(processed_item['local_images'], list):
+                processed_item['local_images'] = ' | '.join(processed_item['local_images'])
+            
+            processed_data.append(processed_item)
+        
         # 转换为DataFrame
-        df = pd.DataFrame(data)
+        df = pd.DataFrame(processed_data)
         
         ext = self.config.export_format
         filename = f"data/搜索结果_{keyword}_{timestamp}.{ext}"
@@ -2023,7 +2099,9 @@ class CrawlerApp:
         elif ext == "csv":
             df.to_csv(filename, index=False, encoding='utf-8-sig')
         elif ext == "json":
-            df.to_json(filename, orient='records', force_ascii=False, indent=2)
+            # JSON格式保留原始结构
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
         
         return filename
     
