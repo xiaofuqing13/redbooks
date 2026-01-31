@@ -1426,13 +1426,34 @@ class CrawlerApp:
             self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
     
-    def _check_login(self, page):
-        """检查是否已登录"""
+    def _check_login(self, page) -> bool:
+        """检查是否已登录（改进版）"""
         try:
-            # 检查是否有登录弹窗
-            login_popup = page.ele('xpath://div[contains(@class, "login")]', timeout=1)
-            return login_popup is None
-        except:
+            # 方法1：检查是否有用户头像（已登录标志）
+            avatar = page.ele('xpath://img[contains(@class, "avatar") or contains(@class, "user")]', timeout=0.5)
+            if avatar:
+                return True
+            
+            # 方法2：检查是否有"我"或用户相关的导航项
+            user_nav = page.ele('xpath://a[contains(@href, "/user/") or contains(text(), "我")]', timeout=0.5)
+            if user_nav:
+                return True
+            
+            # 方法3：检查是否有明确的登录按钮（未登录标志）
+            login_btn = page.ele('xpath://button[contains(text(), "登录")] | //span[text()="登录"]', timeout=0.5)
+            if login_btn:
+                return False
+            
+            # 方法4：检查登录弹窗（更精确的选择器）
+            login_modal = page.ele('xpath://div[contains(@class, "login-modal") or contains(@class, "login-container")]', timeout=0.5)
+            if login_modal:
+                return False
+            
+            # 默认认为已登录（避免误判）
+            return True
+            
+        except Exception:
+            # 出错时默认认为已登录，让用户自己判断
             return True
     
     def _wait_for_login(self, page):
