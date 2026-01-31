@@ -1,0 +1,11 @@
+# 小红书爬虫工具 - 依赖列表
+
+# 核心依赖（必须）
+DrissionPage>=4.0.5.7
+pandas>=2.0.0
+openpyxl>=3.1.0
+requests>=2.25.0
+
+# 可选依赖（数据分析功能）
+# 如需使用图表、词云、报告功能，请安装：
+# pip install matplotlib wordcloud jieba python-docx

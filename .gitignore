@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+
+# 虚拟环境
+venv/
+env/
+.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 数据文件（包含隐私数据）
+data/cookies.json
+data/*.xlsx
+data/*.csv
+data/*.json
+data/*.db
+data/*.log
+data/charts/
+
+# 下载的图片（太大了）
+images/
+
+# 临时文件
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
