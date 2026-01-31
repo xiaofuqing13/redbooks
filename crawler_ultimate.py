@@ -1323,7 +1323,7 @@ class CrawlerApp:
                         time.sleep(random.uniform(*self.config.scroll_delay))
                         
                         # 检测是否加载了新内容
-                        curr_count = len(page.eles("xpath://section", timeout=0.5))
+                        curr_count = len(page.eles("css:section.note-item", timeout=0.5))
                         if curr_count >= self.config.max_notes:
                             self.log(f"已加载足够笔记 ({curr_count})", "INFO")
                             break
@@ -1336,7 +1336,7 @@ class CrawlerApp:
                         break
                     
                     # 获取笔记列表
-                    note_elements = page.eles("xpath://section")[:self.config.max_notes]
+                    note_elements = page.eles("css:section.note-item")[:self.config.max_notes]
                     note_count = len(note_elements)
                     
                     if note_count == 0:
@@ -1539,7 +1539,7 @@ class CrawlerApp:
                         time.sleep(0.4)
                 
                 # 重新获取元素列表
-                elements = page.eles("xpath://section", timeout=1)
+                elements = page.eles("css:section.note-item", timeout=1)
                 if not elements or idx >= len(elements):
                     self.log(f"笔记 {idx+1} 不存在，跳过", "WARNING")
                     consecutive_fails += 1
@@ -1627,7 +1627,7 @@ class CrawlerApp:
             )
             
             try:
-                elements = page.eles("xpath://section")
+                elements = page.eles("css:section.note-item")
                 if idx >= len(elements):
                     continue
                 
@@ -1717,19 +1717,18 @@ class CrawlerApp:
         return len(records), img_count, 0
     
     def _extract_full_note(self, page, idx: int, images_dir: str, timestamp: int, keyword: str) -> Optional[Dict]:
-        """提取完整笔记数据（优化版）"""
+        """提取完整笔记数据（基于实际页面结构优化）"""
         try:
             data = {'keyword': keyword, 'image_count': 0}
             
-            # 使用更快的超时和更精确的选择器
-            FAST_TIMEOUT = 0.15
+            FAST_TIMEOUT = 0.2
             
-            # 标题 - 优化选择器顺序
+            # 标题 - 使用实际的class选择器
             title = ""
             title_selectors = [
-                'xpath://div[@id="detail-title"]',
-                'xpath://div[contains(@id, "detail-title")]',
-                'xpath://div[contains(@class, "note-content")]//div[contains(@class, "title")]'
+                'css:.note-content .title',           # 新版选择器
+                'xpath://div[contains(@class, "note-content")]//div[contains(@class, "title")]',
+                'xpath://div[@id="detail-title"]',    # 旧版选择器
             ]
             for sel in title_selectors:
                 try:
@@ -1741,62 +1740,105 @@ class CrawlerApp:
                     continue
             data['title'] = title[:200] if title else f"笔记{idx+1}"
             
-            # 作者 - 简化选择器
+            # 作者 - 使用实际的class
             author = ""
-            try:
-                e = page.ele('xpath://a[contains(@class, "author")]//span[@class="name"]', timeout=FAST_TIMEOUT)
-                if e:
-                    author = e.text or ""
-            except Exception:
-                pass
-            data['author'] = author.strip() or "未知"
+            author_selectors = [
+                'css:.author-wrapper .name',
+                'css:.author-container .name',
+                'xpath://a[contains(@class, "author")]//span[contains(@class, "name")]',
+            ]
+            for sel in author_selectors:
+                try:
+                    e = page.ele(sel, timeout=FAST_TIMEOUT)
+                    if e and e.text:
+                        author = e.text.strip()
+                        break
+                except Exception:
+                    continue
+            data['author'] = author or "未知"
             
-            # 正文内容
+            # 正文内容 - 使用.note-text
             if self.config.get_content:
                 content = ""
-                try:
-                    e = page.ele('xpath://div[@id="detail-desc"]', timeout=FAST_TIMEOUT)
-                    if e:
-                        content = e.text or ""
-                except Exception:
-                    pass
-                data['content'] = content.strip()
+                content_selectors = [
+                    'css:.note-text',
+                    'xpath://div[contains(@class, "note-text")]',
+                    'xpath://div[@id="detail-desc"]',
+                ]
+                for sel in content_selectors:
+                    try:
+                        e = page.ele(sel, timeout=FAST_TIMEOUT)
+                        if e and e.text:
+                            content = e.text.strip()
+                            break
+                    except Exception:
+                        continue
+                data['content'] = content
                 
                 # 提取标签
                 if self.config.get_tags and content:
-                    # 提取#标签和话题
                     tags = re.findall(r'#([^\s#]+)', content)
-                    data['tags'] = list(set(tags))[:20]  # 限制标签数量
+                    data['tags'] = list(set(tags))[:20]
             
-            # 发布时间
+            # 发布时间 - 使用.date
             if self.config.get_publish_time:
                 pub_time = ""
                 try:
-                    e = page.ele('xpath://span[contains(@class, "date")]', timeout=FAST_TIMEOUT)
+                    e = page.ele('css:.date', timeout=FAST_TIMEOUT)
                     if e:
                         pub_time = e.text or ""
                 except Exception:
                     pass
                 data['publish_time'] = pub_time.strip()
             
-            # 互动数据 - 优化获取方式
+            # 互动数据 - 从底部互动栏获取
             if self.config.get_interactions:
                 data['like_count'] = 0
                 data['collect_count'] = 0
                 data['comment_count'] = 0
                 try:
-                    counts = page.eles('xpath://span[contains(@class, "count")]', timeout=FAST_TIMEOUT)
-                    if counts:
-                        data['like_count'] = self._parse_num(counts[0].text if len(counts) > 0 else "0")
-                        data['collect_count'] = self._parse_num(counts[1].text if len(counts) > 1 else "0")
-                        data['comment_count'] = self._parse_num(counts[2].text if len(counts) > 2 else "0")
+                    # 尝试获取底部互动栏的数字
+                    interact_selectors = [
+                        'css:.like-wrapper .count',
+                        'css:.collect-wrapper .count', 
+                        'css:.chat-wrapper .count',
+                    ]
+                    counts = []
+                    for sel in interact_selectors:
+                        try:
+                            e = page.ele(sel, timeout=0.1)
+                            if e:
+                                counts.append(e.text)
+                        except Exception:
+                            counts.append("0")
+                    
+                    if len(counts) >= 3:
+                        data['like_count'] = self._parse_num(counts[0])
+                        data['collect_count'] = self._parse_num(counts[1])
+                        data['comment_count'] = self._parse_num(counts[2])
+                    else:
+                        # 备用方法：获取所有count
+                        all_counts = page.eles('xpath://*[contains(@class, "count")]', timeout=0.2)
+                        nums = []
+                        for c in all_counts[:5]:
+                            num = self._parse_num(c.text)
+                            if num > 0:
+                                nums.append(num)
+                        if nums:
+                            data['like_count'] = nums[0] if len(nums) > 0 else 0
+                            data['collect_count'] = nums[1] if len(nums) > 1 else 0
+                            data['comment_count'] = nums[2] if len(nums) > 2 else 0
                 except Exception:
                     pass
             
             # 链接和ID
             current_url = page.url
             data['note_link'] = current_url if '/explore/' in current_url else ""
-            data['note_id'] = current_url.split('/')[-1].split('?')[0] if '/explore/' in current_url else ""
+            note_id = ""
+            if '/explore/' in current_url:
+                # 提取ID：/explore/xxxxx?token=xxx
+                note_id = current_url.split('/explore/')[-1].split('?')[0]
+            data['note_id'] = note_id
             
             # 检测笔记类型
             note_type = "图文"
@@ -1811,23 +1853,23 @@ class CrawlerApp:
             data['note_type'] = note_type
             data['video_url'] = video_url
             
-            # 获取图片URL
+            # 获取图片URL - 使用实际的class
             preview_images = []
             try:
-                imgs = page.eles('xpath://div[contains(@class, "swiper")]//img | //div[contains(@class, "carousel")]//img')
+                # 优先从note-slider获取
+                imgs = page.eles('css:.note-slider-img img, .note-slider img')
                 if not imgs:
-                    imgs = page.eles('xpath://div[5]//img')
+                    imgs = page.eles('xpath://div[contains(@class, "note-")]//img')
                     
-                for img in imgs[:15]:  # 限制数量
+                for img in imgs[:15]:
                     src = img.attr('src') or ""
-                    # 过滤头像和小图标
                     if src and len(src) > 50:
-                        if 'avatar' not in src.lower() and '.png' not in src.lower():
+                        if 'avatar' not in src.lower() and 'icon' not in src.lower():
                             preview_images.append(src)
             except Exception:
                 pass
             
-            data['image_urls'] = list(dict.fromkeys(preview_images))[:10]  # 去重并限制
+            data['image_urls'] = list(dict.fromkeys(preview_images))[:10]
             
             # 批量下载图片
             if self.config.download_images and preview_images:
@@ -1864,53 +1906,58 @@ class CrawlerApp:
             return None
     
     def _extract_comments(self, page) -> List[str]:
-        """智能提取评论内容"""
+        """提取评论内容（基于实际页面结构）"""
         comments = []
         max_count = self.config.comments_count
         
-        # 评论选择器优先级列表
+        # 实际的评论选择器（从浏览器分析得到）
         comment_selectors = [
-            'xpath://div[contains(@class, "comment-item")]//span[contains(@class, "content")]',
-            'xpath://div[contains(@class, "comments-container")]//div[contains(@class, "content")]',
-            'xpath://div[contains(@class, "comment")]//div[@class="content"]',
-            'xpath://div[contains(@class, "note-comment")]//span[contains(@class, "note")]',
+            'css:.comment-item .content',           # 评论内容
+            'css:.parent-comment .content',         # 父评论内容
+            'css:.comment-inner-container .content',
+            'xpath://div[contains(@class, "comment-item")]//div[@class="content"]',
         ]
         
         # 排除词列表
-        exclude_words = {'关注', '点赞', '收藏', '分享', '复制', '举报', '回复', '查看', '展开'}
+        exclude_words = {'关注', '点赞', '收藏', '分享', '复制', '举报', '回复', '查看', '展开', '赞', '条评论', '说点什么'}
         
         for selector in comment_selectors:
             if len(comments) >= max_count:
                 break
             try:
-                elements = page.eles(selector, timeout=0.2)
+                elements = page.eles(selector, timeout=0.3)
                 for elem in elements:
                     if len(comments) >= max_count:
                         break
                     text = (elem.text or "").strip()
                     # 智能过滤
-                    if (5 < len(text) < 500 and 
+                    if (3 < len(text) < 500 and 
                         text not in comments and
-                        not any(w in text for w in exclude_words)):
+                        not any(w == text for w in exclude_words) and
+                        not text.isdigit()):
                         comments.append(text)
             except Exception:
                 continue
         
-        # 备用方案：滚动后获取
-        if not comments:
+        # 如果还没有足够的评论，尝试滚动评论区
+        if len(comments) < max_count:
             try:
-                page.scroll.to_bottom()
-                time.sleep(0.2)
-                
-                spans = page.eles('xpath://div[contains(@class, "comment")]//span', timeout=0.2)
-                for span in spans:
-                    if len(comments) >= max_count:
-                        break
-                    text = (span.text or "").strip()
-                    if (10 < len(text) < 300 and 
-                        text not in comments and
-                        not any(w in text for w in exclude_words)):
-                        comments.append(text)
+                # 滚动评论区加载更多
+                comments_container = page.ele('css:.comments-container, .comments-el', timeout=0.3)
+                if comments_container:
+                    comments_container.scroll.to_bottom()
+                    time.sleep(0.3)
+                    
+                    # 再次获取评论
+                    elements = page.eles('css:.comment-item .content', timeout=0.3)
+                    for elem in elements:
+                        if len(comments) >= max_count:
+                            break
+                        text = (elem.text or "").strip()
+                        if (3 < len(text) < 500 and 
+                            text not in comments and
+                            not any(w == text for w in exclude_words)):
+                            comments.append(text)
             except Exception:
                 pass
         
