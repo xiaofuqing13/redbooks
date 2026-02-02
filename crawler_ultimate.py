@@ -1403,7 +1403,7 @@ class CrawlerApp:
         """加载指定批次的图片"""
         import glob
         
-        folder_path = os.path.join("images", folder_name)
+        folder_path = os.path.abspath(os.path.join("images", folder_name))
         if not os.path.exists(folder_path):
             return
         
@@ -1414,10 +1414,13 @@ class CrawlerApp:
         # 扫描文件夹下的所有笔记
         note_folders = []
         for note_folder in os.listdir(folder_path):
-            note_path = os.path.join(folder_path, note_folder)
+            note_path = os.path.abspath(os.path.join(folder_path, note_folder))
             if os.path.isdir(note_path) and note_folder.startswith("note_"):
-                images = glob.glob(f"{note_path}/*.jpg") + glob.glob(f"{note_path}/*.png")
-                videos = glob.glob(f"{note_path}/*.mp4")
+                # 使用绝对路径查找图片和视频
+                images = [os.path.abspath(f) for f in glob.glob(os.path.join(note_path, "*.jpg"))]
+                images += [os.path.abspath(f) for f in glob.glob(os.path.join(note_path, "*.png"))]
+                images += [os.path.abspath(f) for f in glob.glob(os.path.join(note_path, "*.webp"))]
+                videos = [os.path.abspath(f) for f in glob.glob(os.path.join(note_path, "*.mp4"))]
                 if images or videos:
                     # 提取序号
                     try:
@@ -1895,32 +1898,39 @@ class CrawlerApp:
             print(f"选择错误: {e}")
     
     def _load_batch_note_previews(self, note):
-        """加载批次笔记的图片预览"""
+        """加载批次笔记的图片预览（支持分页）"""
         self.preview_canvas.delete("all")
         self.preview_images = []
-        self.preview_image_paths = note.get('images', [])[:8]
         
-        if not self.preview_image_paths:
-            self.preview_canvas.create_text(200, 75, text="暂无图片", fill="#888")
+        # 获取所有图片路径（确保绝对路径）
+        all_images = []
+        for img_path in note.get('images', []):
+            abs_path = os.path.abspath(img_path)
+            if os.path.exists(abs_path):
+                all_images.append(abs_path)
+        
+        # 检查视频
+        videos = note.get('videos', [])
+        self.current_video_path = None
+        if videos:
+            for v in videos:
+                abs_v = os.path.abspath(v)
+                if os.path.exists(abs_v):
+                    self.current_video_path = abs_v
+                    break
+        
+        # 保存所有图片路径（用于分页和大图查看）
+        self.preview_image_paths = all_images
+        self.preview_comment_images = []  # 批次模式无评论图片
+        self.preview_page = 0  # 重置分页
+        
+        if not all_images and not self.current_video_path:
+            self.preview_canvas.create_text(200, 75, text="暂无媒体文件", fill="#888")
+            self.preview_page_label.config(text="")
             return
         
-        try:
-            from PIL import Image, ImageTk
-            x_offset = 10
-            for i, img_path in enumerate(self.preview_image_paths):
-                try:
-                    img = Image.open(img_path)
-                    img.thumbnail((130, 130))
-                    photo = ImageTk.PhotoImage(img)
-                    self.preview_images.append(photo)
-                    self.preview_canvas.create_image(x_offset, 10, anchor="nw", image=photo, tags=f"img_{i}")
-                    x_offset += 140
-                except Exception:
-                    continue
-            
-            self.preview_canvas.bind("<Button-1>", self._on_preview_click)
-        except ImportError:
-            self.preview_canvas.create_text(200, 75, text="需要安装Pillow库", fill="#888")
+        # 使用通用的分页渲染
+        self._render_preview_page()
     
     def _load_image_previews(self, note):
         """加载图片预览 - 只显示当前笔记的图片"""
