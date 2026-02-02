@@ -7,6 +7,15 @@
 
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
+
+# 尝试导入CustomTkinter美化界面
+try:
+    import customtkinter as ctk
+    ctk.set_appearance_mode("light")  # 浅色主题
+    ctk.set_default_color_theme("blue")  # 蓝色主题
+    HAS_CTK = True
+except ImportError:
+    HAS_CTK = False
 import threading
 import queue
 import json
@@ -106,6 +115,12 @@ class CrawlerConfig:
     # 配置文件路径
     config_file: str = "data/settings.json"
     
+    # 窗口位置
+    window_x: int = -1
+    window_y: int = -1
+    window_width: int = 1000
+    window_height: int = 750
+    
     def save_to_file(self):
         """保存配置到文件"""
         import json
@@ -136,6 +151,10 @@ class CrawlerConfig:
                 'date_filter': self.date_filter,
                 'export_format': self.export_format,
                 'export_to_db': self.export_to_db,
+                'window_x': self.window_x,
+                'window_y': self.window_y,
+                'window_width': self.window_width,
+                'window_height': self.window_height,
             }
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(config_dict, f, ensure_ascii=False, indent=2)
@@ -669,14 +688,25 @@ class CrawlerApp:
     """爬虫GUI应用"""
     
     def __init__(self):
-        self.root = tk.Tk()
+        # 使用CustomTkinter创建现代化窗口
+        if HAS_CTK:
+            self.root = ctk.CTk()
+            self.root.configure(fg_color="#f5f5f5")
+        else:
+            self.root = tk.Tk()
+        
         self.root.title(APP_NAME)
-        self.root.geometry("980x850")
-        self.root.minsize(800, 600)
+        self.root.minsize(900, 650)
         
         self.config = CrawlerConfig()
         # 加载上次的配置
         self.config.load_from_file()
+        
+        # 窗口大小固定1000x700，位置根据保存恢复
+        win_x = self.config.window_x if self.config.window_x >= 0 else 100
+        win_y = self.config.window_y if self.config.window_y >= 0 else 100
+        
+        self.root.geometry(f"1000x700+{win_x}+{win_y}")
         
         self.downloader = MediaDownloader()
         self.cookie_mgr = CookieManager(self.config.cookies_file)
@@ -692,6 +722,7 @@ class CrawlerApp:
         self.current_batch_folder = None  # 当前批次文件夹
         self.browser_page = None  # 保持浏览器实例，避免每次都重新登录
         
+        self._setup_styles()
         self._create_ui()
         self._start_log_consumer()
         
@@ -701,18 +732,102 @@ class CrawlerApp:
         # 程序退出时关闭浏览器并保存配置
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
     
+    def _setup_styles(self):
+        """设置样式主题"""
+        style = ttk.Style()
+        
+        # 主题颜色
+        self.colors = {
+            'primary': '#3b82f6',      # 蓝色
+            'primary_hover': '#2563eb',
+            'success': '#22c55e',      # 绿色
+            'danger': '#ef4444',       # 红色
+            'warning': '#f59e0b',      # 橙色
+            'bg': '#f8fafc',           # 背景
+            'card': '#ffffff',         # 卡片背景
+            'border': '#e2e8f0',       # 边框
+            'text': '#1e293b',         # 主文字
+            'text_secondary': '#64748b', # 次要文字
+        }
+        
+        # 配置Treeview样式
+        style.configure("Treeview",
+            background="#ffffff",
+            foreground="#1e293b",
+            fieldbackground="#ffffff",
+            rowheight=38,
+            font=('Microsoft YaHei UI', 14)
+        )
+        style.configure("Treeview.Heading",
+            background="#f1f5f9",
+            foreground="#475569",
+            font=('Microsoft YaHei UI', 14, 'bold'),
+            padding=(10, 8)
+        )
+        style.map("Treeview",
+            background=[('selected', '#dbeafe')],
+            foreground=[('selected', '#1e40af')]
+        )
+        
+        # 设置全局默认字体（12号）
+        default_font = ('Microsoft YaHei UI', 16)
+        self.root.option_add('*Font', default_font)
+        self.root.option_add('*TCombobox*Listbox.font', default_font)
+        
+        # 配置Notebook样式
+        style.configure("TNotebook", background="#f8fafc")
+        style.configure("TNotebook.Tab",
+            padding=(25, 12),
+            font=('Microsoft YaHei UI', 14)
+        )
+        style.map("TNotebook.Tab",
+            background=[('selected', '#ffffff'), ('!selected', '#f1f5f9')],
+            foreground=[('selected', '#3b82f6'), ('!selected', '#64748b')]
+        )
+        
+        # 配置LabelFrame样式
+        style.configure("Card.TLabelframe",
+            background="#ffffff",
+            borderwidth=1,
+            relief="solid"
+        )
+        style.configure("Card.TLabelframe.Label",
+            background="#ffffff",
+            foreground="#3b82f6",
+            font=('Microsoft YaHei UI', 14, 'bold')
+        )
+        
+        # 配置普通LabelFrame样式
+        style.configure("TLabelframe.Label",
+            font=('Microsoft YaHei UI', 14, 'bold'),
+            foreground="#1565c0"
+        )
+        
+        # 配置其他组件字体
+        style.configure("TRadiobutton", font=('Microsoft YaHei UI', 14))
+        style.configure("TCheckbutton", font=('Microsoft YaHei UI', 14))
+        style.configure("TLabel", font=('Microsoft YaHei UI', 14))
+        style.configure("TEntry", font=('Microsoft YaHei UI', 14))
+        style.configure("TCombobox", font=('Microsoft YaHei UI', 14))
+        style.configure("TSpinbox", font=('Microsoft YaHei UI', 14))
+        style.configure("TButton", font=('Microsoft YaHei UI', 14))
+    
     def _create_ui(self):
         """创建界面"""
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.notebook = notebook  # 保存引用
+        # 主容器
+        main_container = ttk.Frame(self.root, padding="10")
+        main_container.pack(fill=tk.BOTH, expand=True)
+        
+        notebook = ttk.Notebook(main_container)
+        notebook.pack(fill=tk.BOTH, expand=True)
+        self.notebook = notebook
         
         # 创建各标签页
-        main_page = ttk.Frame(notebook, padding="10")
-        result_page = ttk.Frame(notebook, padding="10")
-        content_page = ttk.Frame(notebook, padding="10")
-        analysis_page = ttk.Frame(notebook, padding="10")
-        settings_page = ttk.Frame(notebook, padding="10")
+        main_page = ttk.Frame(notebook, padding="15")
+        result_page = ttk.Frame(notebook, padding="15")
+        content_page = ttk.Frame(notebook, padding="15")
+        analysis_page = ttk.Frame(notebook, padding="15")
+        settings_page = ttk.Frame(notebook, padding="15")
         
         notebook.add(main_page, text="搜索爬取")
         notebook.add(result_page, text="爬取结果")
@@ -727,9 +842,9 @@ class CrawlerApp:
         self._create_settings_page(settings_page)
     
     def _create_main_page(self, parent):
-        """创建主页面"""
-        # === 爬取模式选择 ===
-        mode_frame = ttk.LabelFrame(parent, text="爬取模式", padding="10")
+        """创建主页面 - 简洁设计"""
+        # 爬取模式
+        mode_frame = ttk.LabelFrame(parent, text=" 爬取模式 ", padding="12")
         mode_frame.pack(fill=tk.X, pady=(0, 10))
         
         self.crawl_type_var = tk.StringVar(value="keyword")
@@ -737,160 +852,204 @@ class CrawlerApp:
         mode_row = ttk.Frame(mode_frame)
         mode_row.pack(fill=tk.X)
         
-        ttk.Radiobutton(mode_row, text="关键词搜索", variable=self.crawl_type_var, 
-                       value="keyword", command=self._on_mode_change).pack(side=tk.LEFT, padx=(0, 15))
-        ttk.Radiobutton(mode_row, text="博主主页", variable=self.crawl_type_var, 
-                       value="blogger", command=self._on_mode_change).pack(side=tk.LEFT, padx=(0, 15))
-        ttk.Radiobutton(mode_row, text="热门榜单", variable=self.crawl_type_var, 
-                       value="hot", command=self._on_mode_change).pack(side=tk.LEFT)
+        for text, value in [("关键词搜索", "keyword"), ("博主主页", "blogger"), ("热门榜单", "hot")]:
+            tk.Radiobutton(mode_row, text=text, variable=self.crawl_type_var, 
+                          value=value, command=self._on_mode_change,
+                          font=('Microsoft YaHei UI', 14), bg='#f0f0f0',
+                          activebackground='#f0f0f0').pack(side=tk.LEFT, padx=(0, 25))
         
-        # === 搜索配置 ===
-        self.search_frame = ttk.LabelFrame(parent, text="搜索配置", padding="10")
+        # 搜索配置
+        self.search_frame = ttk.LabelFrame(parent, text=" 搜索配置 ", padding="12")
         self.search_frame.pack(fill=tk.X, pady=(0, 10))
         
         # 关键词输入
         row1 = ttk.Frame(self.search_frame)
-        row1.pack(fill=tk.X, pady=2)
+        row1.pack(fill=tk.X, pady=(0, 10))
         
-        ttk.Label(row1, text="搜索关键词:").pack(side=tk.LEFT)
+        tk.Label(row1, text="搜索关键词:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
         self.keyword_var = tk.StringVar(value="鞋子")
-        self.keyword_entry = ttk.Entry(row1, textvariable=self.keyword_var, width=40)
-        self.keyword_entry.pack(side=tk.LEFT, padx=5)
-        
-        ttk.Label(row1, text="(多个用逗号分隔)", foreground="gray").pack(side=tk.LEFT)
+        self.keyword_entry = tk.Entry(row1, textvariable=self.keyword_var, width=35, font=('Microsoft YaHei UI', 14))
+        self.keyword_entry.pack(side=tk.LEFT, padx=(10, 8))
+        tk.Label(row1, text="多个用逗号分隔", fg="#999", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
         
         # 博主URL输入
         row1b = ttk.Frame(self.search_frame)
-        row1b.pack(fill=tk.X, pady=2)
+        row1b.pack(fill=tk.X, pady=(0, 10))
         
-        ttk.Label(row1b, text="博主主页URL:").pack(side=tk.LEFT)
+        tk.Label(row1b, text="博主主页URL:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
         self.blogger_url_var = tk.StringVar()
-        self.blogger_entry = ttk.Entry(row1b, textvariable=self.blogger_url_var, width=50)
-        self.blogger_entry.pack(side=tk.LEFT, padx=5)
+        self.blogger_entry = tk.Entry(row1b, textvariable=self.blogger_url_var, width=45, font=('Microsoft YaHei UI', 14))
+        self.blogger_entry.pack(side=tk.LEFT, padx=(10, 0))
         self.blogger_entry.config(state=tk.DISABLED)
         
         # 热门分类
         row1c = ttk.Frame(self.search_frame)
-        row1c.pack(fill=tk.X, pady=2)
+        row1c.pack(fill=tk.X, pady=(0, 10))
         
-        ttk.Label(row1c, text="热门分类:").pack(side=tk.LEFT)
+        tk.Label(row1c, text="热门分类:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
         self.hot_category_var = tk.StringVar(value="综合")
         self.hot_combo = ttk.Combobox(row1c, textvariable=self.hot_category_var,
                                       values=["综合", "美食", "穿搭", "美妆", "旅行", "家居", "数码"], 
-                                      width=15, state="readonly")
-        self.hot_combo.pack(side=tk.LEFT, padx=5)
+                                      width=12, state="readonly", font=('Microsoft YaHei UI', 14))
+        self.hot_combo.pack(side=tk.LEFT, padx=(10, 0))
         self.hot_combo.config(state=tk.DISABLED)
         
-        # 数量配置
+        # 数量配置 - 使用网格布局更整齐
         row2 = ttk.Frame(self.search_frame)
-        row2.pack(fill=tk.X, pady=5)
+        row2.pack(fill=tk.X)
         
-        # 滚动次数已改为自动模式，无需手动设置
-        self.scroll_var = tk.StringVar(value="10")  # 保留变量但不显示
+        self.scroll_var = tk.StringVar(value="10")
         
-        ttk.Label(row2, text="最多笔记:").pack(side=tk.LEFT)
+        tk.Label(row2, text="最多笔记:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
         self.max_notes_var = tk.StringVar(value="30")
-        ttk.Spinbox(row2, from_=1, to=500, textvariable=self.max_notes_var, width=6).pack(side=tk.LEFT, padx=(2, 15))
+        tk.Spinbox(row2, from_=1, to=500, textvariable=self.max_notes_var, width=6, 
+                  font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT, padx=(10, 25))
         
-        ttk.Label(row2, text="并行下载:").pack(side=tk.LEFT)
+        tk.Label(row2, text="并行下载:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
         self.parallel_var = tk.StringVar(value="10")
-        ttk.Spinbox(row2, from_=1, to=20, textvariable=self.parallel_var, width=6).pack(side=tk.LEFT)
+        tk.Spinbox(row2, from_=1, to=20, textvariable=self.parallel_var, width=6,
+                  font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT, padx=(10, 0))
         
-        # === 筛选条件 ===
-        filter_frame = ttk.LabelFrame(parent, text="筛选条件", padding="10")
+        # 筛选条件
+        filter_frame = ttk.LabelFrame(parent, text=" 筛选条件 ", padding="12")
         filter_frame.pack(fill=tk.X, pady=(0, 10))
         
         filter_row = ttk.Frame(filter_frame)
         filter_row.pack(fill=tk.X)
         
-        ttk.Label(filter_row, text="点赞范围:").pack(side=tk.LEFT)
+        tk.Label(filter_row, text="点赞:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
         self.min_likes_var = tk.StringVar(value="0")
-        ttk.Entry(filter_row, textvariable=self.min_likes_var, width=8).pack(side=tk.LEFT, padx=2)
-        ttk.Label(filter_row, text="-").pack(side=tk.LEFT)
+        tk.Entry(filter_row, textvariable=self.min_likes_var, width=8, font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT, padx=(8, 3))
+        tk.Label(filter_row, text="~", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
         self.max_likes_var = tk.StringVar(value="999999")
-        ttk.Entry(filter_row, textvariable=self.max_likes_var, width=8).pack(side=tk.LEFT, padx=(2, 15))
+        tk.Entry(filter_row, textvariable=self.max_likes_var, width=8, font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT, padx=(3, 20))
         
-        ttk.Label(filter_row, text="笔记类型:").pack(side=tk.LEFT)
+        tk.Label(filter_row, text="类型:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
         self.note_type_var = tk.StringVar(value="全部")
         ttk.Combobox(filter_row, textvariable=self.note_type_var,
-                    values=["全部", "图文", "视频"], width=8, state="readonly").pack(side=tk.LEFT, padx=(2, 15))
+                    values=["全部", "图文", "视频"], width=6, state="readonly",
+                    font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT, padx=(8, 20))
         
-        ttk.Label(filter_row, text="时间范围:").pack(side=tk.LEFT)
+        tk.Label(filter_row, text="时间:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
         self.date_filter_var = tk.StringVar(value="全部")
         ttk.Combobox(filter_row, textvariable=self.date_filter_var,
-                    values=["全部", "今天", "本周", "本月"], width=8, state="readonly").pack(side=tk.LEFT)
+                    values=["全部", "今天", "本周", "本月"], width=6, state="readonly",
+                    font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT, padx=(8, 0))
         
-        # === 速度模式 ===
-        speed_frame = ttk.LabelFrame(parent, text="速度模式", padding="10")
+        # 速度模式
+        speed_frame = ttk.LabelFrame(parent, text=" 速度模式 ", padding="12")
         speed_frame.pack(fill=tk.X, pady=(0, 10))
         
         self.crawl_mode_var = tk.StringVar(value="standard")
         speed_row = ttk.Frame(speed_frame)
         speed_row.pack(fill=tk.X)
         
-        ttk.Radiobutton(speed_row, text="标准模式（完整数据）", variable=self.crawl_mode_var, 
-                       value="standard").pack(side=tk.LEFT, padx=(0, 15))
-        ttk.Radiobutton(speed_row, text="快速模式（减少等待）", variable=self.crawl_mode_var, 
-                       value="fast").pack(side=tk.LEFT, padx=(0, 15))
-        ttk.Radiobutton(speed_row, text="极速模式（列表直取）", variable=self.crawl_mode_var, 
-                       value="turbo").pack(side=tk.LEFT)
+        for text, value in [("标准模式", "standard"), ("快速模式", "fast"), ("极速模式", "turbo")]:
+            tk.Radiobutton(speed_row, text=text, variable=self.crawl_mode_var, 
+                          value=value, font=('Microsoft YaHei UI', 14),
+                          bg='#f0f0f0', activebackground='#f0f0f0').pack(side=tk.LEFT, padx=(0, 20))
         
-        # === 控制按钮 ===
+        # 控制按钮区域
         btn_frame = ttk.Frame(parent)
-        btn_frame.pack(fill=tk.X, pady=(0, 10))
+        btn_frame.pack(fill=tk.X, pady=(5, 10))
         
-        self.start_btn = ttk.Button(btn_frame, text="开始爬取", command=self._start_crawl, width=12)
-        self.start_btn.pack(side=tk.LEFT, padx=(0, 5))
+        # 使用CustomTkinter按钮（如果可用）
+        if HAS_CTK:
+            self.start_btn = ctk.CTkButton(btn_frame, text="开始爬取", command=self._start_crawl, 
+                                           width=120, height=36, corner_radius=8,
+                                           fg_color="#3b82f6", hover_color="#2563eb",
+                                           font=('Microsoft YaHei UI', 14, 'bold'))
+            self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
+            
+            self.stop_btn = ctk.CTkButton(btn_frame, text="停止", command=self._stop_crawl,
+                                          width=80, height=36, corner_radius=8,
+                                          fg_color="#ef4444", hover_color="#dc2626",
+                                          font=('Microsoft YaHei UI', 14), state="disabled")
+            self.stop_btn.pack(side=tk.LEFT, padx=(0, 8))
+            
+            ctk.CTkButton(btn_frame, text="已保存Cookie", command=self._use_saved_cookies,
+                         width=120, height=36, corner_radius=8,
+                         fg_color="#8b5cf6", hover_color="#7c3aed",
+                         font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+            
+            ctk.CTkButton(btn_frame, text="打开数据", command=self._open_data_dir,
+                         width=100, height=36, corner_radius=8,
+                         fg_color="#64748b", hover_color="#475569",
+                         font=('Microsoft YaHei UI', 14)).pack(side=tk.RIGHT)
+            
+            ctk.CTkButton(btn_frame, text="打包图片", command=self._zip_images,
+                         width=100, height=36, corner_radius=8,
+                         fg_color="#64748b", hover_color="#475569",
+                         font=('Microsoft YaHei UI', 14)).pack(side=tk.RIGHT, padx=(0, 8))
+        else:
+            self.start_btn = ttk.Button(btn_frame, text="开始爬取", command=self._start_crawl, width=14)
+            self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
+            
+            self.stop_btn = ttk.Button(btn_frame, text="停止", command=self._stop_crawl, state=tk.DISABLED, width=12)
+            self.stop_btn.pack(side=tk.LEFT, padx=(0, 8))
+            
+            ttk.Button(btn_frame, text="已保存Cookie", command=self._use_saved_cookies, width=16).pack(side=tk.LEFT)
+            ttk.Button(btn_frame, text="打开数据", command=self._open_data_dir, width=12).pack(side=tk.RIGHT)
+            ttk.Button(btn_frame, text="打包图片", command=self._zip_images, width=12).pack(side=tk.RIGHT, padx=(0, 8))
         
-        self.stop_btn = ttk.Button(btn_frame, text="停止", command=self._stop_crawl, state=tk.DISABLED, width=10)
-        self.stop_btn.pack(side=tk.LEFT, padx=(0, 5))
-        
-        ttk.Button(btn_frame, text="使用已保存Cookie", command=self._use_saved_cookies, width=18).pack(side=tk.LEFT, padx=(0, 5))
-        
-        ttk.Button(btn_frame, text="打开数据", command=self._open_data_dir, width=10).pack(side=tk.RIGHT)
-        ttk.Button(btn_frame, text="打包图片", command=self._zip_images, width=10).pack(side=tk.RIGHT, padx=(0, 5))
-        
-        # === 进度区域 ===
-        progress_frame = ttk.LabelFrame(parent, text="运行状态", padding="10")
+        # 运行状态
+        progress_frame = ttk.LabelFrame(parent, text=" 运行状态 ", padding="12")
         progress_frame.pack(fill=tk.X, pady=(0, 10))
         
+        # 进度条
         prog_row = ttk.Frame(progress_frame)
-        prog_row.pack(fill=tk.X)
-        self.total_progress = ttk.Progressbar(prog_row, length=400, mode='determinate')
+        prog_row.pack(fill=tk.X, pady=(0, 8))
+        self.total_progress = ttk.Progressbar(prog_row, length=500, mode='determinate')
         self.total_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
-        self.progress_label = ttk.Label(prog_row, text="0%")
+        self.progress_label = tk.Label(prog_row, text="0%", font=('Microsoft YaHei UI', 14, 'bold'),
+                                      fg="#3b82f6")
         self.progress_label.pack(side=tk.LEFT)
         
+        # 状态信息 - 单行显示
         stat_row = ttk.Frame(progress_frame)
-        stat_row.pack(fill=tk.X, pady=5)
+        stat_row.pack(fill=tk.X, pady=(5, 0))
         
         self.status_var = tk.StringVar(value="就绪")
-        ttk.Label(stat_row, text="状态:").pack(side=tk.LEFT)
-        ttk.Label(stat_row, textvariable=self.status_var, foreground="blue").pack(side=tk.LEFT, padx=(5, 20))
+        tk.Label(stat_row, text="状态:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+        tk.Label(stat_row, textvariable=self.status_var, fg="#3b82f6", 
+                font=('Microsoft YaHei UI', 14, 'bold')).pack(side=tk.LEFT, padx=(5, 20))
         
-        self.notes_var = tk.StringVar(value="笔记: 0")
-        ttk.Label(stat_row, textvariable=self.notes_var).pack(side=tk.LEFT, padx=(0, 15))
+        self.notes_var = tk.StringVar(value="0")
+        tk.Label(stat_row, text="笔记:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+        tk.Label(stat_row, textvariable=self.notes_var, font=('Microsoft YaHei UI', 14, 'bold')).pack(side=tk.LEFT, padx=(5, 20))
         
-        self.images_var = tk.StringVar(value="图片: 0")
-        ttk.Label(stat_row, textvariable=self.images_var).pack(side=tk.LEFT, padx=(0, 15))
+        self.images_var = tk.StringVar(value="0")
+        tk.Label(stat_row, text="图片:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+        tk.Label(stat_row, textvariable=self.images_var, font=('Microsoft YaHei UI', 14, 'bold')).pack(side=tk.LEFT, padx=(5, 20))
         
-        self.videos_var = tk.StringVar(value="视频: 0")
-        ttk.Label(stat_row, textvariable=self.videos_var).pack(side=tk.LEFT, padx=(0, 15))
+        self.videos_var = tk.StringVar(value="0")
+        tk.Label(stat_row, text="视频:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+        tk.Label(stat_row, textvariable=self.videos_var, font=('Microsoft YaHei UI', 14, 'bold')).pack(side=tk.LEFT, padx=(5, 20))
         
-        self.time_var = tk.StringVar(value="用时: 0秒")
-        ttk.Label(stat_row, textvariable=self.time_var).pack(side=tk.LEFT)
+        self.time_var = tk.StringVar(value="0秒")
+        tk.Label(stat_row, text="用时:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+        tk.Label(stat_row, textvariable=self.time_var, font=('Microsoft YaHei UI', 14, 'bold')).pack(side=tk.LEFT)
         
-        # === 日志区域 ===
-        log_frame = ttk.LabelFrame(parent, text="运行日志", padding="5")
+        # 日志区域
+        log_frame = ttk.LabelFrame(parent, text=" 运行日志 ", padding="8")
         log_frame.pack(fill=tk.BOTH, expand=True)
         
-        self.log_text = scrolledtext.ScrolledText(log_frame, height=8, state=tk.DISABLED)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-        
-        self.log_text.tag_config("INFO", foreground="black")
-        self.log_text.tag_config("SUCCESS", foreground="green")
-        self.log_text.tag_config("WARNING", foreground="orange")
-        self.log_text.tag_config("ERROR", foreground="red")
+        if HAS_CTK:
+            self.log_text = ctk.CTkTextbox(log_frame, height=150, corner_radius=6,
+                                           font=('Consolas', 14), fg_color="#fafafa",
+                                           text_color="#333333", border_width=1,
+                                           border_color="#ddd")
+            self.log_text.pack(fill=tk.BOTH, expand=True)
+            self.log_text.configure(state="disabled")
+        else:
+            self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state=tk.DISABLED,
+                                                      font=('Consolas', 14), bg="#fafafa")
+            self.log_text.pack(fill=tk.BOTH, expand=True)
+            self.log_text.tag_config("INFO", foreground="black")
+            self.log_text.tag_config("SUCCESS", foreground="green")
+            self.log_text.tag_config("WARNING", foreground="orange")
+            self.log_text.tag_config("ERROR", foreground="red")
+            self.log_text.tag_config("DEBUG", foreground="purple")
     
     def _create_result_page(self, parent):
         """创建爬取结果展示页面"""
@@ -963,16 +1122,16 @@ class CrawlerApp:
         stats_frame.pack(fill=tk.X, pady=(0, 8))
         
         # 统计卡片样式
-        self.result_count_label = ttk.Label(stats_frame, text="总计: 0 条", font=("", 9, "bold"))
+        self.result_count_label = ttk.Label(stats_frame, text="总计: 0 条", font=('Microsoft YaHei UI', 14, "bold"))
         self.result_count_label.pack(side=tk.LEFT, padx=(0, 15))
         
-        self.stats_image_label = ttk.Label(stats_frame, text="图文: 0", foreground="#2196F3")
+        self.stats_image_label = ttk.Label(stats_frame, text="图文: 0", foreground="#2196F3", font=('Microsoft YaHei UI', 14))
         self.stats_image_label.pack(side=tk.LEFT, padx=(0, 15))
         
-        self.stats_video_label = ttk.Label(stats_frame, text="视频: 0", foreground="#FF5722")
+        self.stats_video_label = ttk.Label(stats_frame, text="视频: 0", foreground="#FF5722", font=('Microsoft YaHei UI', 14))
         self.stats_video_label.pack(side=tk.LEFT, padx=(0, 15))
         
-        self.stats_likes_label = ttk.Label(stats_frame, text="总点赞: 0", foreground="#E91E63")
+        self.stats_likes_label = ttk.Label(stats_frame, text="总点赞: 0", foreground="#E91E63", font=('Microsoft YaHei UI', 14))
         self.stats_likes_label.pack(side=tk.LEFT, padx=(0, 15))
         
         # 导出按钮
@@ -992,8 +1151,8 @@ class CrawlerApp:
         
         # 配置表格样式 - 斑马纹
         style = ttk.Style()
-        style.configure("Treeview", rowheight=28, font=("", 9))
-        style.configure("Treeview.Heading", font=("", 9, "bold"))
+        style.configure("Treeview", rowheight=36, font=('Microsoft YaHei UI', 14))
+        style.configure("Treeview.Heading", font=('Microsoft YaHei UI', 14, "bold"))
         self.result_tree.tag_configure('oddrow', background='#f8f8f8')
         self.result_tree.tag_configure('evenrow', background='#ffffff')
         self.result_tree.tag_configure('video', foreground='#FF5722')
@@ -1040,7 +1199,7 @@ class CrawlerApp:
         detail_header.pack(fill=tk.X, pady=(0, 5))
         
         self.detail_title_label = ttk.Label(detail_header, text="选择笔记查看详情", 
-                                            font=("", 11, "bold"), wraplength=300)
+                                            font=('Microsoft YaHei UI', 14, "bold"), wraplength=400)
         self.detail_title_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
         
         # 操作按钮（图标化）
@@ -1056,18 +1215,18 @@ class CrawlerApp:
         info_cards.pack(fill=tk.X, pady=(0, 8))
         
         # 互动数据展示
-        self.detail_likes = ttk.Label(info_cards, text="❤ 0", foreground="#E91E63", font=("", 10))
+        self.detail_likes = ttk.Label(info_cards, text="❤ 0", foreground="#E91E63", font=('Microsoft YaHei UI', 14))
         self.detail_likes.pack(side=tk.LEFT, padx=(0, 15))
-        self.detail_collects = ttk.Label(info_cards, text="⭐ 0", foreground="#FF9800", font=("", 10))
+        self.detail_collects = ttk.Label(info_cards, text="⭐ 0", foreground="#FF9800", font=('Microsoft YaHei UI', 14))
         self.detail_collects.pack(side=tk.LEFT, padx=(0, 15))
-        self.detail_comments = ttk.Label(info_cards, text="💬 0", foreground="#2196F3", font=("", 10))
+        self.detail_comments = ttk.Label(info_cards, text="💬 0", foreground="#2196F3", font=('Microsoft YaHei UI', 14))
         self.detail_comments.pack(side=tk.LEFT, padx=(0, 15))
-        self.detail_author = ttk.Label(info_cards, text="", foreground="#666", font=("", 9))
+        self.detail_author = ttk.Label(info_cards, text="", foreground="#666", font=('Microsoft YaHei UI', 14))
         self.detail_author.pack(side=tk.RIGHT)
         
         # 详情内容（减小高度，给预览更多空间）
         self.detail_text = scrolledtext.ScrolledText(right_frame, height=8, state=tk.DISABLED, 
-                                                     wrap=tk.WORD, font=("", 9))
+                                                     wrap=tk.WORD, font=('Microsoft YaHei UI', 14))
         self.detail_text.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
         
         # 图片预览区（更大）
@@ -1085,7 +1244,7 @@ class CrawlerApp:
         ttk.Button(preview_nav, text="▶", command=self._next_preview_page, width=3).pack(side=tk.RIGHT, padx=2)
         ttk.Button(preview_nav, text="查看大图", command=self._open_image_viewer, width=8).pack(side=tk.RIGHT, padx=5)
         
-        self.preview_canvas = tk.Canvas(preview_frame, height=180, bg="#f0f0f0")
+        self.preview_canvas = tk.Canvas(preview_frame, height=280, bg="#f0f0f0")
         self.preview_canvas.pack(fill=tk.BOTH, expand=True)
         self.preview_canvas.bind("<Double-Button-1>", self._on_preview_double_click)
         
@@ -1096,7 +1255,7 @@ class CrawlerApp:
         self.preview_images = []  # 保持图片引用
         self.current_video_path = None  # 当前预览的视频路径
         self.preview_page = 0  # 预览分页
-        self.preview_page_size = 5  # 每页显示数量
+        self.preview_page_size = 3  # 每页显示数量（图片放大后减少）
         self.sort_column = None  # 排序列
         self.sort_reverse = False  # 排序方向
         self.filtered_notes = []  # 筛选后的数据
@@ -1400,7 +1559,7 @@ class CrawlerApp:
             messagebox.showerror("错误", f"打开失败: {e}")
     
     def _load_batch_images(self, folder_name):
-        """加载指定批次的图片"""
+        """加载指定批次的图片，并从数据库获取笔记详情"""
         import glob
         
         folder_path = os.path.abspath(os.path.join("images", folder_name))
@@ -1410,6 +1569,47 @@ class CrawlerApp:
         # 清空表格
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
+        
+        # 从数据库获取批次相关的笔记数据
+        db_notes = {}
+        db_notes_by_order = []  # 按爬取顺序存储
+        try:
+            conn = sqlite3.connect(self.config.db_path)
+            cursor = conn.cursor()
+            
+            # 尝试从文件夹名提取时间范围 (格式: 主页推荐_20260202_164319)
+            parts = folder_name.split("_")
+            if len(parts) >= 3:
+                try:
+                    date_str = parts[-2]  # 20260202
+                    time_str = parts[-1]  # 164319
+                    # 构建时间范围（前后10分钟）
+                    from datetime import datetime, timedelta
+                    batch_time = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
+                    start_time = (batch_time - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+                    end_time = (batch_time + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+                    
+                    cursor.execute(
+                        "SELECT * FROM notes WHERE crawl_time >= ? AND crawl_time <= ? ORDER BY crawl_time ASC",
+                        (start_time, end_time)
+                    )
+                except:
+                    cursor.execute("SELECT * FROM notes ORDER BY crawl_time DESC LIMIT 500")
+            else:
+                cursor.execute("SELECT * FROM notes ORDER BY crawl_time DESC LIMIT 500")
+            
+            rows = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+            conn.close()
+            
+            for row in rows:
+                note = dict(zip(columns, row))
+                note_id = note.get('note_id', '')
+                if note_id:
+                    db_notes[note_id] = note
+                db_notes_by_order.append(note)  # 按顺序保存
+        except Exception as e:
+            print(f"[数据库] 查询失败: {e}")
         
         # 扫描文件夹下的所有笔记
         note_folders = []
@@ -1422,19 +1622,50 @@ class CrawlerApp:
                 images += [os.path.abspath(f) for f in glob.glob(os.path.join(note_path, "*.webp"))]
                 videos = [os.path.abspath(f) for f in glob.glob(os.path.join(note_path, "*.mp4"))]
                 if images or videos:
-                    # 提取序号
+                    # 提取序号和note_id
+                    parts = note_folder.split("_")
                     try:
-                        idx = int(note_folder.split("_")[1])
+                        idx = int(parts[1])
                     except:
                         idx = 0
+                    
+                    # 提取note_id (格式: note_1_noteId 或 note_1_timestamp)
+                    # note_id是24位字母数字，timestamp是10位数字
+                    potential_id = parts[2] if len(parts) > 2 else ""
+                    # 如果是24位且包含字母，则是note_id；否则是时间戳
+                    if len(potential_id) >= 20 and any(c.isalpha() for c in potential_id):
+                        note_id = potential_id
+                    else:
+                        note_id = ""
+                    
+                    # 从数据库获取详细信息
+                    db_note = db_notes.get(note_id, {})
+                    
+                    # 如果通过note_id没找到，尝试按序号匹配（对旧数据有用）
+                    if not db_note and db_notes_by_order:
+                        # idx是1-based，数组是0-based
+                        if 0 <= idx - 1 < len(db_notes_by_order):
+                            db_note = db_notes_by_order[idx - 1]
+                    
                     note_folders.append({
                         'folder': note_folder,
                         'path': note_path,
                         'idx': idx,
+                        'note_id': note_id,
                         'images': images,
                         'videos': videos,
                         'image_count': len(images),
-                        'has_video': len(videos) > 0
+                        'has_video': len(videos) > 0,
+                        # 从数据库获取的数据
+                        'title': db_note.get('title', ''),
+                        'author': db_note.get('author', ''),
+                        'like_count': db_note.get('like_count', 0),
+                        'collect_count': db_note.get('collect_count', 0),
+                        'comment_count': db_note.get('comment_count', 0),
+                        'content': db_note.get('content', ''),
+                        'tags': db_note.get('tags', ''),
+                        'note_type': db_note.get('note_type', '视频' if len(videos) > 0 else '图文'),
+                        'note_link': db_note.get('note_link', ''),
                     })
         
         # 按序号排序
@@ -1445,27 +1676,50 @@ class CrawlerApp:
         self.current_batch_folder = folder_path
         
         # 填充表格
-        from datetime import datetime
-        folder_time = ""
-        try:
-            mtime = os.path.getmtime(folder_path)
-            folder_time = datetime.fromtimestamp(mtime).strftime("%m-%d %H:%M")
-        except:
-            pass
+        total_likes = 0
+        image_count = 0
+        video_count = 0
         
         for i, note in enumerate(note_folders):
             note_type = "视频" if note['has_video'] else "图文"
+            title = note.get('title', '') or f"笔记{note['idx']}"
+            author = note.get('author', '') or f"{note['image_count']}张"
+            like_count = note.get('like_count', 0) or 0
+            collect_count = note.get('collect_count', 0) or 0
+            comment_count = note.get('comment_count', 0) or 0
+            
+            # 统计
+            if note_type == "视频":
+                video_count += 1
+            else:
+                image_count += 1
+            try:
+                total_likes += int(like_count)
+            except:
+                pass
+            
+            # 斑马纹
+            tags = ('oddrow',) if i % 2 else ('evenrow',)
+            if note_type == "视频":
+                tags = tags + ('video',)
+            else:
+                tags = tags + ('image',)
+            
             self.result_tree.insert("", tk.END, values=(
                 note['idx'],
                 note_type,
-                f"笔记{note['idx']}",
-                f"{note['image_count']}张",
-                "-",
-                "-",
-                "-"
-            ))
+                title[:28] if title else f"笔记{note['idx']}",
+                author[:12] if author else "-",
+                like_count if like_count else "-",
+                collect_count if collect_count else "-",
+                comment_count if comment_count else "-"
+            ), tags=tags)
         
+        # 更新统计
         self.result_count_label.config(text=f"共 {len(note_folders)} 个笔记")
+        self.stats_image_label.config(text=f"图文: {image_count}")
+        self.stats_video_label.config(text=f"视频: {video_count}")
+        self.stats_likes_label.config(text=f"总点赞: {total_likes:,}")
     
     def _load_all_batch_images(self):
         """加载所有批次的摘要"""
@@ -1650,6 +1904,39 @@ class CrawlerApp:
             
             # 临时存储历史数据
             self.history_notes_data = []
+            
+            # 预先扫描images文件夹
+            import glob
+            from datetime import datetime
+            
+            # 建立note_id到文件夹的映射（新格式）
+            note_id_to_folder = {}
+            # 建立批次时间到批次文件夹的映射（旧格式）
+            batch_folders_by_time = {}
+            
+            if os.path.exists("images"):
+                for batch_folder in os.listdir("images"):
+                    batch_path = os.path.join("images", batch_folder)
+                    if os.path.isdir(batch_path):
+                        # 提取批次时间（格式: 主页推荐_20260202_164319）
+                        parts = batch_folder.split("_")
+                        if len(parts) >= 3:
+                            try:
+                                date_str = parts[-2]  # 20260202
+                                time_str = parts[-1]  # 164319
+                                batch_time = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
+                                batch_folders_by_time[batch_time] = batch_path
+                            except:
+                                pass
+                        
+                        for note_folder in os.listdir(batch_path):
+                            if note_folder.startswith("note_"):
+                                parts = note_folder.split("_")
+                                if len(parts) >= 3:
+                                    potential_id = parts[2]
+                                    if len(potential_id) >= 20 and any(c.isalpha() for c in potential_id):
+                                        note_id_to_folder[potential_id] = os.path.abspath(os.path.join(batch_path, note_folder))
+            
             for row in rows:
                 note = dict(zip(columns, row))
                 # 解析JSON字段
@@ -1661,6 +1948,46 @@ class CrawlerApp:
                     note['comments'] = json.loads(note.get('comments', '[]'))
                 except:
                     note['comments'] = []
+                
+                # 尝试找到本地图片文件夹
+                note_id = note.get('note_id', '')
+                folder_path = None
+                
+                # 方法1: 通过note_id匹配（新格式）
+                if note_id and note_id in note_id_to_folder:
+                    folder_path = note_id_to_folder[note_id]
+                
+                # 方法2: 通过crawl_time找批次，再搜索note_id（旧格式）
+                if not folder_path and note_id:
+                    crawl_time_str = note.get('crawl_time', '')
+                    if crawl_time_str:
+                        try:
+                            crawl_time = datetime.strptime(crawl_time_str, "%Y-%m-%d %H:%M:%S")
+                            # 找到最接近的批次文件夹
+                            for batch_time, batch_path in batch_folders_by_time.items():
+                                # 在批次时间前后30分钟内
+                                diff = abs((crawl_time - batch_time).total_seconds())
+                                if diff < 1800:  # 30分钟
+                                    # 在这个批次中搜索包含note_id的文件夹
+                                    for note_folder in os.listdir(batch_path):
+                                        if note_folder.startswith("note_") and note_id in note_folder:
+                                            folder_path = os.path.abspath(os.path.join(batch_path, note_folder))
+                                            break
+                                    if folder_path:
+                                        break
+                        except:
+                            pass
+                
+                # 如果找到了文件夹，加载图片和视频
+                if folder_path and os.path.exists(folder_path):
+                    local_images = []
+                    for ext in ['*.jpg', '*.png', '*.webp']:
+                        local_images.extend(glob.glob(os.path.join(folder_path, ext)))
+                    note['local_images'] = [os.path.abspath(p) for p in local_images]
+                    video_path = os.path.join(folder_path, 'video.mp4')
+                    if os.path.exists(video_path):
+                        note['local_video'] = os.path.abspath(video_path)
+                
                 self.history_notes_data.append(note)
             
             # 填充表格
@@ -1764,17 +2091,45 @@ class CrawlerApp:
                     if note.get('idx') == idx:
                         self.current_selected_note = note
                         
-                        # 更新顶部信息
-                        self.detail_title_label.config(text=f"笔记 {idx}")
-                        self.detail_likes.config(text=f"❤ -")
-                        self.detail_collects.config(text=f"⭐ -")
-                        self.detail_comments.config(text=f"💬 -")
-                        self.detail_author.config(text=f"{note.get('image_count', 0)}张图片")
+                        # 获取数据库中的详细信息
+                        title = note.get('title', '') or f"笔记 {idx}"
+                        author = note.get('author', '')
+                        like_count = note.get('like_count', 0) or 0
+                        collect_count = note.get('collect_count', 0) or 0
+                        comment_count = note.get('comment_count', 0) or 0
+                        content = note.get('content', '')
+                        tags = note.get('tags', '')
+                        note_type = note.get('note_type', '图文')
                         
-                        detail = f"文件夹: {note.get('folder', '')}\n"
-                        detail += f"图片数量: {note.get('image_count', 0)}\n"
+                        # 更新顶部信息
+                        self.detail_title_label.config(text=title[:40] + ('...' if len(title) > 40 else ''))
+                        self.detail_likes.config(text=f"❤ {like_count}")
+                        self.detail_collects.config(text=f"⭐ {collect_count}")
+                        self.detail_comments.config(text=f"💬 {comment_count}")
+                        self.detail_author.config(text=f"@{author}" if author else f"{note.get('image_count', 0)}张图片")
+                        
+                        # 构建详情文本
+                        detail = ""
+                        if title and title != f"笔记 {idx}":
+                            detail += f"标题: {title}\n"
+                        if author:
+                            detail += f"作者: {author}\n"
+                        detail += f"类型: {note_type}\n"
+                        detail += f"图片: {note.get('image_count', 0)}张\n"
                         detail += f"视频: {'有' if note.get('has_video') else '无'}\n"
-                        detail += f"\n--- 图片文件 ---\n"
+                        
+                        if content:
+                            detail += f"\n--- 内容 ---\n{content[:500]}\n"
+                        
+                        if tags:
+                            try:
+                                tag_list = json.loads(tags) if isinstance(tags, str) else tags
+                                if tag_list:
+                                    detail += f"\n标签: {', '.join(tag_list[:10])}\n"
+                            except:
+                                pass
+                        
+                        detail += f"\n--- 本地文件 ({note.get('image_count', 0)}张) ---\n"
                         for img in note.get('images', [])[:10]:
                             detail += f"• {os.path.basename(img)}\n"
                         
@@ -1962,11 +2317,12 @@ class CrawlerApp:
         if valid_stored:
             local_images = valid_stored
         else:
-            # 没有有效的存储路径，使用精确的批次目录+序号查找
+            # 没有有效的存储路径，尝试多种方法查找
             local_images = []
             batch_dir = note.get('batch_dir', '')
+            note_id = note.get('note_id', '')
             
-            # 获取当前选中的序号
+            # 方法1: 使用batch_dir + 序号查找
             idx = None
             try:
                 selected = self.result_tree.selection()
@@ -1976,15 +2332,62 @@ class CrawlerApp:
             except:
                 pass
             
-            # 只使用精确的批次目录+序号查找（不跨批次）
             if batch_dir and idx:
                 abs_batch = os.path.abspath(batch_dir)
-                # 精确匹配 note_{idx}_ 开头的文件夹
                 pattern = f"{abs_batch}/note_{idx}_*/*.*"
                 local_images = [os.path.abspath(f) for f in glob.glob(pattern) 
                                if f.lower().endswith(('.jpg', '.png', '.webp'))]
             
-            # 不使用其他备用方法，避免跨笔记混淆
+            # 方法2: 根据note_id在所有文件夹中搜索（新格式文件夹）
+            if not local_images and note_id and os.path.exists("images"):
+                for batch_folder in os.listdir("images"):
+                    batch_path = os.path.join("images", batch_folder)
+                    if os.path.isdir(batch_path):
+                        for note_folder in os.listdir(batch_path):
+                            if note_folder.startswith("note_") and note_id in note_folder:
+                                folder_path = os.path.abspath(os.path.join(batch_path, note_folder))
+                                for ext in ['*.jpg', '*.png', '*.webp']:
+                                    local_images.extend(glob.glob(os.path.join(folder_path, ext)))
+                                if local_images:
+                                    break
+                    if local_images:
+                        break
+            
+            # 方法3: 根据crawl_time找批次，用序号匹配（旧格式文件夹）
+            if not local_images and os.path.exists("images"):
+                crawl_time_str = note.get('crawl_time', '')
+                if crawl_time_str and idx:
+                    try:
+                        from datetime import datetime, timedelta
+                        crawl_time = datetime.strptime(crawl_time_str, "%Y-%m-%d %H:%M:%S")
+                        
+                        # 遍历所有批次文件夹，找到时间匹配的
+                        for batch_folder in os.listdir("images"):
+                            batch_path = os.path.join("images", batch_folder)
+                            if os.path.isdir(batch_path):
+                                # 从文件夹名提取时间
+                                parts = batch_folder.split("_")
+                                if len(parts) >= 3:
+                                    try:
+                                        date_str = parts[-2]
+                                        time_str = parts[-1]
+                                        batch_time = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
+                                        # 在批次时间前后30分钟内
+                                        diff = abs((crawl_time - batch_time).total_seconds())
+                                        if diff < 1800:
+                                            # 在这个批次中查找 note_{idx}_ 开头的文件夹
+                                            for note_folder in os.listdir(batch_path):
+                                                if note_folder.startswith(f"note_{idx}_"):
+                                                    folder_path = os.path.abspath(os.path.join(batch_path, note_folder))
+                                                    for ext in ['*.jpg', '*.png', '*.webp']:
+                                                        local_images.extend(glob.glob(os.path.join(folder_path, ext)))
+                                                    break
+                                            if local_images:
+                                                break
+                                    except:
+                                        pass
+                    except:
+                        pass
         
         # 过滤有效路径
         valid_images = [p for p in local_images if p and os.path.exists(p)]
@@ -2098,7 +2501,7 @@ class CrawlerApp:
         try:
             from PIL import Image, ImageTk, ImageDraw
             x_offset = 10
-            thumb_size = 145  # 增大缩略图尺寸
+            thumb_size = 240  # 放大预览图尺寸
             
             # 第一页先显示视频缩略图
             if has_video and self.preview_page == 0:
@@ -2230,7 +2633,7 @@ class CrawlerApp:
         info_frame = tk.Frame(viewer, bg="#1a1a1a")
         info_frame.pack(fill=tk.X, pady=5)
         
-        info_label = tk.Label(info_frame, text="", fg="white", bg="#1a1a1a", font=("", 10))
+        info_label = tk.Label(info_frame, text="", fg="white", bg="#1a1a1a", font=('Microsoft YaHei UI', 14))
         info_label.pack()
         
         # 图片显示区域
@@ -2310,10 +2713,14 @@ class CrawlerApp:
         # 初始显示
         viewer.after(50, update_image)
         
-        # 居中显示
+        # 在主窗口旁边显示（而不是屏幕中心）
         viewer.update_idletasks()
-        x = (viewer.winfo_screenwidth() - 900) // 2
-        y = (viewer.winfo_screenheight() - 700) // 2
+        main_x = self.root.winfo_x()
+        main_y = self.root.winfo_y()
+        main_w = self.root.winfo_width()
+        # 在主窗口右侧显示
+        x = main_x + main_w + 10
+        y = main_y
         viewer.geometry(f"900x700+{x}+{y}")
         
         viewer.focus_set()
@@ -2741,8 +3148,8 @@ class CrawlerApp:
             card = ttk.Frame(stats_grid, relief="solid", borderwidth=1)
             card.grid(row=row, column=col, padx=10, pady=5, sticky="nsew")
             
-            ttk.Label(card, text=label, font=("", 9)).pack(pady=(5, 0))
-            self.dashboard_labels[key] = ttk.Label(card, text=default, font=("", 14, "bold"), foreground="#667eea")
+            ttk.Label(card, text=label, font=('Microsoft YaHei UI', 14)).pack(pady=(5, 0))
+            self.dashboard_labels[key] = ttk.Label(card, text=default, font=('Microsoft YaHei UI', 14, 'bold'), foreground="#667eea")
             self.dashboard_labels[key].pack(pady=(0, 5))
         
         for i in range(4):
@@ -2949,10 +3356,18 @@ class CrawlerApp:
             try:
                 while True:
                     msg, level = self.log_queue.get_nowait()
-                    self.log_text.config(state=tk.NORMAL)
-                    self.log_text.insert(tk.END, msg, level)
-                    self.log_text.see(tk.END)
-                    self.log_text.config(state=tk.DISABLED)
+                    if HAS_CTK and isinstance(self.log_text, ctk.CTkTextbox):
+                        # CustomTkinter方式
+                        self.log_text.configure(state="normal")
+                        self.log_text.insert(tk.END, msg)
+                        self.log_text.see(tk.END)
+                        self.log_text.configure(state="disabled")
+                    else:
+                        # 标准tkinter方式
+                        self.log_text.config(state=tk.NORMAL)
+                        self.log_text.insert(tk.END, msg, level)
+                        self.log_text.see(tk.END)
+                        self.log_text.config(state=tk.DISABLED)
             except queue.Empty:
                 pass
             self.root.after(100, consume)
@@ -2962,13 +3377,26 @@ class CrawlerApp:
         if "status" in kwargs:
             self.status_var.set(kwargs["status"])
         if "notes" in kwargs:
-            self.notes_var.set(kwargs["notes"])
+            # 支持旧格式 "笔记: X" 和新格式纯数字
+            val = kwargs["notes"]
+            if isinstance(val, str) and ":" in val:
+                val = val.split(":")[-1].strip()
+            self.notes_var.set(str(val))
         if "images" in kwargs:
-            self.images_var.set(kwargs["images"])
+            val = kwargs["images"]
+            if isinstance(val, str) and ":" in val:
+                val = val.split(":")[-1].strip()
+            self.images_var.set(str(val))
         if "videos" in kwargs:
-            self.videos_var.set(kwargs["videos"])
+            val = kwargs["videos"]
+            if isinstance(val, str) and ":" in val:
+                val = val.split(":")[-1].strip()
+            self.videos_var.set(str(val))
         if "time" in kwargs:
-            self.time_var.set(kwargs["time"])
+            val = kwargs["time"]
+            if isinstance(val, str) and ":" in val:
+                val = val.split(":")[-1].strip()
+            self.time_var.set(str(val))
         if "progress" in kwargs:
             self.total_progress["value"] = kwargs["progress"]
             self.progress_label.config(text=f"{int(kwargs['progress'])}%")
@@ -3136,8 +3564,8 @@ class CrawlerApp:
         # 确保数据源是"当前爬取"
         self.data_source_var.set("当前爬取")
         
-        self.start_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
+        self.start_btn.configure(state=tk.DISABLED)
+        self.stop_btn.configure(state=tk.NORMAL)
         
         thread = threading.Thread(target=self._crawl_thread, daemon=True)
         thread.start()
@@ -3399,8 +3827,8 @@ class CrawlerApp:
             self.downloader.reset_stats()
             
             self.is_running = False
-            self.root.after(0, lambda: self.start_btn.config(state=tk.NORMAL))
-            self.root.after(0, lambda: self.stop_btn.config(state=tk.DISABLED))
+            self.root.after(0, lambda: self.start_btn.configure(state=tk.NORMAL))
+            self.root.after(0, lambda: self.stop_btn.configure(state=tk.DISABLED))
     
     def _sync_browser_cookies(self, page):
         """将浏览器Cookie同步到下载器"""
@@ -4574,7 +5002,8 @@ class CrawlerApp:
             
             # 批量下载图片（视频类型不下载封面图）
             if self.config.download_images and data['image_urls'] and note_type != "视频":
-                folder = f"{images_dir}/note_{idx+1}_{timestamp}"
+                # 使用note_id命名文件夹，便于后续匹配数据库
+                folder = f"{images_dir}/note_{idx+1}_{note_id}" if note_id else f"{images_dir}/note_{idx+1}_{timestamp}"
                 tasks = []
                 for i, url in enumerate(data['image_urls'], 1):
                     ext = '.webp' if '.webp' in url else '.jpg'
@@ -4594,7 +5023,7 @@ class CrawlerApp:
             # 下载视频
             if self.config.download_videos and video_url:
                 self.log(f"  开始下载视频...", "INFO")
-                folder = f"{images_dir}/note_{idx+1}_{timestamp}"
+                folder = f"{images_dir}/note_{idx+1}_{note_id}" if note_id else f"{images_dir}/note_{idx+1}_{timestamp}"
                 os.makedirs(folder, exist_ok=True)
                 video_path = f"{folder}/video.mp4"
                 result = self.downloader.download_file(video_url, video_path, lambda: self.should_stop, min_size=10240)
@@ -4620,7 +5049,7 @@ class CrawlerApp:
                     
                     if comment_images_urls and self.config.download_images:
                         # 使用与笔记图片相同的文件夹路径
-                        note_save_folder = f"{images_dir}/note_{idx+1}_{timestamp}"
+                        note_save_folder = f"{images_dir}/note_{idx+1}_{note_id}" if note_id else f"{images_dir}/note_{idx+1}_{timestamp}"
                         comments_dir = os.path.join(note_save_folder, 'comments')
                         os.makedirs(comments_dir, exist_ok=True)
                         
@@ -5291,6 +5720,13 @@ class CrawlerApp:
     
     def _on_closing(self):
         """程序退出时的处理"""
+        # 只保存窗口位置，大小固定
+        try:
+            self.config.window_x = max(0, self.root.winfo_x())
+            self.config.window_y = max(0, self.root.winfo_y())
+        except:
+            pass
+        
         # 保存当前配置
         self._save_gui_settings()
         self.config.save_to_file()

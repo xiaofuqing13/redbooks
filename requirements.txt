@@ -5,6 +5,10 @@ DrissionPage>=4.0.5.7
 pandas>=2.0.0
 openpyxl>=3.1.0
 requests>=2.25.0
+Pillow>=9.0.0
+
+# 界面美化（推荐）
+customtkinter>=5.2.0
 
 # 可选依赖（数据分析功能）
 # 如需使用图表、词云、报告功能，请安装：
