@@ -4572,8 +4572,8 @@ class CrawlerApp:
             data['image_urls'] = filtered_images[:20]  # 最多保存20张
             self.log(f"  共获取到 {len(data['image_urls'])} 张图片URL", "INFO")
             
-            # 批量下载图片
-            if self.config.download_images and data['image_urls']:
+            # 批量下载图片（视频类型不下载封面图）
+            if self.config.download_images and data['image_urls'] and note_type != "视频":
                 folder = f"{images_dir}/note_{idx+1}_{timestamp}"
                 tasks = []
                 for i, url in enumerate(data['image_urls'], 1):
@@ -4586,6 +4586,8 @@ class CrawlerApp:
                     data['local_images'] = [os.path.abspath(r) for r in results.values() if r]
                     data['image_count'] = len(data['local_images'])
                     self.log(f"  下载成功 {data['image_count']}/{len(tasks)} 张图片", "SUCCESS" if data['image_count'] > 0 else "WARNING")
+            elif note_type == "视频":
+                self.log(f"  视频类型跳过图片下载", "INFO")
             elif not data['image_urls']:
                 self.log(f"  未获取到图片URL", "WARNING")
             
