@@ -1743,15 +1743,19 @@ class CrawlerApp:
             values = item['values']
             
             # 检查是否是批次视图（文件夹模式）
-            # 只有当数据源是"当前爬取"且明确处于批次浏览模式时才使用批次逻辑
             data_source = self.data_source_var.get()
             batch_notes = getattr(self, 'batch_notes_data', [])
             batch_folder = getattr(self, 'current_batch_folder', None)
             
-            # 如果数据源不是"当前爬取"，或者正在查看当前爬取的结果，不使用批次逻辑
-            if data_source != "当前爬取" or (not batch_folder and self.all_notes_data):
-                batch_notes = []
-                batch_folder = None
+            # 检查用户是否明确选择了一个爬取批次（不是"全部"）
+            selected_batch = getattr(self, 'crawl_batch_var', None)
+            batch_selected = selected_batch and selected_batch.get() and selected_batch.get() != "全部"
+            
+            # 只有在没有明确选择批次的情况下，才根据数据源清空批次逻辑
+            if not batch_selected:
+                if data_source != "当前爬取" or (not batch_folder and self.all_notes_data):
+                    batch_notes = []
+                    batch_folder = None
             
             if batch_folder and batch_notes:
                 # 批次内的笔记视图
