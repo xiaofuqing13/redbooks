@@ -4782,43 +4782,63 @@ class CrawlerApp:
         return comments
     
     def _filter_live_images(self, image_urls: list) -> list:
-        """过滤Live图（动态图片），只保留一张
+        """过滤Live图（动态图片），只保留一张静态版本
         
         Live图特征：
         1. URL中包含 'live' 关键字
-        2. 同一基础URL的不同格式/参数变体
-        3. 成对出现的静态图+动态图
+        2. 同一张图片有静态和动态两个版本
+        3. URL结构相似，只是路径或参数不同
         """
+        import re
+        
         if not image_urls:
             return []
         
         # 去重
         unique_urls = list(dict.fromkeys(image_urls))
         
-        # 提取URL基础部分（去掉参数和格式后缀）
-        def get_base_url(url):
-            import re
+        def extract_image_id(url):
+            """提取图片的核心ID（去掉所有变体标记）"""
             # 移除查询参数
             base = url.split('?')[0]
-            # 移除常见的图片处理参数
-            base = re.sub(r'![\w_]+$', '', base)
-            base = re.sub(r'\.(jpg|jpeg|png|webp|gif).*$', '', base, flags=re.IGNORECASE)
-            # 移除live标记
-            base = re.sub(r'/live/', '/', base)
-            base = re.sub(r'_live\d*', '', base)
-            return base
+            # 移除处理参数如 !nd_dft_wlteh_webp_3
+            base = re.sub(r'![^/]+$', '', base)
+            
+            # 提取文件名部分
+            filename = base.split('/')[-1]
+            
+            # 移除扩展名
+            filename = re.sub(r'\.(jpg|jpeg|png|webp|gif|heic)$', '', filename, flags=re.IGNORECASE)
+            
+            # 移除live相关标记
+            # 例如: spectrum/1040g0k031fat0rfh5g6g5p4sk5ohqo95i4stbh0_live.jpg -> spectrum/1040g0k031fat0rfh5g6g5p4sk5ohqo95i4stbh0
+            filename = re.sub(r'_live\d*$', '', filename)
+            filename = re.sub(r'-live\d*$', '', filename)
+            
+            # 提取核心ID（通常是长字符串）
+            # 匹配类似 1040g0k031fat0rfh5g6g5p4sk5ohqo95i4stbh0 的ID
+            id_match = re.search(r'([a-z0-9]{20,})', filename, re.IGNORECASE)
+            if id_match:
+                return id_match.group(1).lower()
+            
+            return filename.lower()
         
-        # 按基础URL分组
+        def is_live_url(url):
+            """判断是否是Live图URL"""
+            url_lower = url.lower()
+            return 'live' in url_lower or '/live/' in url_lower
+        
+        # 按图片ID分组
         url_groups = {}
         for url in unique_urls:
-            base = get_base_url(url)
-            if base not in url_groups:
-                url_groups[base] = []
-            url_groups[base].append(url)
+            img_id = extract_image_id(url)
+            if img_id not in url_groups:
+                url_groups[img_id] = []
+            url_groups[img_id].append(url)
         
         # 每组只保留一张（优先非live的静态图）
         filtered = []
-        for base, urls in url_groups.items():
+        for img_id, urls in url_groups.items():
             if len(urls) == 1:
                 filtered.append(urls[0])
             else:
@@ -4826,9 +4846,12 @@ class CrawlerApp:
                 # 优先级：不含live > 含jpg/png > 其他
                 best = None
                 for url in urls:
-                    url_lower = url.lower()
-                    if 'live' not in url_lower:
-                        if best is None or ('.jpg' in url_lower or '.png' in url_lower):
+                    if not is_live_url(url):
+                        # 优先选择静态图
+                        url_lower = url.lower()
+                        if best is None:
+                            best = url
+                        elif '.jpg' in url_lower or '.png' in url_lower:
                             best = url
                 
                 # 如果全是live图，取第一张
@@ -4836,19 +4859,9 @@ class CrawlerApp:
                     best = urls[0]
                 
                 filtered.append(best)
+                self.log(f"  Live图过滤: {len(urls)}张相似图 -> 保留1张", "DEBUG")
         
-        # 额外过滤：检测URL中明确的live标记，如果有成对的非live版本就跳过
-        final_urls = []
-        seen_bases = set()
-        
-        for url in filtered:
-            base = get_base_url(url)
-            if base in seen_bases:
-                continue
-            seen_bases.add(base)
-            final_urls.append(url)
-        
-        return final_urls
+        return filtered
     
     def _is_emoji_image(self, url: str) -> bool:
         """检测是否是表情包图片"""
