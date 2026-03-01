@@ -1,5 +1,8 @@
 # 小红书爬虫工具
 
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white) ![Playwright](https://img.shields.io/badge/Playwright-2EAD33?logo=playwright&logoColor=white) ![License](https://img.shields.io/badge/License-MIT-green)
+
+
 一个功能完整的小红书笔记爬虫工具，支持关键词搜索、主页推荐、博主主页爬取，具有图形化界面。
 
 
