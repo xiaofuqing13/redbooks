@@ -40,6 +40,25 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 VERSION = "5.3"
 APP_NAME = f"小红书爬虫终极版 v{VERSION}"
 
+
+def _enable_dpi_awareness():
+    """声明进程 DPI 感知，必须在创建任何 tk 窗口之前调用。
+
+    不声明时，高分屏（如 4K@175%）上 Windows 会对整个 Tk 界面做位图
+    拉伸——字体发虚、控件比例失真，且 Tk 只能看到被虚拟化的低分辨率，
+    导致保存的窗口尺寸下次启动时溢出屏幕。声明为 System-Aware 后界面
+    清晰，且点号字体（如 14pt）会按真实 DPI 自动放大到正确物理尺寸。
+    """
+    try:
+        import ctypes
+        try:
+            # PROCESS_SYSTEM_DPI_AWARE = 1（比 per-monitor 更稳，够用）
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()  # 老系统回退
+    except Exception:
+        pass  # 非 Windows 或无相关 API，忽略
+
 # 导出文件（xlsx/csv）的列名中译映射。
 # ⚠️ 写盘用中文列头，但所有回读代码按英文键取列 —— 回读任何导出文件
 # 前必须先经 normalize_df_columns() 反向归一化，否则统计恒为 0、
@@ -755,35 +774,29 @@ class CrawlerApp:
     """爬虫GUI应用"""
     
     def __init__(self):
+        # DPI 感知：仅在没有 CustomTkinter 时才手动声明。
+        # CTk 自带 per-monitor DPI 处理并对自身控件缩放；若此时再手动
+        # SetProcessDpiAwareness，会与 CTk 缩放叠加（实测 4K@175% 下窗口
+        # 被放大到近全屏 3844px）。有 CTk 时交由它统一处理。
+        if not HAS_CTK:
+            _enable_dpi_awareness()
+
         # 使用CustomTkinter创建现代化窗口
         if HAS_CTK:
             self.root = ctk.CTk()
             self.root.configure(fg_color="#f5f5f5")
         else:
             self.root = tk.Tk()
-        
+
         self.root.title(APP_NAME)
-        self.root.minsize(900, 650)
+        # DPI 缩放因子：DPI 感知后点号字体自动放大，最小尺寸也须同比放大，
+        # 否则在 175% 屏上窗口相对字体过小、控件挤成一团
+        self.ui_scale = self._detect_ui_scale()
+        self.root.minsize(int(900 * self.ui_scale), int(640 * self.ui_scale))
         
         self.config = CrawlerConfig()
         # 加载上次的配置
         self.config.load_from_file()
-        
-        # 恢复上次窗口大小与位置（尺寸此前被保存却从不使用）
-        win_x = self.config.window_x if self.config.window_x >= 0 else 100
-        win_y = self.config.window_y if self.config.window_y >= 0 else 100
-        win_w = self.config.window_width if self.config.window_width >= 900 else 1100
-        win_h = self.config.window_height if self.config.window_height >= 650 else 720
-        # 防止越界（比如从大屏切换到小屏后恢复）
-        try:
-            win_w = min(win_w, self.root.winfo_screenwidth())
-            win_h = min(win_h, self.root.winfo_screenheight() - 40)
-            win_x = max(0, min(win_x, self.root.winfo_screenwidth() - 200))
-            win_y = max(0, min(win_y, self.root.winfo_screenheight() - 200))
-        except tk.TclError:
-            pass
-
-        self.root.geometry(f"{win_w}x{win_h}+{win_x}+{win_y}")
         
         self.downloader = MediaDownloader()
         self.cookie_mgr = CookieManager(self.config.cookies_file)
@@ -805,10 +818,61 @@ class CrawlerApp:
         
         # 恢复上次的GUI设置
         self._restore_gui_settings()
-        
+
+        # 恢复窗口大小与位置——必须在 _create_ui 之后再设并锁定。
+        # 若在建控件前设，DPI 放大后的控件自然尺寸会通过 pack 传播把
+        # 窗口撑大到近全屏；此处 update_idletasks 后再 geometry 才生效。
+        # 边界钳制见 _sane_window_geometry（防失效坐标溢出屏幕）。
+        win_w, win_h, win_x, win_y = self._sane_window_geometry(
+            self.config.window_width, self.config.window_height,
+            self.config.window_x, self.config.window_y)
+        self.root.update_idletasks()
+        self.root.geometry(f"{win_w}x{win_h}+{win_x}+{win_y}")
+
         # 程序退出时关闭浏览器并保存配置
         self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
     
+    def _detect_ui_scale(self) -> float:
+        """DPI 缩放因子（诊断用）。有 CTk 时 Tk 层为 DPI-unaware，
+        winfo 坐标已是逻辑像素，本值多为 1.0；CTk 自行处理物理缩放。"""
+        try:
+            return max(1.0, self.root.winfo_fpixels('1i') / 96.0)
+        except Exception:
+            return 1.0
+
+    def _sane_window_geometry(self, w, h, x, y) -> Tuple[int, int, int, int]:
+        """把保存的窗口几何钳制到可见且合理的范围。
+
+        全部计算都在 Tk 自身坐标系（winfo_screenwidth/height）内完成——
+        有 CustomTkinter 时该坐标系是"逻辑像素"（如 4K@175% 下为 2194×1234），
+        CTk 再按 1.75 渲染成物理像素。**切勿**在这里掺入 ctypes 的物理
+        分辨率：逻辑/物理混用正是窗口跑出屏幕的根因（saved x 在物理系
+        里合法、在逻辑系里却越界）。
+        尺寸上限取屏幕 88%/86%，想占满请用系统最大化。
+        位置：窗口需完整落在屏内，否则（含拔副屏后的失效坐标）居中偏上。
+        """
+        try:
+            sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        except tk.TclError:
+            return 1000, 700, 80, 60
+        min_w, min_h = 880, 620
+        max_w, max_h = int(sw * 0.88), int(sh * 0.86)
+        default_w, default_h = int(sw * 0.82), int(sh * 0.82)
+        # 保存值须在 [min, 屏宽] 内才采用，否则回落到默认
+        w = int(w) if (w and min_w <= int(w) <= sw) else default_w
+        h = int(h) if (h and min_h <= int(h) <= sh) else default_h
+        w = max(min_w, min(w, max_w))
+        h = max(min_h, min(h, max_h))
+        # 位置：任一方向越界即视为失效坐标，居中偏上重置
+        try:
+            x, y = int(x), int(y)
+        except (TypeError, ValueError):
+            x = y = -99999
+        if x < 0 or y < 0 or x + w > sw or y + h > sh:
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // 3)
+        return w, h, x, y
+
     def _setup_styles(self):
         """设置样式主题"""
         style = ttk.Style()
@@ -2817,11 +2881,37 @@ class CrawlerApp:
             return
         
         from PIL import Image, ImageTk
-        
+
+        # 按首图长宽比计算窗口尺寸：小红书图多为 3:4 竖图，
+        # 固定 900x700 横框会把竖图缩成中间一小条。
+        # 所有坐标用 Tk 自身坐标系（winfo_*），与主窗口一致，
+        # 不掺 ctypes 物理分辨率（逻辑/物理混用会让窗口跑出屏幕）。
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        CHROME_H = 110  # 顶部信息栏 + 底部按钮栏的额外高度
+        try:
+            with Image.open(self.preview_image_paths[start_index]) as _im:
+                img_w, img_h = _im.size
+        except Exception:
+            img_w, img_h = 3, 4  # 打不开时按典型竖图比例
+        fit = min((sw * 0.66) / img_w, (sh * 0.82 - CHROME_H) / img_h)
+        view_w = max(480, min(int(img_w * fit) + 40, int(sw * 0.9)))
+        view_h = max(560, min(int(img_h * fit) + CHROME_H, int(sh * 0.9)))
+
+        # 居中于主窗口，再整体钳回屏内（主窗口贴边时不跑出屏幕）
+        try:
+            mx, my = self.root.winfo_x(), self.root.winfo_y()
+            mw, mh = self.root.winfo_width(), self.root.winfo_height()
+        except tk.TclError:
+            mx = my = 0; mw, mh = sw, sh
+        pos_x = max(0, min(mx + (mw - view_w) // 2, sw - view_w))
+        pos_y = max(0, min(my + (mh - view_h) // 2, sh - view_h))
+
         # 创建查看器窗口
         viewer = tk.Toplevel(self.root)
         viewer.title("图片查看器")
-        viewer.geometry("900x700")
+        viewer.geometry(f"{view_w}x{view_h}+{pos_x}+{pos_y}")
+        viewer.minsize(460, 520)
+        viewer.transient(self.root)  # 保持在主窗口之上，随主窗口最小化
         viewer.configure(bg="#1a1a1a")
         
         # 当前图片索引
@@ -2855,11 +2945,13 @@ class CrawlerApp:
                     canvas_h = canvas.winfo_height() or 550
                     
                     img_w, img_h = img.size
-                    ratio = min(canvas_w / img_w, canvas_h / img_h, 1.0)  # 不放大超过原尺寸
-                    new_w = int(img_w * ratio)
-                    new_h = int(img_h * ratio)
-                    
-                    if ratio < 1.0:
+                    # 允许适度放大（≤2x）填满画布：此前上限1.0，小图在
+                    # 深色大窗口里只有中间一小块
+                    ratio = min(canvas_w / img_w, canvas_h / img_h, 2.0)
+                    new_w = max(1, int(img_w * ratio))
+                    new_h = max(1, int(img_h * ratio))
+
+                    if ratio != 1.0:
                         img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
                     
                     photo_ref[0] = ImageTk.PhotoImage(img)
@@ -2909,19 +3001,9 @@ class CrawlerApp:
                 viewer.after(100, update_image)
         canvas.bind("<Configure>", on_resize)
         
-        # 初始显示
+        # 初始显示（窗口几何已在创建时按图片比例设定并钳制在屏内；
+        # 此前这里把窗口挪到"主窗口右侧+10px"，主窗口较宽时直接弹出屏幕外）
         viewer.after(50, update_image)
-        
-        # 在主窗口旁边显示（而不是屏幕中心）
-        viewer.update_idletasks()
-        main_x = self.root.winfo_x()
-        main_y = self.root.winfo_y()
-        main_w = self.root.winfo_width()
-        # 在主窗口右侧显示
-        x = main_x + main_w + 10
-        y = main_y
-        viewer.geometry(f"900x700+{x}+{y}")
-        
         viewer.focus_set()
     
     def _on_preview_double_click(self, event):
@@ -6154,12 +6236,16 @@ class CrawlerApp:
     
     def _on_closing(self):
         """程序退出时的处理"""
-        # 保存窗口位置与大小
+        # 保存窗口位置与大小。
+        # 仅在普通(normal)状态下保存：最大化时 winfo 返回的是全屏尺寸
+        # (如 2560x1225)，存下来会在下次启动恢复成"伪全屏"浮窗——
+        # settings 里那组坏几何正是这么来的。
         try:
-            self.config.window_x = max(0, self.root.winfo_x())
-            self.config.window_y = max(0, self.root.winfo_y())
-            self.config.window_width = self.root.winfo_width()
-            self.config.window_height = self.root.winfo_height()
+            if self.root.state() == 'normal':
+                self.config.window_x = self.root.winfo_x()
+                self.config.window_y = self.root.winfo_y()
+                self.config.window_width = self.root.winfo_width()
+                self.config.window_height = self.root.winfo_height()
         except tk.TclError:
             pass
         
