@@ -4316,25 +4316,71 @@ class CrawlerApp:
                 except OSError as ex:
                     messagebox.showerror("错误", f"无法播放: {ex}", parent=win)
 
-        # 悬浮圆形翻页箭头（白底灰字，叠在图片左右边缘）
-        arrow_prev = ctk.CTkButton(
-            left, text="‹", width=40, height=40, corner_radius=20, command=prev_slot,
-            font=UI_FONT(FS_TITLE, bold=True), fg_color="#FFFFFF", hover_color="#F0F0F0",
-            text_color=C['text'], text_color_disabled=C['text_faint'])
-        arrow_next = ctk.CTkButton(
-            left, text="›", width=40, height=40, corner_radius=20, command=next_slot,
-            font=UI_FONT(FS_TITLE, bold=True), fg_color="#FFFFFF", hover_color="#F0F0F0",
-            text_color=C['text'], text_color_disabled=C['text_faint'])
+        # 悬浮翻页箭头：直接绘制在 canvas 上。
+        # 不用 CTkButton——它的圆角**四角永远填父容器底色**，place 到图片
+        # 上就是一块 40px 白方板（旧观感生硬的根因），任何 tk 组件库都有
+        # 此局限。改为带 alpha 的半透明白圆 + Lucide 图标库的 chevron
+        # 矢量路径（ISC 许可），Pillow 4x 超采样抗锯齿，真悬浮在图上。
+        AR_D = 44   # 圆钮直径
+        AR_SS = 4   # 超采样倍数
+
+        def _arrow_img(direction, style):
+            fill_a = {'normal': 214, 'hover': 255, 'disabled': 92}[style]
+            stroke = {'normal': '#3A3A3A', 'hover': C['brand'],
+                      'disabled': '#B9B9B9'}[style]
+            S = AR_D * AR_SS
+            im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+            dr = ImageDraw.Draw(im)
+            dr.ellipse((0, 0, S - 1, S - 1), fill=(255, 255, 255, fill_a))
+            # Lucide chevron-left 折线 (15,18)-(9,12)-(15,6)，24 视窗
+            pts = [(15.0, 18.0), (9.0, 12.0), (15.0, 6.0)]
+            if direction == 'next':
+                pts = [(24.0 - x, y) for x, y in pts]
+            k = S / 24.0
+            pts = [(x * k, y * k) for x, y in pts]
+            w = max(2, round(2.2 * AR_SS))
+            dr.line(pts, fill=stroke, width=w, joint="curve")
+            r = w / 2 - 0.5
+            for x, y in (pts[0], pts[-1]):  # 手动补圆头线帽（PIL line 无 linecap）
+                dr.ellipse((x - r, y - r, x + r, y + r), fill=stroke)
+            im = im.resize((AR_D, AR_D), Image.Resampling.LANCZOS)
+            return ImageTk.PhotoImage(im)
+
+        arrow_imgs = {(d, s): _arrow_img(d, s)
+                      for d in ('prev', 'next') for s in ('normal', 'hover', 'disabled')}
+        arrow_state = {'prev': 'normal', 'next': 'normal'}
 
         def _sync_arrows(i):
+            """按当前页重画两枚箭头（show_slot 每次 delete all 后调用）。"""
+            canvas.delete("nav")
             if len(slots) <= 1:
-                arrow_prev.place_forget()
-                arrow_next.place_forget()
                 return
-            arrow_prev.place(relx=0.0, rely=0.5, x=14, anchor="w")
-            arrow_next.place(relx=1.0, rely=0.5, x=-14, anchor="e")
-            arrow_prev.configure(state="normal" if i > 0 else "disabled")
-            arrow_next.configure(state="normal" if i < len(slots) - 1 else "disabled")
+            cw = canvas.winfo_width() or 520
+            ch = canvas.winfo_height() or 640
+            for d, x, enabled in (('prev', 24 + AR_D // 2, i > 0),
+                                  ('next', cw - 24 - AR_D // 2, i < len(slots) - 1)):
+                arrow_state[d] = 'normal' if enabled else 'disabled'
+                canvas.create_image(x, ch // 2, image=arrow_imgs[(d, arrow_state[d])],
+                                    tags=("nav", f"nav_{d}"))
+
+        def _arrow_enter(d):
+            if arrow_state[d] == 'normal':
+                canvas.itemconfig(f"nav_{d}", image=arrow_imgs[(d, 'hover')])
+                canvas.configure(cursor="hand2")
+
+        def _arrow_leave(d):
+            canvas.itemconfig(f"nav_{d}", image=arrow_imgs[(d, arrow_state[d])])
+            canvas.configure(cursor="")
+
+        def _arrow_click(d):
+            if arrow_state[d] != 'disabled':
+                (prev_slot if d == 'prev' else next_slot)()
+            return "break"  # 阻断 canvas 全局点击（避免误触视频播放）
+
+        for _d in ('prev', 'next'):
+            canvas.tag_bind(f"nav_{_d}", "<Enter>", lambda e, d=_d: _arrow_enter(d))
+            canvas.tag_bind(f"nav_{_d}", "<Leave>", lambda e, d=_d: _arrow_leave(d))
+            canvas.tag_bind(f"nav_{_d}", "<Button-1>", lambda e, d=_d: _arrow_click(d))
 
         canvas.bind("<Button-1>", on_canvas_click)
         canvas.bind("<Configure>", lambda e: show_slot())
