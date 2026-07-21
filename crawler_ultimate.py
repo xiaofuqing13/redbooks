@@ -8,14 +8,26 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog
 
-# 尝试导入CustomTkinter美化界面
+# CustomTkinter 是界面的必需依赖，不再是可选美化项。
+# 曾经的 "有则用 CTk、无则退回 tk" 双路径正是界面观感割裂的根源：
+# 同一屏里 Win95 凹陷输入框与现代圆角按钮并存。统一为单一渲染体系后，
+# 缺失依赖就明确报错，而不是静默降级成另一套长相。
 try:
     import customtkinter as ctk
-    ctk.set_appearance_mode("light")  # 浅色主题
-    ctk.set_default_color_theme("blue")  # 蓝色主题
+    ctk.set_appearance_mode("light")  # 本程序固定浅色，深色需另配图表/预览色
     HAS_CTK = True
 except ImportError:
     HAS_CTK = False
+    _root = tk.Tk()
+    _root.withdraw()
+    messagebox.showerror(
+        "缺少依赖",
+        "界面依赖 customtkinter，尚未安装。\n\n"
+        "请在项目目录执行：\n    pip install customtkinter\n"
+        "或：\n    pip install -r requirements.txt"
+    )
+    _root.destroy()
+    raise SystemExit(1)
 import threading
 import queue
 import json
@@ -89,9 +101,19 @@ C = {
     'text_faint':   '#9CA3AF',   # 占位提示 / 禁用态
     'text_on_brand':'#FFFFFF',
 
+    'row_video':    '#9A4A44',   # 表格中视频行的文字（低饱和暖褐，克制区分）
+    'hover':        '#E9EAEE',   # 未选中标签页的悬停底
+    'warn_soft':    '#FFF8EC',   # 警告提示的浅底
+
     'canvas':       '#F7F7F8',   # 预览画布底
     'viewer_bg':    '#1A1A1A',   # 图片查看器深色底
+    'viewer_btn':   '#2E2E2E',   # 查看器按钮底
+    'viewer_btn_h': '#3D3D3D',
+    'viewer_text':  '#E8E8E8',
 }
+
+# 图表配色：与界面同源，生成的 PNG 才像同一个产品出来的
+CHART_COLORS = [C['brand'], '#2D9C8F', '#E8A33D', '#6B7280', '#8B5CF6']
 
 FONT_FAMILY = 'Microsoft YaHei UI'
 FONT_MONO = 'Consolas'
@@ -700,7 +722,7 @@ class DataAnalyzer:
             # 点赞分布图
             if 'like_count' in df.columns:
                 fig, ax = plt.subplots(figsize=(10, 6))
-                df['like_count'].hist(bins=20, ax=ax, color='#ff6b6b', edgecolor='white')
+                df['like_count'].hist(bins=20, ax=ax, color=C['brand'], edgecolor='white')
                 ax.set_title('点赞数分布', fontsize=14)
                 ax.set_xlabel('点赞数')
                 ax.set_ylabel('笔记数量')
@@ -714,7 +736,7 @@ class DataAnalyzer:
                 fig, ax = plt.subplots(figsize=(8, 8))
                 type_counts = df['note_type'].value_counts()
                 ax.pie(type_counts.values, labels=type_counts.index, autopct='%1.1f%%',
-                       colors=['#4ecdc4', '#ff6b6b', '#ffe66d'])
+                       colors=CHART_COLORS)
                 ax.set_title('笔记类型分布', fontsize=14)
                 chart_path = os.path.join(output_dir, 'type_distribution.png')
                 plt.savefig(chart_path, dpi=100, bbox_inches='tight')
@@ -726,7 +748,7 @@ class DataAnalyzer:
                 fig, ax = plt.subplots(figsize=(12, 6))
                 top10 = df.nlargest(10, 'like_count')
                 titles = [t[:15] + '...' if len(t) > 15 else t for t in top10['title']]
-                ax.barh(range(len(top10)), top10['like_count'], color='#667eea')
+                ax.barh(range(len(top10)), top10['like_count'], color=C['brand'])
                 ax.set_yticks(range(len(top10)))
                 ax.set_yticklabels(titles)
                 ax.set_xlabel('点赞数')
@@ -827,20 +849,12 @@ class CrawlerApp:
     """爬虫GUI应用"""
     
     def __init__(self):
-        # DPI 感知：仅在没有 CustomTkinter 时才手动声明。
-        # CTk 自带 per-monitor DPI 处理并对自身控件缩放；若此时再手动
-        # SetProcessDpiAwareness，会与 CTk 缩放叠加（实测 4K@175% 下窗口
-        # 被放大到近全屏 3844px）。有 CTk 时交由它统一处理。
-        if not HAS_CTK:
-            _enable_dpi_awareness()
-
-        # 使用CustomTkinter创建现代化窗口
-        if HAS_CTK:
-            self.root = ctk.CTk()
-            self.root.configure(fg_color="#f5f5f5")
-        else:
-            self.root = tk.Tk()
-
+        # DPI 感知交由 CustomTkinter 统一处理，此处**不要**再调
+        # _enable_dpi_awareness()：CTk 自带 per-monitor 缩放，手动叠加
+        # SetProcessDpiAwareness 会双重放大（实测 4K@175% 下窗口被撑到
+        # 近全屏 3844px）。该函数仅为无 CTk 的历史路径保留。
+        self.root = ctk.CTk()
+        self.root.configure(fg_color=C['bg'])
         self.root.title(APP_NAME)
         # DPI 缩放因子：DPI 感知后点号字体自动放大，最小尺寸也须同比放大，
         # 否则在 175% 屏上窗口相对字体过小、控件挤成一团
@@ -927,441 +941,643 @@ class CrawlerApp:
         return w, h, x, y
 
     def _setup_styles(self):
-        """设置样式主题"""
+        """建立全局视觉样式。取值一律来自模块级设计令牌 C / UI_FONT。
+
+        界面由两套渲染体系拼成，本方法负责让它们看起来是同一个产品：
+        - CustomTkinter 承担按钮/输入/勾选等交互控件 —— 改 ThemeManager
+          全局默认色，各处就不必再重复写 fg_color，也杜绝了配色漂移。
+        - ttk 只保留没有 CTk 对应实现的控件（Treeview / Notebook /
+          Scrollbar / Combobox / Spinbox / PanedWindow）。Windows 默认的
+          'vista' 主题会**忽略**大部分 configure 选项（背景、边框都改不动），
+          因此必须先切到 'clam' 才能把它们拉到与 CTk 一致的观感。
+        """
+        self.colors = C  # 兼容旧引用；新代码直接用模块级 C
+
+        # ---- CustomTkinter 全局主题 ----
+        if HAS_CTK:
+            self._setup_ctk_theme()
+
+        # ---- ttk 主题 ----
         style = ttk.Style()
-        
-        # 主题颜色
-        self.colors = {
-            'primary': '#3b82f6',      # 蓝色
-            'primary_hover': '#2563eb',
-            'success': '#22c55e',      # 绿色
-            'danger': '#ef4444',       # 红色
-            'warning': '#f59e0b',      # 橙色
-            'bg': '#f8fafc',           # 背景
-            'card': '#ffffff',         # 卡片背景
-            'border': '#e2e8f0',       # 边框
-            'text': '#1e293b',         # 主文字
-            'text_secondary': '#64748b', # 次要文字
-        }
-        
-        # 配置Treeview样式
+        try:
+            style.theme_use('clam')  # 唯一能完整响应 configure 的内置主题
+        except tk.TclError:
+            pass  # 极少数环境无 clam，退回默认主题（观感降级但不影响功能）
+
+        # 全局默认字体：覆盖 tk.Menu、messagebox 等无法逐个配置的控件
+        self.root.option_add('*Font', UI_FONT())
+        self.root.option_add('*TCombobox*Listbox.font', UI_FONT())
+        self.root.option_add('*TCombobox*Listbox.background', C['card'])
+        self.root.option_add('*TCombobox*Listbox.foreground', C['text'])
+        self.root.option_add('*TCombobox*Listbox.selectBackground', C['brand_soft'])
+        self.root.option_add('*TCombobox*Listbox.selectForeground', C['brand'])
+        self.root.option_add('*Menu.background', C['card'])
+        self.root.option_add('*Menu.foreground', C['text'])
+        self.root.option_add('*Menu.activeBackground', C['brand_soft'])
+        self.root.option_add('*Menu.activeForeground', C['brand'])
+        self.root.option_add('*Menu.relief', 'flat')
+
+        # ---- 容器与文字 ----
+        style.configure("TFrame", background=C['bg'])
+        style.configure("Card.TFrame", background=C['card'])
+        style.configure("TLabel", background=C['bg'], foreground=C['text'], font=UI_FONT())
+        style.configure("TPanedwindow", background=C['bg'])
+        style.configure("TSeparator", background=C['border'])
+
+        # ---- 表格 ----
+        # 行高与字号绑定：38px 是 14pt 中文加行距的舒适值，改字号需同步
         style.configure("Treeview",
-            background="#ffffff",
-            foreground="#1e293b",
-            fieldbackground="#ffffff",
+            background=C['card'],
+            foreground=C['text'],
+            fieldbackground=C['card'],
             rowheight=38,
-            font=('Microsoft YaHei UI', 14)
+            borderwidth=0,
+            font=UI_FONT(FS_SMALL),
         )
         style.configure("Treeview.Heading",
-            background="#f1f5f9",
-            foreground="#475569",
-            font=('Microsoft YaHei UI', 14, 'bold'),
-            padding=(10, 8)
+            background=C['card_alt'],
+            foreground=C['text_sub'],
+            font=UI_FONT(FS_SMALL, bold=True),
+            padding=(10, 10),
+            relief="flat",
+            borderwidth=0,
         )
+        style.map("Treeview.Heading",
+            background=[('active', C['brand_soft'])],
+            foreground=[('active', C['brand'])],
+        )
+        # 选中态用品牌浅底 + 品牌字，不再用蓝色系（与主色冲突）
         style.map("Treeview",
-            background=[('selected', '#dbeafe')],
-            foreground=[('selected', '#1e40af')]
+            background=[('selected', C['brand_soft'])],
+            foreground=[('selected', C['brand'])],
         )
-        
-        # 设置全局默认字体（12号）
-        default_font = ('Microsoft YaHei UI', 16)
-        self.root.option_add('*Font', default_font)
-        self.root.option_add('*TCombobox*Listbox.font', default_font)
-        
-        # 配置Notebook样式
-        style.configure("TNotebook", background="#f8fafc")
+        style.layout("Treeview", [('Treeview.treearea', {'sticky': 'nswe'})])  # 去掉外框
+
+        # ---- 标签页 ----
+        style.configure("TNotebook", background=C['bg'], borderwidth=0, tabmargins=(0, 0, 0, 0))
         style.configure("TNotebook.Tab",
-            padding=(25, 12),
-            font=('Microsoft YaHei UI', 14)
+            padding=(26, 13),
+            font=UI_FONT(),
+            background=C['bg'],
+            foreground=C['text_sub'],
+            borderwidth=0,
         )
+        # 选中态：白底 + 品牌红加粗，与下方内容区连成一片
         style.map("TNotebook.Tab",
-            background=[('selected', '#ffffff'), ('!selected', '#f1f5f9')],
-            foreground=[('selected', '#3b82f6'), ('!selected', '#64748b')]
+            background=[('selected', C['card']), ('active', C['hover'])],
+            foreground=[('selected', C['brand']), ('active', C['text'])],
+            font=[('selected', UI_FONT(bold=True))],
+            expand=[('selected', (0, 0, 0, 0))],
         )
-        
-        # 配置LabelFrame样式
-        style.configure("Card.TLabelframe",
-            background="#ffffff",
+
+        # ---- 输入类 ----
+        for name in ("TEntry", "TCombobox", "TSpinbox"):
+            style.configure(name,
+                font=UI_FONT(),
+                fieldbackground=C['card'],
+                background=C['card'],
+                foreground=C['text'],
+                bordercolor=C['border_strong'],
+                lightcolor=C['border_strong'],
+                darkcolor=C['border_strong'],
+                arrowcolor=C['text_sub'],
+                insertcolor=C['text'],
+                borderwidth=1,
+                padding=(8, 6),
+            )
+            style.map(name,
+                bordercolor=[('focus', C['brand']), ('hover', C['border_strong'])],
+                lightcolor=[('focus', C['brand'])],
+                darkcolor=[('focus', C['brand'])],
+                fieldbackground=[('disabled', C['card_alt']), ('readonly', C['card'])],
+                foreground=[('disabled', C['text_faint'])],
+                arrowcolor=[('disabled', C['text_faint'])],
+            )
+
+        # ---- 滚动条：细窄浅灰，不抢视线 ----
+        for orient in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
+            style.configure(orient,
+                background=C['border_strong'],
+                troughcolor=C['bg'],
+                bordercolor=C['bg'],
+                arrowcolor=C['text_sub'],
+                borderwidth=0,
+                width=12,
+            )
+            style.map(orient, background=[('active', C['text_faint'])])
+
+        # ---- 进度条 ----
+        style.configure("TProgressbar",
+            background=C['brand'],
+            troughcolor=C['border'],
+            bordercolor=C['border'],
+            lightcolor=C['brand'],
+            darkcolor=C['brand'],
+            borderwidth=0,
+            thickness=10,
+        )
+
+        # ---- ttk 按钮（仅弹窗等少数 CTk 未覆盖处使用）----
+        style.configure("TButton",
+            font=UI_FONT(),
+            background=C['card'],
+            foreground=C['text'],
+            bordercolor=C['border_strong'],
+            lightcolor=C['card'],
+            darkcolor=C['card'],
             borderwidth=1,
-            relief="solid"
+            focusthickness=0,
+            padding=(12, 7),
         )
-        style.configure("Card.TLabelframe.Label",
-            background="#ffffff",
-            foreground="#3b82f6",
-            font=('Microsoft YaHei UI', 14, 'bold')
+        style.map("TButton",
+            background=[('pressed', C['brand_soft']), ('active', C['card_alt'])],
+            foreground=[('pressed', C['brand']), ('active', C['brand'])],
+            bordercolor=[('active', C['brand'])],
         )
-        
-        # 配置普通LabelFrame样式
-        style.configure("TLabelframe.Label",
-            font=('Microsoft YaHei UI', 14, 'bold'),
-            foreground="#1565c0"
-        )
-        
-        # 配置其他组件字体
-        style.configure("TRadiobutton", font=('Microsoft YaHei UI', 14))
-        style.configure("TCheckbutton", font=('Microsoft YaHei UI', 14))
-        style.configure("TLabel", font=('Microsoft YaHei UI', 14))
-        style.configure("TEntry", font=('Microsoft YaHei UI', 14))
-        style.configure("TCombobox", font=('Microsoft YaHei UI', 14))
-        style.configure("TSpinbox", font=('Microsoft YaHei UI', 14))
-        style.configure("TButton", font=('Microsoft YaHei UI', 14))
-    
+
+    def _setup_ctk_theme(self):
+        """把 CustomTkinter 的全局默认色改成品牌配色。
+
+        改 ThemeManager 而不是逐控件传 fg_color：控件数以百计，逐个传
+        必然漂移。CTk 主题里每个颜色是 [浅色模式, 深色模式] 两元素列表，
+        本程序固定浅色模式，两个位置填同值即可。
+        """
+        try:
+            theme = ctk.ThemeManager.theme
+        except Exception:
+            return  # CTk 内部结构变化时静默降级，不阻断启动
+
+        def dual(color):
+            return [color, color]
+
+        # 默认字体：不传 font 参数的 CTk 控件直接继承，省掉全文重复
+        theme.setdefault("CTkFont", {})
+        for platform in ("Windows", "macOS", "Linux"):
+            theme["CTkFont"][platform] = {
+                "family": FONT_FAMILY, "size": FS_BASE, "weight": "normal"}
+
+        merges = {
+            "CTk": {"fg_color": dual(C['bg'])},
+            "CTkToplevel": {"fg_color": dual(C['bg'])},
+            "CTkFrame": {
+                "fg_color": dual(C['card']),
+                "top_fg_color": dual(C['card']),
+                "border_color": dual(C['border']),
+                "corner_radius": 10,
+                "border_width": 0,
+            },
+            "CTkButton": {
+                "fg_color": dual(C['brand']),
+                "hover_color": dual(C['brand_hover']),
+                "border_color": dual(C['border_strong']),
+                "text_color": dual(C['text_on_brand']),
+                "text_color_disabled": dual(C['text_faint']),
+                "corner_radius": 8,
+            },
+            "CTkLabel": {
+                "fg_color": "transparent",
+                "text_color": dual(C['text']),
+            },
+            "CTkEntry": {
+                "fg_color": dual(C['card']),
+                "border_color": dual(C['border_strong']),
+                "text_color": dual(C['text']),
+                "placeholder_text_color": dual(C['text_faint']),
+                "corner_radius": 8,
+                "border_width": 1,
+            },
+            "CTkCheckBox": {
+                "fg_color": dual(C['brand']),
+                "hover_color": dual(C['brand_hover']),
+                "border_color": dual(C['border_strong']),
+                "checkmark_color": dual(C['text_on_brand']),
+                "text_color": dual(C['text']),
+                "text_color_disabled": dual(C['text_faint']),
+                "corner_radius": 5,
+                "border_width": 2,
+            },
+            "CTkRadioButton": {
+                "fg_color": dual(C['brand']),
+                "hover_color": dual(C['brand_hover']),
+                "border_color": dual(C['border_strong']),
+                "text_color": dual(C['text']),
+                "text_color_disabled": dual(C['text_faint']),
+            },
+            "CTkProgressBar": {
+                "fg_color": dual(C['border']),
+                "progress_color": dual(C['brand']),
+                "border_color": dual(C['border']),
+            },
+            "CTkTextbox": {
+                "fg_color": dual(C['card']),
+                "border_color": dual(C['border']),
+                "text_color": dual(C['text']),
+                "scrollbar_button_color": dual(C['border_strong']),
+                "scrollbar_button_hover_color": dual(C['text_faint']),
+                "corner_radius": 8,
+            },
+            "CTkComboBox": {
+                "fg_color": dual(C['card']),
+                "border_color": dual(C['border_strong']),
+                # 箭头区用极淡灰，不能与输入区同色：CTkComboBox 的按钮区是
+                # **无边框实心块**，涂成白色会让描边在文字区就收口，箭头看着
+                # 像飘在控件外面。也不宜用深灰（默认值），那样色块比箭头还抢眼。
+                "button_color": dual(C['bg']),
+                "button_hover_color": dual(C['brand_soft']),
+                "text_color": dual(C['text']),
+                "text_color_disabled": dual(C['text_faint']),
+                "corner_radius": 8,
+                "border_width": 1,
+                "dropdown_fg_color": dual(C['card']),
+                "dropdown_hover_color": dual(C['brand_soft']),
+                "dropdown_text_color": dual(C['text']),
+            },
+            "CTkOptionMenu": {
+                "fg_color": dual(C['card']),
+                "button_color": dual(C['card_alt']),
+                "button_hover_color": dual(C['brand_soft']),
+                "text_color": dual(C['text']),
+                "text_color_disabled": dual(C['text_faint']),
+                "corner_radius": 8,
+                "dropdown_fg_color": dual(C['card']),
+                "dropdown_hover_color": dual(C['brand_soft']),
+                "dropdown_text_color": dual(C['text']),
+            },
+            "CTkScrollbar": {
+                "fg_color": "transparent",
+                "button_color": dual(C['border_strong']),
+                "button_hover_color": dual(C['text_faint']),
+            },
+        }
+        for widget, options in merges.items():
+            if widget in theme:
+                theme[widget].update(options)
+            else:
+                theme[widget] = options
+
+    # ---- 界面构件工厂 ----
+    # 卡片是全界面唯一的分组容器，取代观感陈旧、边框几乎不可见的
+    # ttk.LabelFrame。统一在这里造，各页面才不会各写一套分组样式。
+    def _card(self, parent, title=None, expand=False, pady=(0, SP_MD)):
+        """创建带标题的卡片，返回可直接放内容的内层容器。"""
+        shell = ctk.CTkFrame(parent, fg_color=C['card'], corner_radius=10,
+                             border_width=1, border_color=C['border'])
+        shell.pack(fill=tk.BOTH if expand else tk.X, expand=expand, pady=pady)
+
+        if title:
+            head = ctk.CTkLabel(shell, text=title, font=UI_FONT(FS_TITLE, bold=True),
+                                text_color=C['text'], anchor="w")
+            head.pack(fill=tk.X, padx=SP_MD + 2, pady=(SP_MD, SP_XS))
+
+        body = ctk.CTkFrame(shell, fg_color="transparent")
+        body.pack(fill=tk.BOTH, expand=True,
+                  padx=SP_MD + 2, pady=(0, SP_MD) if title else SP_MD)
+        return body
+
+    def _row(self, parent, pady=0):
+        """卡片内的一行。transparent 让它自动继承父容器底色。"""
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill=tk.X, pady=pady)
+        return row
+
+    def _label(self, parent, text, color=None, bold=False, size=FS_BASE, **pack_kw):
+        """行内文字标签。默认次要灰——界面里大部分标签都是字段名。"""
+        lbl = ctk.CTkLabel(parent, text=text, font=UI_FONT(size, bold=bold),
+                           text_color=color or C['text_sub'], anchor="w")
+        lbl.pack(**{'side': tk.LEFT, **pack_kw})
+        return lbl
+
+    def _btn(self, parent, text, command, kind="secondary", width=100, **pack_kw):
+        """统一按钮。kind: primary(品牌红) / danger(红) / secondary(白底描边)。"""
+        styles = {
+            "primary": dict(fg_color=C['brand'], hover_color=C['brand_hover'],
+                            text_color=C['text_on_brand'], border_width=0),
+            "danger": dict(fg_color=C['danger'], hover_color=C['danger_hover'],
+                           text_color=C['text_on_brand'], border_width=0),
+            "secondary": dict(fg_color=C['card'], hover_color=C['brand_soft'],
+                              text_color=C['text'], border_width=1,
+                              border_color=C['border_strong']),
+        }
+        btn = ctk.CTkButton(parent, text=text, command=command, width=width, height=34,
+                            corner_radius=8, font=UI_FONT(), **styles[kind])
+        btn.pack(**{'side': tk.LEFT, **pack_kw})
+        return btn
+
+    def _combo(self, parent, variable, values, width=140, command=None, **pack_kw):
+        """只读下拉框。
+
+        注意回调约定与 ttk 不同：CTk 的 command 直接收到选中值字符串，
+        而非 <<ComboboxSelected>> 事件对象。调用方若沿用旧的 handler(event)
+        签名，需接受一个位置参数并忽略它。
+        """
+        box = ctk.CTkComboBox(parent, variable=variable, values=[str(v) for v in values],
+                              width=width, height=34, font=UI_FONT(),
+                              dropdown_font=UI_FONT(), state="readonly", command=command)
+        box.pack(**{'side': tk.LEFT, **pack_kw})
+        return box
+
+    def _num_entry(self, parent, variable, width=84, **pack_kw):
+        """数字输入框。取代 ttk.Spinbox——步进箭头在本界面几乎无人点，
+        却带来一个无法圆角化、高度也对不齐的方框控件。"""
+        entry = ctk.CTkEntry(parent, textvariable=variable, width=width, height=34,
+                             font=UI_FONT(), justify="center")
+        entry.pack(**{'side': tk.LEFT, **pack_kw})
+        return entry
+
+    def _metric(self, parent, caption, textvariable, color=None):
+        """状态指标：小字说明在上、大字数值在下，靠字号差建立层次。"""
+        cell = ctk.CTkFrame(parent, fg_color="transparent")
+        cell.pack(side=tk.LEFT, padx=(0, 28))
+        ctk.CTkLabel(cell, text=caption, font=UI_FONT(FS_SMALL),
+                     text_color=C['text_sub'], anchor="w").pack(anchor="w")
+        ctk.CTkLabel(cell, textvariable=textvariable, font=UI_FONT(FS_TITLE + 3, bold=True),
+                     text_color=color or C['text'], anchor="w").pack(anchor="w")
+        return cell
+
     def _create_ui(self):
-        """创建界面"""
-        # 主容器
-        main_container = ttk.Frame(self.root, padding="10")
-        main_container.pack(fill=tk.BOTH, expand=True)
-        
+        """创建界面骨架：标签页容器 + 五个功能页。
+
+        每页外层是灰底（C['bg']），页内的白色卡片才浮得起来；内边距在
+        这里统一给出，各页构建函数收到的 parent 已经留好边距。
+        """
+        main_container = ctk.CTkFrame(self.root, fg_color="transparent")
+        main_container.pack(fill=tk.BOTH, expand=True, padx=SP_MD, pady=SP_MD)
+
         notebook = ttk.Notebook(main_container)
         notebook.pack(fill=tk.BOTH, expand=True)
         self.notebook = notebook
-        
-        # 创建各标签页
-        main_page = ttk.Frame(notebook, padding="15")
-        result_page = ttk.Frame(notebook, padding="15")
-        content_page = ttk.Frame(notebook, padding="15")
-        analysis_page = ttk.Frame(notebook, padding="15")
-        settings_page = ttk.Frame(notebook, padding="15")
-        
-        notebook.add(main_page, text="搜索爬取")
-        notebook.add(result_page, text="爬取结果")
-        notebook.add(content_page, text="内容选项")
-        notebook.add(analysis_page, text="数据分析")
-        notebook.add(settings_page, text="高级设置")
-        
-        self._create_main_page(main_page)
-        self._create_result_page(result_page)
-        self._create_content_page(content_page)
-        self._create_analysis_page(analysis_page)
-        self._create_settings_page(settings_page)
-    
+
+        pages = (
+            ("搜索爬取", self._create_main_page),
+            ("爬取结果", self._create_result_page),
+            ("内容选项", self._create_content_page),
+            ("数据分析", self._create_analysis_page),
+            ("高级设置", self._create_settings_page),
+        )
+        for title, build in pages:
+            page = ctk.CTkFrame(notebook, fg_color=C['bg'], corner_radius=0)
+            notebook.add(page, text=title)
+            inner = ctk.CTkFrame(page, fg_color="transparent")
+            inner.pack(fill=tk.BOTH, expand=True, padx=SP_LG, pady=SP_LG)
+            build(inner)
+
     def _create_main_page(self, parent):
-        """创建主页面 - 简洁设计"""
-        # 爬取模式
-        mode_frame = ttk.LabelFrame(parent, text=" 爬取模式 ", padding="12")
-        mode_frame.pack(fill=tk.X, pady=(0, 10))
-        
+        """创建主页面。
+
+        分组从原先的 5 张零碎 LabelFrame 收敛为 3 张卡片：采集目标、
+        筛选与速度、运行状态。原布局把"爬取模式/搜索配置/筛选/速度"各
+        占一张卡，纵向碎片化，把日志挤到只剩一条缝——现在日志能真正
+        撑满剩余空间。
+        """
+        # ================= 采集目标 =================
+        target = self._card(parent, "采集目标")
+
         self.crawl_type_var = tk.StringVar(value="keyword")
-        
-        mode_row = ttk.Frame(mode_frame)
-        mode_row.pack(fill=tk.X)
-        
-        for text, value in [("关键词搜索", "keyword"), ("博主主页", "blogger"), ("热门榜单", "hot")]:
-            tk.Radiobutton(mode_row, text=text, variable=self.crawl_type_var, 
-                          value=value, command=self._on_mode_change,
-                          font=('Microsoft YaHei UI', 14), bg='#f0f0f0',
-                          activebackground='#f0f0f0').pack(side=tk.LEFT, padx=(0, 25))
-        
-        # 搜索配置
-        self.search_frame = ttk.LabelFrame(parent, text=" 搜索配置 ", padding="12")
-        self.search_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        # 关键词输入
-        row1 = ttk.Frame(self.search_frame)
-        row1.pack(fill=tk.X, pady=(0, 10))
-        
-        tk.Label(row1, text="搜索关键词:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+        mode_row = self._row(target, pady=(0, SP_MD))
+        for text, value in (("关键词搜索", "keyword"), ("博主主页", "blogger"), ("热门榜单", "hot")):
+            ctk.CTkRadioButton(mode_row, text=text, variable=self.crawl_type_var,
+                               value=value, command=self._on_mode_change,
+                               font=UI_FONT(), radiobutton_width=19, radiobutton_height=19,
+                               border_width_unchecked=2, border_width_checked=6,
+                               ).pack(side=tk.LEFT, padx=(0, 26))
+
+        # 三种模式的输入框始终同时可见，靠禁用态提示当前生效项
+        row1 = self._row(target, pady=(0, SP_SM))
+        self._label(row1, "搜索关键词", padx=(0, SP_SM))
         self.keyword_var = tk.StringVar(value="鞋子")
-        self.keyword_entry = tk.Entry(row1, textvariable=self.keyword_var, width=35, font=('Microsoft YaHei UI', 14))
-        self.keyword_entry.pack(side=tk.LEFT, padx=(10, 8))
-        tk.Label(row1, text="多个用逗号分隔", fg="#999", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
-        
-        # 博主URL输入
-        row1b = ttk.Frame(self.search_frame)
-        row1b.pack(fill=tk.X, pady=(0, 10))
-        
-        tk.Label(row1b, text="博主主页URL:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+        self.keyword_entry = ctk.CTkEntry(row1, textvariable=self.keyword_var, width=320,
+                                          height=34, font=UI_FONT(),
+                                          placeholder_text="留空则采集主页推荐")
+        self.keyword_entry.pack(side=tk.LEFT, padx=(0, SP_SM))
+        self._label(row1, "多个关键词用逗号分隔", color=C['text_faint'], size=FS_SMALL)
+
+        row1b = self._row(target, pady=(0, SP_SM))
+        self._label(row1b, "博主主页URL", padx=(0, SP_SM))
         self.blogger_url_var = tk.StringVar()
-        self.blogger_entry = tk.Entry(row1b, textvariable=self.blogger_url_var, width=45, font=('Microsoft YaHei UI', 14))
-        self.blogger_entry.pack(side=tk.LEFT, padx=(10, 0))
-        self.blogger_entry.config(state=tk.DISABLED)
-        
-        # 热门分类
-        row1c = ttk.Frame(self.search_frame)
-        row1c.pack(fill=tk.X, pady=(0, 10))
-        
-        tk.Label(row1c, text="热门分类:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+        self.blogger_entry = ctk.CTkEntry(row1b, textvariable=self.blogger_url_var, width=430,
+                                          height=34, font=UI_FONT(),
+                                          placeholder_text="https://www.xiaohongshu.com/user/profile/...")
+        self.blogger_entry.pack(side=tk.LEFT)
+        self.blogger_entry.configure(state=tk.DISABLED)
+
+        row1c = self._row(target, pady=(0, SP_MD))
+        self._label(row1c, "热门分类", padx=(0, SP_SM))
         self.hot_category_var = tk.StringVar(value="综合")
-        self.hot_combo = ttk.Combobox(row1c, textvariable=self.hot_category_var,
-                                      values=["综合", "美食", "穿搭", "美妆", "旅行", "家居", "数码"], 
-                                      width=12, state="readonly", font=('Microsoft YaHei UI', 14))
-        self.hot_combo.pack(side=tk.LEFT, padx=(10, 0))
-        self.hot_combo.config(state=tk.DISABLED)
-        
-        # 数量配置 - 使用网格布局更整齐
-        row2 = ttk.Frame(self.search_frame)
-        row2.pack(fill=tk.X)
-        
+        self.hot_combo = self._combo(row1c, self.hot_category_var,
+                                     ["综合", "美食", "穿搭", "美妆", "旅行", "家居", "数码"],
+                                     width=130)
+        self.hot_combo.configure(state=tk.DISABLED)
+
+        row2 = self._row(target)
         self.scroll_var = tk.StringVar(value="10")
-        
-        tk.Label(row2, text="最多笔记:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+        self._label(row2, "最多笔记", padx=(0, SP_SM))
         self.max_notes_var = tk.StringVar(value="30")
-        tk.Spinbox(row2, from_=1, to=500, textvariable=self.max_notes_var, width=6, 
-                  font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT, padx=(10, 25))
-        
-        tk.Label(row2, text="并行下载:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+        self._num_entry(row2, self.max_notes_var, padx=(0, 28))
+        self._label(row2, "并行下载", padx=(0, SP_SM))
         self.parallel_var = tk.StringVar(value="10")
-        tk.Spinbox(row2, from_=1, to=20, textvariable=self.parallel_var, width=6,
-                  font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT, padx=(10, 0))
-        
-        # 筛选条件
-        filter_frame = ttk.LabelFrame(parent, text=" 筛选条件 ", padding="12")
-        filter_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        filter_row = ttk.Frame(filter_frame)
-        filter_row.pack(fill=tk.X)
-        
-        tk.Label(filter_row, text="点赞:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+        self._num_entry(row2, self.parallel_var)
+
+        # ================= 筛选与速度 =================
+        refine = self._card(parent, "筛选与速度")
+
+        filter_row = self._row(refine, pady=(0, SP_MD))
+        self._label(filter_row, "点赞", padx=(0, SP_SM))
         self.min_likes_var = tk.StringVar(value="0")
-        tk.Entry(filter_row, textvariable=self.min_likes_var, width=8, font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT, padx=(8, 3))
-        tk.Label(filter_row, text="~", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+        ctk.CTkEntry(filter_row, textvariable=self.min_likes_var, width=90, height=34,
+                     font=UI_FONT()).pack(side=tk.LEFT, padx=(0, SP_XS))
+        self._label(filter_row, "~", padx=(0, SP_XS))
         self.max_likes_var = tk.StringVar(value="999999")
-        tk.Entry(filter_row, textvariable=self.max_likes_var, width=8, font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT, padx=(3, 20))
-        
-        tk.Label(filter_row, text="类型:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+        ctk.CTkEntry(filter_row, textvariable=self.max_likes_var, width=110, height=34,
+                     font=UI_FONT()).pack(side=tk.LEFT, padx=(0, 24))
+
+        self._label(filter_row, "类型", padx=(0, SP_SM))
         self.note_type_var = tk.StringVar(value="全部")
-        ttk.Combobox(filter_row, textvariable=self.note_type_var,
-                    values=["全部", "图文", "视频"], width=6, state="readonly",
-                    font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT, padx=(8, 20))
-        
-        tk.Label(filter_row, text="时间:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
+        self._combo(filter_row, self.note_type_var, ["全部", "图文", "视频"],
+                    width=110, padx=(0, 24))
+
+        self._label(filter_row, "时间", padx=(0, SP_SM))
         self.date_filter_var = tk.StringVar(value="全部")
-        ttk.Combobox(filter_row, textvariable=self.date_filter_var,
-                    values=["全部", "今天", "本周", "本月"], width=6, state="readonly",
-                    font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT, padx=(8, 0))
-        
-        # 速度模式
-        speed_frame = ttk.LabelFrame(parent, text=" 速度模式 ", padding="12")
-        speed_frame.pack(fill=tk.X, pady=(0, 10))
-        
+        self._combo(filter_row, self.date_filter_var, ["全部", "今天", "本周", "本月"],
+                    width=110)
+
         self.crawl_mode_var = tk.StringVar(value="standard")
-        speed_row = ttk.Frame(speed_frame)
-        speed_row.pack(fill=tk.X)
-        
+        speed_row = self._row(refine)
+        self._label(speed_row, "采集速度", padx=(0, SP_MD))
         # "快速模式"已移除：引擎中 fast 与 standard 完全等价，属误导性死选项
-        for text, value in [("标准模式（完整数据）", "standard"), ("极速模式（仅列表信息）", "turbo")]:
-            tk.Radiobutton(speed_row, text=text, variable=self.crawl_mode_var,
-                          value=value, font=('Microsoft YaHei UI', 14),
-                          bg='#f0f0f0', activebackground='#f0f0f0').pack(side=tk.LEFT, padx=(0, 20))
-        
-        # 控制按钮区域
-        btn_frame = ttk.Frame(parent)
-        btn_frame.pack(fill=tk.X, pady=(5, 10))
-        
-        # 使用CustomTkinter按钮（如果可用）
-        if HAS_CTK:
-            self.start_btn = ctk.CTkButton(btn_frame, text="开始爬取", command=self._start_crawl, 
-                                           width=120, height=36, corner_radius=8,
-                                           fg_color="#3b82f6", hover_color="#2563eb",
-                                           font=('Microsoft YaHei UI', 14, 'bold'))
-            self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
-            
-            self.stop_btn = ctk.CTkButton(btn_frame, text="停止", command=self._stop_crawl,
-                                          width=80, height=36, corner_radius=8,
-                                          fg_color="#ef4444", hover_color="#dc2626",
-                                          font=('Microsoft YaHei UI', 14), state="disabled")
-            self.stop_btn.pack(side=tk.LEFT, padx=(0, 8))
-            
-            ctk.CTkButton(btn_frame, text="已保存Cookie", command=self._use_saved_cookies,
-                         width=120, height=36, corner_radius=8,
-                         fg_color="#8b5cf6", hover_color="#7c3aed",
-                         font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
-            
-            ctk.CTkButton(btn_frame, text="打开数据", command=self._open_data_dir,
-                         width=100, height=36, corner_radius=8,
-                         fg_color="#64748b", hover_color="#475569",
-                         font=('Microsoft YaHei UI', 14)).pack(side=tk.RIGHT)
-            
-            ctk.CTkButton(btn_frame, text="打包图片", command=self._zip_images,
-                         width=100, height=36, corner_radius=8,
-                         fg_color="#64748b", hover_color="#475569",
-                         font=('Microsoft YaHei UI', 14)).pack(side=tk.RIGHT, padx=(0, 8))
-        else:
-            self.start_btn = ttk.Button(btn_frame, text="开始爬取", command=self._start_crawl, width=14)
-            self.start_btn.pack(side=tk.LEFT, padx=(0, 8))
-            
-            self.stop_btn = ttk.Button(btn_frame, text="停止", command=self._stop_crawl, state=tk.DISABLED, width=12)
-            self.stop_btn.pack(side=tk.LEFT, padx=(0, 8))
-            
-            ttk.Button(btn_frame, text="已保存Cookie", command=self._use_saved_cookies, width=16).pack(side=tk.LEFT)
-            ttk.Button(btn_frame, text="打开数据", command=self._open_data_dir, width=12).pack(side=tk.RIGHT)
-            ttk.Button(btn_frame, text="打包图片", command=self._zip_images, width=12).pack(side=tk.RIGHT, padx=(0, 8))
-        
-        # 运行状态
-        progress_frame = ttk.LabelFrame(parent, text=" 运行状态 ", padding="12")
-        progress_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        # 进度条
-        prog_row = ttk.Frame(progress_frame)
-        prog_row.pack(fill=tk.X, pady=(0, 8))
-        self.total_progress = ttk.Progressbar(prog_row, length=500, mode='determinate')
-        self.total_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 10))
-        self.progress_label = tk.Label(prog_row, text="0%", font=('Microsoft YaHei UI', 14, 'bold'),
-                                      fg="#3b82f6")
+        for text, value in (("标准模式（完整数据）", "standard"), ("极速模式（仅列表信息）", "turbo")):
+            ctk.CTkRadioButton(speed_row, text=text, variable=self.crawl_mode_var,
+                               value=value, font=UI_FONT(), radiobutton_width=19,
+                               radiobutton_height=19, border_width_unchecked=2,
+                               border_width_checked=6).pack(side=tk.LEFT, padx=(0, 26))
+
+        # ================= 操作条 =================
+        btn_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        btn_frame.pack(fill=tk.X, pady=(0, SP_MD))
+
+        self.start_btn = ctk.CTkButton(btn_frame, text="开始爬取", command=self._start_crawl,
+                                       width=128, height=38, corner_radius=8,
+                                       font=UI_FONT(bold=True))
+        self.start_btn.pack(side=tk.LEFT, padx=(0, SP_SM))
+        # 停止按钮平时为描边灰，仅在爬取中才变红——原先禁用态仍是刺眼的
+        # 纯红块，静止界面上比主操作还抢眼
+        self.stop_btn = self._btn(btn_frame, "停止", self._stop_crawl, width=88,
+                                  padx=(0, SP_SM))
+        self.stop_btn.configure(state="disabled")
+        self._btn(btn_frame, "已保存Cookie", self._use_saved_cookies, width=130)
+
+        self._btn(btn_frame, "打开数据", self._open_data_dir, side=tk.RIGHT)
+        self._btn(btn_frame, "打包图片", self._zip_images, side=tk.RIGHT, padx=(0, SP_SM))
+
+        # ================= 运行状态 =================
+        status_card = self._card(parent, "运行状态")
+
+        prog_row = self._row(status_card, pady=(0, SP_MD))
+        # corner_radius=0：圆角端点在进度为 0 时仍会画出一个色块，
+        # 静止界面上像个突兀的红点
+        self.total_progress = ctk.CTkProgressBar(prog_row, height=8, corner_radius=0)
+        self.total_progress.set(0)
+        self.total_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, SP_MD))
+        self.progress_label = ctk.CTkLabel(prog_row, text="0%", font=UI_FONT(bold=True),
+                                           text_color=C['brand'], width=52, anchor="e")
         self.progress_label.pack(side=tk.LEFT)
-        
-        # 状态信息 - 单行显示
-        stat_row = ttk.Frame(progress_frame)
-        stat_row.pack(fill=tk.X, pady=(5, 0))
-        
+
+        stat_row = self._row(status_card)
         self.status_var = tk.StringVar(value="就绪")
-        tk.Label(stat_row, text="状态:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
-        tk.Label(stat_row, textvariable=self.status_var, fg="#3b82f6", 
-                font=('Microsoft YaHei UI', 14, 'bold')).pack(side=tk.LEFT, padx=(5, 20))
-        
         self.notes_var = tk.StringVar(value="0")
-        tk.Label(stat_row, text="笔记:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
-        tk.Label(stat_row, textvariable=self.notes_var, font=('Microsoft YaHei UI', 14, 'bold')).pack(side=tk.LEFT, padx=(5, 20))
-        
         self.images_var = tk.StringVar(value="0")
-        tk.Label(stat_row, text="图片:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
-        tk.Label(stat_row, textvariable=self.images_var, font=('Microsoft YaHei UI', 14, 'bold')).pack(side=tk.LEFT, padx=(5, 20))
-        
         self.videos_var = tk.StringVar(value="0")
-        tk.Label(stat_row, text="视频:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
-        tk.Label(stat_row, textvariable=self.videos_var, font=('Microsoft YaHei UI', 14, 'bold')).pack(side=tk.LEFT, padx=(5, 20))
-        
         self.time_var = tk.StringVar(value="0秒")
-        tk.Label(stat_row, text="用时:", font=('Microsoft YaHei UI', 14)).pack(side=tk.LEFT)
-        tk.Label(stat_row, textvariable=self.time_var, font=('Microsoft YaHei UI', 14, 'bold')).pack(side=tk.LEFT)
-        
-        # 日志区域
-        log_frame = ttk.LabelFrame(parent, text=" 运行日志 ", padding="8")
-        log_frame.pack(fill=tk.BOTH, expand=True)
-        
-        if HAS_CTK:
-            self.log_text = ctk.CTkTextbox(log_frame, height=150, corner_radius=6,
-                                           font=('Consolas', 14), fg_color="#fafafa",
-                                           text_color="#333333", border_width=1,
-                                           border_color="#ddd")
-            self.log_text.pack(fill=tk.BOTH, expand=True)
-            # CTkTextbox 也支持 tag 着色（委托给内部 tkinter.Text）；
-            # 此前 CTk 分支日志为单色，SUCCESS/ERROR 无法一眼区分
-            try:
-                self.log_text.tag_config("INFO", foreground="#333333")
-                self.log_text.tag_config("SUCCESS", foreground="#2e7d32")
-                self.log_text.tag_config("WARNING", foreground="#ef6c00")
-                self.log_text.tag_config("ERROR", foreground="#c62828")
-                self.log_text.tag_config("DEBUG", foreground="#6a1b9a")
-                self._ctk_log_tags = True
-            except Exception:
-                self._ctk_log_tags = False
-            self.log_text.configure(state="disabled")
-        else:
-            self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state=tk.DISABLED,
-                                                      font=('Consolas', 14), bg="#fafafa")
-            self.log_text.pack(fill=tk.BOTH, expand=True)
-            self.log_text.tag_config("INFO", foreground="black")
-            self.log_text.tag_config("SUCCESS", foreground="green")
-            self.log_text.tag_config("WARNING", foreground="orange")
-            self.log_text.tag_config("ERROR", foreground="red")
-            self.log_text.tag_config("DEBUG", foreground="purple")
-    
+        self._metric(stat_row, "状态", self.status_var, color=C['brand'])
+        self._metric(stat_row, "笔记", self.notes_var)
+        self._metric(stat_row, "图片", self.images_var)
+        self._metric(stat_row, "视频", self.videos_var)
+        self._metric(stat_row, "用时", self.time_var)
+
+        # ================= 运行日志 =================
+        log_body = self._card(parent, "运行日志", expand=True, pady=0)
+        # 无边框：外层卡片已经描过一次，再加就是双层框
+        self.log_text = ctk.CTkTextbox(log_body, height=150, corner_radius=8,
+                                       font=(FONT_MONO, FS_MONO), fg_color=C['card_alt'],
+                                       text_color=C['text'], border_width=0)
+        self.log_text.pack(fill=tk.BOTH, expand=True)
+        # CTkTextbox 支持 tag 着色（委托给内部 tkinter.Text），
+        # 日志级别靠颜色一眼区分
+        try:
+            self.log_text.tag_config("INFO", foreground=C['text'])
+            self.log_text.tag_config("SUCCESS", foreground=C['success'])
+            self.log_text.tag_config("WARNING", foreground=C['warning'])
+            self.log_text.tag_config("ERROR", foreground=C['danger'])
+            self.log_text.tag_config("DEBUG", foreground=C['text_sub'])
+            self._ctk_log_tags = True
+        except Exception:
+            self._ctk_log_tags = False
+        self.log_text.configure(state="disabled")
+
     def _create_result_page(self, parent):
-        """创建爬取结果展示页面"""
-        # === 工具栏第一行 ===
-        toolbar_frame = ttk.Frame(parent)
-        toolbar_frame.pack(fill=tk.X, pady=(0, 5))
-        
-        # 左侧：数据源选择
-        ttk.Label(toolbar_frame, text="数据源:").pack(side=tk.LEFT, padx=(0, 5))
+        """创建爬取结果展示页面。
+
+        工具栏收在一张卡片里分两行：上行是"看哪批数据"（数据源/批次），
+        下行是"在这批里找什么"（搜索/类型）。原先两行按钮平铺、宽度相同，
+        主次不分——现在破坏性操作统一为红字描边，读得出轻重。
+        """
+        toolbar = self._card(parent, pady=(0, SP_SM))
+
+        # ---- 上行：数据源 / 批次 ----
+        top = self._row(toolbar, pady=(0, SP_SM))
+        self._label(top, "数据源", padx=(0, SP_SM))
         self.data_source_var = tk.StringVar(value="当前爬取")
-        self.data_source_combo = ttk.Combobox(toolbar_frame, textvariable=self.data_source_var, 
-                                               values=["当前爬取", "历史数据库"], width=12, state="readonly")
-        self.data_source_combo.pack(side=tk.LEFT, padx=(0, 10))
-        self.data_source_combo.bind("<<ComboboxSelected>>", self._on_data_source_change)
-        
-        # 关键词筛选
-        ttk.Label(toolbar_frame, text="关键词:").pack(side=tk.LEFT, padx=(0, 5))
-        self.filter_keyword_var = tk.StringVar()
-        self.filter_keyword_entry = ttk.Entry(toolbar_frame, textvariable=self.filter_keyword_var, width=12)
-        self.filter_keyword_entry.pack(side=tk.LEFT, padx=(0, 10))
-        
-        # 右侧按钮
-        ttk.Button(toolbar_frame, text="刷新", command=self._refresh_results).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(toolbar_frame, text="导出Excel", command=self._export_results).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(toolbar_frame, text="删除选中", command=self._delete_selected).pack(side=tk.RIGHT, padx=5)
-        ttk.Button(toolbar_frame, text="清空当前", command=self._clear_results).pack(side=tk.RIGHT, padx=5)
-        
-        # === 工具栏第二行：批次选择 + 搜索筛选 ===
-        filter_frame = ttk.Frame(parent)
-        filter_frame.pack(fill=tk.X, pady=(0, 5))
-        
-        # 左侧：批次选择
-        ttk.Label(filter_frame, text="爬取批次:").pack(side=tk.LEFT, padx=(0, 5))
+        # CTk 的 command 收到的是选中值字符串，正好落在 handler 的
+        # event 形参位置（两个 handler 都不使用该参数）
+        self.data_source_combo = self._combo(top, self.data_source_var,
+                                             ["当前爬取", "历史数据库"], width=140,
+                                             command=self._on_data_source_change,
+                                             padx=(0, SP_LG))
+
+        self._label(top, "爬取批次", padx=(0, SP_SM))
         self.crawl_batch_var = tk.StringVar(value="全部")
-        self.crawl_batch_combo = ttk.Combobox(filter_frame, textvariable=self.crawl_batch_var, 
-                                               width=30, state="readonly")
-        self.crawl_batch_combo.pack(side=tk.LEFT, padx=(0, 5))
-        self.crawl_batch_combo.bind("<<ComboboxSelected>>", self._on_batch_select)
-        
-        ttk.Button(filter_frame, text="刷新批次", command=self._refresh_crawl_batches, width=8).pack(side=tk.LEFT, padx=2)
-        ttk.Button(filter_frame, text="删除批次", command=self._delete_batch_folder, width=8).pack(side=tk.LEFT, padx=2)
-        ttk.Button(filter_frame, text="打开目录", command=self._open_batch_folder, width=8).pack(side=tk.LEFT, padx=2)
-        
-        # 分隔
-        ttk.Separator(filter_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
-        
-        # 右侧：搜索筛选
-        ttk.Label(filter_frame, text="搜索:").pack(side=tk.LEFT, padx=(0, 5))
+        self.crawl_batch_combo = self._combo(top, self.crawl_batch_var, ["全部"], width=300,
+                                             command=self._on_batch_select, padx=(0, SP_SM))
+        self._btn(top, "刷新批次", self._refresh_crawl_batches, width=88, padx=(0, SP_XS))
+        self._btn(top, "打开目录", self._open_batch_folder, width=88, padx=(0, SP_XS))
+        del_batch = self._btn(top, "删除批次", self._delete_batch_folder, width=88)
+        del_batch.configure(text_color=C['danger'])
+
+        # 读取类操作靠右，与左侧"选哪批数据"分开
+        self._btn(top, "导出Excel", self._export_results, width=96, side=tk.RIGHT)
+        self._btn(top, "复制全部", self._copy_all_data, width=88, side=tk.RIGHT, padx=(0, SP_XS))
+        self._btn(top, "刷新", self._refresh_results, width=64, side=tk.RIGHT, padx=(0, SP_XS))
+
+        # ---- 下行：本批内的检索 ----
+        bottom = self._row(toolbar)
+        self._label(bottom, "搜索", padx=(0, SP_SM))
         self.search_var = tk.StringVar()
-        self.search_entry = ttk.Entry(filter_frame, textvariable=self.search_var, width=15)
-        self.search_entry.pack(side=tk.LEFT, padx=(0, 5))
+        self.search_entry = ctk.CTkEntry(bottom, textvariable=self.search_var, width=200,
+                                         height=34, font=UI_FONT(),
+                                         placeholder_text="标题 / 作者 / 正文")
+        self.search_entry.pack(side=tk.LEFT, padx=(0, SP_SM))
         self.search_entry.bind("<Return>", lambda e: self._filter_results())
-        
-        ttk.Button(filter_frame, text="筛选", command=self._filter_results, width=5).pack(side=tk.LEFT, padx=2)
-        ttk.Button(filter_frame, text="重置", command=self._reset_filter, width=5).pack(side=tk.LEFT, padx=2)
-        
-        # 类型筛选
-        ttk.Label(filter_frame, text="类型:").pack(side=tk.LEFT, padx=(10, 5))
+        self._btn(bottom, "筛选", self._filter_results, width=64, padx=(0, SP_XS))
+        self._btn(bottom, "重置", self._reset_filter, width=64, padx=(0, SP_LG))
+
+        self._label(bottom, "类型", padx=(0, SP_SM))
         self.type_filter_var = tk.StringVar(value="全部")
-        type_combo = ttk.Combobox(filter_frame, textvariable=self.type_filter_var, 
-                                  values=["全部", "图文", "视频"], width=6, state="readonly")
-        type_combo.pack(side=tk.LEFT)
-        type_combo.bind("<<ComboboxSelected>>", lambda e: self._filter_results())
-        
+        self._combo(bottom, self.type_filter_var, ["全部", "图文", "视频"], width=110,
+                    command=lambda _v: self._filter_results(), padx=(0, SP_LG))
+
+        self._label(bottom, "关键词", padx=(0, SP_SM))
+        self.filter_keyword_var = tk.StringVar()
+        self.filter_keyword_entry = ctk.CTkEntry(bottom, textvariable=self.filter_keyword_var,
+                                                 width=150, height=34, font=UI_FONT(),
+                                                 placeholder_text="限定关键词")
+        self.filter_keyword_entry.pack(side=tk.LEFT)
+
+        # 破坏性操作单独靠右，红字描边与其余按钮区分
+        clear_btn = self._btn(bottom, "清空当前", self._clear_results, width=96, side=tk.RIGHT)
+        clear_btn.configure(text_color=C['danger'])
+        del_btn = self._btn(bottom, "删除选中", self._delete_selected, width=96,
+                            side=tk.RIGHT, padx=(0, SP_XS))
+        del_btn.configure(text_color=C['danger'])
+
         # 初始化批次列表
         self._refresh_crawl_batches()
-        
-        # === 统计信息栏（带数据卡片）===
-        stats_frame = ttk.Frame(parent)
-        stats_frame.pack(fill=tk.X, pady=(0, 8))
-        
-        # 统计卡片样式
-        self.result_count_label = ttk.Label(stats_frame, text="总计: 0 条", font=('Microsoft YaHei UI', 14, "bold"))
-        self.result_count_label.pack(side=tk.LEFT, padx=(0, 15))
-        
-        self.stats_image_label = ttk.Label(stats_frame, text="图文: 0", foreground="#2196F3", font=('Microsoft YaHei UI', 14))
-        self.stats_image_label.pack(side=tk.LEFT, padx=(0, 15))
-        
-        self.stats_video_label = ttk.Label(stats_frame, text="视频: 0", foreground="#FF5722", font=('Microsoft YaHei UI', 14))
-        self.stats_video_label.pack(side=tk.LEFT, padx=(0, 15))
-        
-        self.stats_likes_label = ttk.Label(stats_frame, text="总点赞: 0", foreground="#E91E63", font=('Microsoft YaHei UI', 14))
-        self.stats_likes_label.pack(side=tk.LEFT, padx=(0, 15))
-        
-        # 复制按钮（"导出Excel"与工具栏第一行重复，已去重）
-        ttk.Button(stats_frame, text="复制全部", command=self._copy_all_data, width=8).pack(side=tk.RIGHT, padx=5)
-        
+
+        # === 统计条：药丸标签，比原先一行彩色文字更有分量 ===
+        stats_frame = ctk.CTkFrame(parent, fg_color="transparent")
+        stats_frame.pack(fill=tk.X, pady=(0, SP_SM))
+
+        def chip(text, fg, bg):
+            lbl = ctk.CTkLabel(stats_frame, text=text, font=UI_FONT(FS_SMALL, bold=True),
+                               text_color=fg, fg_color=bg, corner_radius=13,
+                               height=28, padx=14)
+            lbl.pack(side=tk.LEFT, padx=(0, SP_SM))
+            return lbl
+
+        self.result_count_label = chip("总计: 0 条", C['brand'], C['brand_soft'])
+        self.stats_image_label = chip("图文: 0", C['text_sub'], C['card'])
+        self.stats_video_label = chip("视频: 0", C['text_sub'], C['card'])
+        self.stats_likes_label = chip("总点赞: 0", C['text_sub'], C['card'])
+
         # === 主区域：左边表格，右边详情 ===
         main_paned = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
         main_paned.pack(fill=tk.BOTH, expand=True)
         
         # 左侧：结果表格
-        left_frame = ttk.Frame(main_paned)
+        left_frame = ctk.CTkFrame(main_paned, fg_color=C['card'], corner_radius=10,
+                                  border_width=1, border_color=C['border'])
         main_paned.add(left_frame, weight=3)
         
         columns = ("序号", "类型", "标题", "作者", "点赞", "收藏", "评论")
         self.result_tree = ttk.Treeview(left_frame, columns=columns, show="headings", height=22)
         
-        # 配置表格样式 - 斑马纹
-        style = ttk.Style()
-        style.configure("Treeview", rowheight=36, font=('Microsoft YaHei UI', 14))
-        style.configure("Treeview.Heading", font=('Microsoft YaHei UI', 14, "bold"))
-        self.result_tree.tag_configure('oddrow', background='#f8f8f8')
-        self.result_tree.tag_configure('evenrow', background='#ffffff')
-        self.result_tree.tag_configure('video', foreground='#FF5722')
-        self.result_tree.tag_configure('image', foreground='#2196F3')
+        # 行样式：斑马纹 + 克制的类型区分。
+        # 原先按类型把**整行**染成 #FF5722 / #2196F3，标题、作者、三列数字
+        # 全被染色，几十行下来像调色板。现在图文行是正常墨色，只有视频行
+        # 带一点暖褐偏移，扫视仍能分辨，但不再喧宾夺主。
+        # （Treeview 的 tag 只能作用于整行，无法只给"类型"列上色。）
+        self.result_tree.tag_configure('oddrow', background=C['card_alt'])
+        self.result_tree.tag_configure('evenrow', background=C['card'])
+        self.result_tree.tag_configure('video', foreground=C['row_video'])
+        self.result_tree.tag_configure('image', foreground=C['text'])
         
         # 表头 - 点击可排序
         for col in columns:
@@ -1377,13 +1593,13 @@ class CrawlerApp:
         self.result_tree.column("收藏", width=76, minwidth=64, anchor="e", stretch=False)
         self.result_tree.column("评论", width=76, minwidth=64, anchor="e", stretch=False)
         
-        # 滚动条
+        # 只需纵向滚动条：标题列 stretch，其余列定宽，横向永远不会溢出
+        # （原先还建了个横向滚动条并接上 xscrollcommand，却从未 pack 出来）
         scrollbar_y = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.result_tree.yview)
-        scrollbar_x = ttk.Scrollbar(left_frame, orient=tk.HORIZONTAL, command=self.result_tree.xview)
-        self.result_tree.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
-        
-        self.result_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y)
+        self.result_tree.configure(yscrollcommand=scrollbar_y.set)
+
+        self.result_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(SP_XS, 0), pady=SP_XS)
+        scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y, pady=SP_XS)
         
         # 右键菜单
         self.tree_context_menu = tk.Menu(self.result_tree, tearoff=0)
@@ -1398,63 +1614,108 @@ class CrawlerApp:
         self.result_tree.bind("<Button-3>", self._show_tree_context_menu)
         
         # 右侧：详情面板
-        right_frame = ttk.Frame(main_paned)
+        right_frame = ctk.CTkFrame(main_paned, fg_color="transparent")
         main_paned.add(right_frame, weight=2)
-        
+
         # 详情顶部：标题 + 快捷操作
-        detail_header = ttk.Frame(right_frame)
-        detail_header.pack(fill=tk.X, pady=(0, 5))
-        
-        self.detail_title_label = ttk.Label(detail_header, text="选择笔记查看详情", 
-                                            font=('Microsoft YaHei UI', 14, "bold"), wraplength=400)
+        detail_header = ctk.CTkFrame(right_frame, fg_color="transparent")
+        detail_header.pack(fill=tk.X, padx=SP_SM, pady=(0, SP_SM))
+
+        self.detail_title_label = ctk.CTkLabel(detail_header, text="选择笔记查看详情",
+                                               font=UI_FONT(FS_TITLE, bold=True),
+                                               text_color=C['text'], anchor="w",
+                                               wraplength=360, justify="left")
         self.detail_title_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        
-        # 操作按钮（图标化）
-        btn_frame = ttk.Frame(detail_header)
+
+        # 图标按钮：正方形、无边框，悬停才浮出底色
+        btn_frame = ctk.CTkFrame(detail_header, fg_color="transparent")
         btn_frame.pack(side=tk.RIGHT)
-        ttk.Button(btn_frame, text="📂", command=self._open_images_folder, width=3).pack(side=tk.LEFT, padx=1)
-        ttk.Button(btn_frame, text="▶", command=self._play_video, width=3).pack(side=tk.LEFT, padx=1)
-        ttk.Button(btn_frame, text="🔗", command=self._open_note_link, width=3).pack(side=tk.LEFT, padx=1)
-        ttk.Button(btn_frame, text="📋", command=self._copy_note_content, width=3).pack(side=tk.LEFT, padx=1)
-        
-        # 数据卡片区
-        info_cards = ttk.Frame(right_frame)
-        info_cards.pack(fill=tk.X, pady=(0, 8))
-        
-        # 互动数据展示
-        self.detail_likes = ttk.Label(info_cards, text="❤ 0", foreground="#E91E63", font=('Microsoft YaHei UI', 14))
-        self.detail_likes.pack(side=tk.LEFT, padx=(0, 15))
-        self.detail_collects = ttk.Label(info_cards, text="⭐ 0", foreground="#FF9800", font=('Microsoft YaHei UI', 14))
-        self.detail_collects.pack(side=tk.LEFT, padx=(0, 15))
-        self.detail_comments = ttk.Label(info_cards, text="💬 0", foreground="#2196F3", font=('Microsoft YaHei UI', 14))
-        self.detail_comments.pack(side=tk.LEFT, padx=(0, 15))
-        self.detail_author = ttk.Label(info_cards, text="", foreground="#666", font=('Microsoft YaHei UI', 14))
+        for icon, cmd, tip in (("📂", self._open_images_folder, "打开文件夹"),
+                               ("▶", self._play_video, "播放视频"),
+                               ("🔗", self._open_note_link, "打开原文"),
+                               ("📋", self._copy_note_content, "复制正文")):
+            ctk.CTkButton(btn_frame, text=icon, command=cmd, width=36, height=32,
+                          corner_radius=8, fg_color="transparent",
+                          hover_color=C['brand_soft'], text_color=C['text_sub'],
+                          font=UI_FONT()).pack(side=tk.LEFT, padx=2)
+
+        # 互动数据：图标 + 数值，颜色只标记指标本身，不铺满整行
+        info_cards = ctk.CTkFrame(right_frame, fg_color="transparent")
+        info_cards.pack(fill=tk.X, padx=SP_SM, pady=(0, SP_SM))
+
+        self.detail_likes = ctk.CTkLabel(info_cards, text="❤ 0", text_color=C['brand'],
+                                         font=UI_FONT(bold=True))
+        self.detail_likes.pack(side=tk.LEFT, padx=(0, SP_LG))
+        self.detail_collects = ctk.CTkLabel(info_cards, text="⭐ 0", text_color=C['warning'],
+                                            font=UI_FONT(bold=True))
+        self.detail_collects.pack(side=tk.LEFT, padx=(0, SP_LG))
+        self.detail_comments = ctk.CTkLabel(info_cards, text="💬 0", text_color=C['info'],
+                                            font=UI_FONT(bold=True))
+        self.detail_comments.pack(side=tk.LEFT, padx=(0, SP_LG))
+        self.detail_author = ctk.CTkLabel(info_cards, text="", text_color=C['text_sub'],
+                                          font=UI_FONT(FS_SMALL))
         self.detail_author.pack(side=tk.RIGHT)
-        
-        # 详情内容（减小高度，给预览更多空间）
-        self.detail_text = scrolledtext.ScrolledText(right_frame, height=8, state=tk.DISABLED, 
-                                                     wrap=tk.WORD, font=('Microsoft YaHei UI', 14))
-        self.detail_text.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
-        
-        # 图片预览区（更大）
-        preview_frame = ttk.LabelFrame(right_frame, text="媒体预览", padding="5")
-        preview_frame.pack(fill=tk.BOTH, expand=True)
-        
-        # 预览导航
-        preview_nav = ttk.Frame(preview_frame)
-        preview_nav.pack(fill=tk.X, pady=(0, 5))
-        
-        self.preview_page_label = ttk.Label(preview_nav, text="")
+
+        # 详情正文：无边框只读文本，靠底色与卡片区分
+        self.detail_text = scrolledtext.ScrolledText(
+            right_frame, height=8, state=tk.DISABLED, wrap=tk.WORD,
+            font=UI_FONT(FS_SMALL), bg=C['card'], fg=C['text'],
+            relief="flat", borderwidth=0, padx=SP_SM, pady=SP_SM,
+            insertbackground=C['text'], selectbackground=C['brand_soft'],
+            selectforeground=C['brand'])
+        # 详情排版靠 tag，不靠 ASCII 分隔线（见 _render_detail）
+        self.detail_text.tag_configure('field', foreground=C['text_sub'],
+                                       font=UI_FONT(FS_SMALL))
+        self.detail_text.tag_configure('value', foreground=C['text'],
+                                       font=UI_FONT(FS_SMALL))
+        self.detail_text.tag_configure('body', foreground=C['text'],
+                                       font=UI_FONT(FS_SMALL), spacing1=3, spacing3=3)
+        self.detail_text.tag_configure('section', foreground=C['brand'],
+                                       font=UI_FONT(FS_SMALL, bold=True),
+                                       spacing1=14, spacing3=6)
+        self.detail_text.tag_configure('meta', foreground=C['text_faint'],
+                                       font=UI_FONT(FS_SMALL - 1), spacing1=6)
+        self.detail_text.tag_configure('quote', foreground=C['text'],
+                                       font=UI_FONT(FS_SMALL), lmargin1=18,
+                                       lmargin2=18, spacing3=8)
+
+        # ScrolledText 内建的是 tk.Scrollbar（带上下箭头的 Win95 样式），
+        # 压成无边框细条才不至于在一屏现代控件里跳出来
+        self.detail_text.vbar.configure(
+            bg=C['border_strong'], troughcolor=C['card'],
+            activebackground=C['text_faint'], borderwidth=0,
+            highlightthickness=0, width=12, relief="flat", elementborderwidth=0)
+        self.detail_text.pack(fill=tk.BOTH, expand=True, padx=SP_SM, pady=(0, SP_SM))
+
+        # 媒体预览
+        preview_shell = ctk.CTkFrame(right_frame, fg_color=C['card'], corner_radius=10,
+                                     border_width=1, border_color=C['border'])
+        preview_shell.pack(fill=tk.BOTH, expand=True, padx=SP_SM)
+        preview_frame = ctk.CTkFrame(preview_shell, fg_color="transparent")
+        preview_frame.pack(fill=tk.BOTH, expand=True, padx=SP_SM, pady=SP_SM)
+
+        preview_nav = ctk.CTkFrame(preview_frame, fg_color="transparent")
+        preview_nav.pack(fill=tk.X, pady=(0, SP_SM))
+
+        ctk.CTkLabel(preview_nav, text="媒体预览", font=UI_FONT(FS_SMALL, bold=True),
+                     text_color=C['text']).pack(side=tk.LEFT, padx=(0, SP_SM))
+        self.preview_page_label = ctk.CTkLabel(preview_nav, text="", font=UI_FONT(FS_SMALL),
+                                               text_color=C['text_sub'])
         self.preview_page_label.pack(side=tk.LEFT)
-        
-        ttk.Button(preview_nav, text="◀", command=self._prev_preview_page, width=3).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(preview_nav, text="▶", command=self._next_preview_page, width=3).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(preview_nav, text="查看大图", command=self._open_image_viewer, width=8).pack(side=tk.RIGHT, padx=5)
-        
-        self.preview_canvas = tk.Canvas(preview_frame, height=300, bg="#f0f0f0",
+
+        for icon, cmd in (("▶", self._next_preview_page), ("◀", self._prev_preview_page)):
+            ctk.CTkButton(preview_nav, text=icon, command=cmd, width=34, height=30,
+                          corner_radius=8, fg_color="transparent",
+                          hover_color=C['brand_soft'], text_color=C['text_sub'],
+                          font=UI_FONT()).pack(side=tk.RIGHT, padx=2)
+        self._btn(preview_nav, "查看大图", self._view_current_media, width=96,
+                  side=tk.RIGHT, padx=(0, SP_SM))
+
+        self.preview_canvas = tk.Canvas(preview_frame, height=300, bg=C['canvas'],
                                         highlightthickness=0)
         self.preview_canvas.pack(fill=tk.BOTH, expand=True)
-        self.preview_canvas.bind("<Double-Button-1>", self._on_preview_double_click)
+        # 注意：不要再绑 <Double-Button-1> 开查看器——单击已经打开，
+        # 双击会先后触发两次（Button-1 + Double-Button-1）叠出两个窗口
         # 画布尺寸变化时按新网格重排（防抖），使缩略图始终铺满可用空间
         self.preview_canvas.bind("<Configure>", self._on_preview_canvas_resize)
         self._preview_resize_job = None
@@ -1512,26 +1773,44 @@ class CrawlerApp:
                 else:
                     batches.append(f"{folder} ({count}张)")
         
-        self.crawl_batch_combo['values'] = batches
-        # 保留用户当前选择（若该批次仍存在）；否则回到"全部"。
-        # 注意 combobox.set() 不触发 <<ComboboxSelected>>，需手动联动表格
+        # CTkComboBox 没有 ttk 的 ['values'] 索引赋值与 .current()，
+        # 一律走 configure/set
+        self.crawl_batch_combo.configure(values=batches)
+        # 保留用户当前选择：按**文件夹名**匹配而非整串标签。此前用整串
+        # 比较，一旦批次图片数变化（标签里的"N张"变了），旧标签失配就把
+        # 用户踢回"全部"进汇总视图。
         current = self.crawl_batch_var.get()
-        if current in batches:
-            self.crawl_batch_combo.set(current)
+        current_folder = self._batch_label_to_folder(current)
+        match = next((b for b in batches if self._batch_label_to_folder(b) == current_folder), None)
+        if current == "全部":
+            self.crawl_batch_combo.set("全部")
+        elif match:
+            self.crawl_batch_combo.set(match)  # 标签可能已更新，用新标签
         elif batches:
-            self.crawl_batch_combo.current(0)
+            self.crawl_batch_combo.set(batches[0])
             if current and current != "全部":
                 self._on_batch_select()  # 之前选中的批次已被删除，回退到汇总视图
-    
-    def _on_batch_select(self, event=None):
-        """选择爬取批次"""
+
+    @staticmethod
+    def _batch_label_to_folder(label: str) -> str:
+        """从下拉标签反解文件夹名。
+
+        标签格式是我们自己拼的 "{folder} ({count}张) [{time}]"（或无时间段）。
+        用正则只剥掉这段固定后缀，因此**文件夹名本身含空格或括号**（如
+        关键词"美食 (推荐)"）也能正确还原——不能用 split(" (")[0]，那会
+        在文件夹名的括号处提前截断。
+        """
+        if not label or label == "全部":
+            return label
+        return re.sub(r' \(\d+张\)( \[[^\]]*\])?$', '', label)
+
+    def _on_batch_select(self, _choice=None):
+        """选择爬取批次。参数是 CTkComboBox 回传的选中值字符串，此处不用。"""
         selected = self.crawl_batch_var.get()
         if selected == "全部":
             self._load_all_batch_images()
         else:
-            # 提取文件夹名
-            folder_name = selected.split(" (")[0]
-            self._load_batch_images(folder_name)
+            self._load_batch_images(self._batch_label_to_folder(selected))
     
     def _filter_results(self):
         """筛选结果"""
@@ -1576,11 +1855,25 @@ class CrawlerApp:
         self._refresh_table_with_notes(filtered)
     
     def _reset_filter(self):
-        """重置筛选"""
+        """重置筛选——留在当前视图，不切换数据源/踢出批次。
+
+        此前无条件调 _on_data_source_change 会清空批次状态、把批次下拉
+        复位"全部"，用户在某批次里点"重置"会莫名跳回当前爬取/历史视图。
+        """
         self.search_var.set("")
         self.type_filter_var.set("全部")
         self.filtered_notes = []
-        self._on_data_source_change()
+        # 按当前视图重新渲染未筛选数据
+        if self.current_batch_folder and self.batch_notes_data:
+            self._refresh_table_with_notes(self.batch_notes_data)   # 批次明细
+        elif self.batch_notes_data and not self.current_batch_folder:
+            self._load_all_batch_images()                            # 批次汇总
+        elif self.data_source_var.get() == "历史数据库":
+            self._load_history_data()
+        else:
+            self._refresh_table_with_notes(
+                self.all_notes_data,
+                count_label=f"共 {len(self.all_notes_data)} 条记录")
     
     def _refresh_table_with_notes(self, notes, count_label=None):
         """用指定数据刷新表格（全仓唯一的结果表渲染入口）
@@ -1627,10 +1920,10 @@ class CrawlerApp:
             ), tags=tags)
 
         # 更新统计
-        self.result_count_label.config(text=count_label or f"总计: {len(notes)} 条")
-        self.stats_image_label.config(text=f"图文: {image_count}")
-        self.stats_video_label.config(text=f"视频: {video_count}")
-        self.stats_likes_label.config(text=f"总点赞: {total_likes:,}")
+        self.result_count_label.configure(text=count_label or f"总计: {len(notes)} 条")
+        self.stats_image_label.configure(text=f"图文: {image_count}")
+        self.stats_video_label.configure(text=f"视频: {video_count}")
+        self.stats_likes_label.configure(text=f"总点赞: {total_likes:,}")
     
     def _sort_by_column(self, col):
         """点击表头排序"""
@@ -1688,36 +1981,47 @@ class CrawlerApp:
             self.result_tree.selection_set(item)
             self.tree_context_menu.post(event.x_root, event.y_root)
     
+    def _copy_to_clipboard(self, text: str, what: str):
+        """写剪贴板。空内容不再静默清空剪贴板，而是明确提示。
+
+        批次汇总行/旧数据行没有 title/author/note_id，此前会 clipboard_clear
+        后 append 空串——用户以为复制成功，实际剪贴板被清空。
+        """
+        if not text:
+            messagebox.showinfo("提示", f"当前选中项没有可复制的{what}")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.log(f"已复制{what}", "INFO")
+
     def _copy_title(self):
         """复制标题"""
         if self.current_selected_note:
-            title = self.current_selected_note.get('title', '')
-            self.root.clipboard_clear()
-            self.root.clipboard_append(title)
-    
+            self._copy_to_clipboard(self.current_selected_note.get('title', ''), "标题")
+
     def _copy_author(self):
         """复制作者"""
         if self.current_selected_note:
-            author = self.current_selected_note.get('author', '')
-            self.root.clipboard_clear()
-            self.root.clipboard_append(author)
-    
+            self._copy_to_clipboard(self.current_selected_note.get('author', ''), "作者")
+
     def _copy_link(self):
         """复制链接"""
         if self.current_selected_note:
-            note_id = self.current_selected_note.get('note_id', '')
-            if note_id:
-                link = f"https://www.xiaohongshu.com/explore/{note_id}"
-                self.root.clipboard_clear()
-                self.root.clipboard_append(link)
-    
+            note = self.current_selected_note
+            link = note.get('note_link', '')
+            if not link and note.get('note_id'):
+                link = f"https://www.xiaohongshu.com/explore/{note['note_id']}"
+            self._copy_to_clipboard(link, "链接")
+
     def _copy_note_content(self):
         """复制笔记内容"""
         if self.current_selected_note:
             note = self.current_selected_note
+            if not (note.get('title') or note.get('content')):
+                messagebox.showinfo("提示", "当前选中项没有可复制的内容")
+                return
             content = f"{note.get('title', '')}\n\n作者: {note.get('author', '')}\n\n{note.get('content', '')}"
-            self.root.clipboard_clear()
-            self.root.clipboard_append(content)
+            self._copy_to_clipboard(content, "内容")
     
     def _copy_all_data(self):
         """复制全部数据为文本"""
@@ -1734,53 +2038,96 @@ class CrawlerApp:
         self.root.clipboard_append("\n".join(lines))
         messagebox.showinfo("成功", f"已复制 {len(items)} 条数据到剪贴板")
     
-    def _quick_export_excel(self):
-        """快速导出当前表格数据到Excel"""
-        items = self.result_tree.get_children()
-        if not items:
-            messagebox.showinfo("提示", "没有数据可导出")
-            return
-        
-        try:
-            import pandas as pd
-            data = []
-            for item in items:
-                values = self.result_tree.item(item)['values']
-                data.append({
-                    '序号': values[0], '类型': values[1], '标题': values[2],
-                    '作者': values[3], '点赞': values[4], '收藏': values[5], '评论': values[6]
-                })
-            
-            df = pd.DataFrame(data)
-            filename = f"导出数据_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            # 数据文件归 data/ 目录；此前误写进 images/（媒体目录）
-            os.makedirs("data", exist_ok=True)
-            filepath = os.path.join("data", filename)
-            df.to_excel(filepath, index=False)
-            messagebox.showinfo("成功", f"已导出到: {filepath}")
-        except Exception as e:
-            messagebox.showerror("错误", f"导出失败: {e}")
-    
     def _delete_single_note(self):
-        """删除单条笔记"""
-        if not self.current_selected_note:
+        """右键"删除此条"——按当前视图分派，确认文案与实际删除范围一致。
+
+        历史教训：此前统一取 current_selected_note 的 folder_path/path 直接
+        rmtree，批次汇总模式下该字段是**整个批次目录**，弹窗却说"删除这条
+        笔记"，一次误点丢几十条笔记；当前爬取/历史模式则因无该字段静默
+        no-op 还把视图跳到批次汇总。判别必须用视图状态，不能用多态字段。
+        """
+        note = self.current_selected_note
+        if not note:
             return
-        
-        if not messagebox.askyesno("确认", "确定要删除这条笔记吗？"):
-            return
-        
-        try:
-            # 删除文件夹
-            folder = self.current_selected_note.get('folder_path') or self.current_selected_note.get('path')
-            if folder and os.path.exists(folder):
+
+        in_batch_detail = bool(getattr(self, 'current_batch_folder', None))
+        in_batch_summary = (not in_batch_detail
+                            and bool(getattr(self, 'batch_notes_data', []))
+                            and 'path' in (self.batch_notes_data[0] or {})
+                            and 'note_id' not in (self.batch_notes_data[0] or {}))
+
+        if in_batch_summary:
+            # 批次汇总行：删除对象是整个批次目录——如实告知并走批次删除
+            folder = note.get('folder_path') or note.get('path') or ''
+            name = os.path.basename(folder.rstrip('/\\')) if folder else '?'
+            if not folder or not os.path.exists(folder):
+                messagebox.showinfo("提示", "批次文件夹不存在")
+                return
+            if not messagebox.askyesno(
+                    "确认删除整个批次",
+                    f"当前选中的是一个批次（不是单条笔记）！\n\n"
+                    f"将删除整个批次文件夹及其中全部笔记媒体：\n{name}\n\n"
+                    f"此操作不可恢复，确定继续吗？"):
+                return
+            try:
                 import shutil
                 shutil.rmtree(folder)
-            
-            # 刷新显示
-            self._on_batch_select()
-        except Exception as e:
-            messagebox.showerror("错误", f"删除失败: {e}")
+                self._refresh_crawl_batches()
+                self._load_all_batch_images()
+                self.log(f"已删除批次: {name}", "WARNING")
+            except OSError as e:
+                messagebox.showerror("错误", f"删除失败: {e}")
+            return
+
+        if in_batch_detail:
+            # 单批次明细行：删磁盘目录 + 同步删除 DB 行（否则历史视图残留
+            # 指向已删目录的孤儿记录）
+            if not messagebox.askyesno("确认", "确定要删除这条笔记吗？\n（同时删除本地文件和数据库记录）"):
+                return
+            try:
+                folder = note.get('path') or note.get('local_dir') or ''
+                if folder and os.path.exists(folder):
+                    import shutil
+                    shutil.rmtree(folder)
+                note_id = note.get('note_id', '')
+                if note_id:
+                    try:
+                        conn = sqlite3.connect(self.config.db_path)
+                        conn.execute("DELETE FROM notes WHERE note_id = ?", (note_id,))
+                        conn.commit()
+                        conn.close()
+                    except sqlite3.Error as e:
+                        self.log(f"删除数据库记录失败: {e}", "WARNING")
+                self._on_batch_select()  # 重扫当前批次
+            except OSError as e:
+                messagebox.showerror("错误", f"删除失败: {e}")
+            return
+
+        # 当前爬取 / 历史数据库：复用 _delete_selected 的成熟路径
+        # （右键弹菜单前已 selection_set 当前行，DB/媒体/列表三方同步）
+        self._delete_selected()
     
+    def _reset_preview_state(self, message: str = ""):
+        """预览状态的唯一重置入口。
+
+        四项状态（图片列表/评论图/视频路径/页码）必须一起清：任何一项
+        残留都会让 _maybe_reflow_preview 在窗口缩放时把上一条笔记的媒体
+        重绘到当前视图（曾出现批次汇总里画出上一条笔记的视频缩略图）。
+        """
+        self.preview_image_paths = []
+        self.preview_comment_images = []
+        self.current_video_path = None
+        self.preview_page = 0
+        self.preview_images = []
+        try:
+            self.preview_canvas.delete("all")
+            self.preview_page_label.configure(text="")
+            if message:
+                cw = max(self.preview_canvas.winfo_width(), 200)
+                self.preview_canvas.create_text(cw // 2, 60, text=message, fill="#888")
+        except tk.TclError:
+            pass
+
     def _prev_preview_page(self):
         """上一页预览"""
         if self.preview_page > 0:
@@ -1872,44 +2219,55 @@ class CrawlerApp:
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
         
-        # 从数据库获取批次相关的笔记数据
+        # 从数据库获取批次相关的笔记数据。
+        # 匹配优先级（见下方使用处）：
+        #   ① local_dir 精确路径配对（全库，无误配可能）——权威方式
+        #   ② 文件夹名里的 note_id
+        #   ③ crawl_time 窗口 + 位置回退（仅旧格式数据的最后手段）
+        def _dir_key(p):
+            return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+
         db_notes = {}
-        db_notes_by_order = []  # 按爬取顺序存储
+        db_by_dir = {}
+        db_notes_by_order = []  # 时间窗口内按爬取顺序（仅供位置回退）
         try:
             conn = sqlite3.connect(self.config.db_path)
             cursor = conn.cursor()
-            
-            # 尝试从文件夹名提取时间范围 (格式: 主页推荐_20260202_164319)
+
+            # ① 全库 local_dir 映射（行数有限，代价可忽略）
+            cursor.execute("SELECT * FROM notes WHERE local_dir IS NOT NULL AND local_dir != ''")
+            columns = [desc[0] for desc in cursor.description]
+            for row in cursor.fetchall():
+                note = dict(zip(columns, row))
+                db_by_dir[_dir_key(note['local_dir'])] = note
+                if note.get('note_id'):
+                    db_notes[note['note_id']] = note
+
+            # ③ 时间窗口（供旧数据位置回退）。
+            # 起点收紧为 批次时间-1分钟：此前 -5 分钟会把上一批次的尾部
+            # 拉进窗口，位置回退随即整体串位（B 批显示 A 批的标题点赞）。
             parts = folder_name.split("_")
             if len(parts) >= 3:
                 try:
-                    date_str = parts[-2]  # 20260202
-                    time_str = parts[-1]  # 164319
-                    # 构建时间范围（前后10分钟）
+                    date_str, time_str = parts[-2], parts[-1]
                     from datetime import datetime, timedelta
                     batch_time = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
-                    start_time = (batch_time - timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+                    start_time = (batch_time - timedelta(minutes=1)).strftime("%Y-%m-%d %H:%M:%S")
                     end_time = (batch_time + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
-                    
                     cursor.execute(
                         "SELECT * FROM notes WHERE crawl_time >= ? AND crawl_time <= ? ORDER BY crawl_time ASC",
-                        (start_time, end_time)
-                    )
-                except:
-                    cursor.execute("SELECT * FROM notes ORDER BY crawl_time DESC LIMIT 500")
-            else:
-                cursor.execute("SELECT * FROM notes ORDER BY crawl_time DESC LIMIT 500")
-            
-            rows = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
+                        (start_time, end_time))
+                    columns = [desc[0] for desc in cursor.description]
+                    for row in cursor.fetchall():
+                        note = dict(zip(columns, row))
+                        db_notes_by_order.append(note)
+                        if note.get('note_id') and note['note_id'] not in db_notes:
+                            db_notes[note['note_id']] = note
+                except (ValueError, sqlite3.Error):
+                    # 文件夹名无法解析时间 → 不做位置回退（乱序全库列表
+                    # 上按位置索引纯属随机匹配，宁缺毋滥）
+                    pass
             conn.close()
-            
-            for row in rows:
-                note = dict(zip(columns, row))
-                note_id = note.get('note_id', '')
-                if note_id:
-                    db_notes[note_id] = note
-                db_notes_by_order.append(note)  # 按顺序保存
         except Exception as e:
             print(f"[数据库] 查询失败: {e}")
         
@@ -1939,15 +2297,17 @@ class CrawlerApp:
                         note_id = potential_id
                     else:
                         note_id = ""
-                    
-                    # 从数据库获取详细信息
-                    db_note = db_notes.get(note_id, {})
-                    
-                    # 如果通过note_id没找到，尝试按序号匹配（对旧数据有用）
-                    if not db_note and db_notes_by_order:
-                        # idx是1-based，数组是0-based
-                        if 0 <= idx - 1 < len(db_notes_by_order):
-                            db_note = db_notes_by_order[idx - 1]
+
+                    # 匹配 DB 详情：① local_dir 精确路径 → ② note_id → ③ 位置回退
+                    db_note = db_by_dir.get(_dir_key(note_path), {})
+                    if not db_note and note_id:
+                        db_note = db_notes.get(note_id, {})
+                    if not db_note and db_notes_by_order and 0 <= idx - 1 < len(db_notes_by_order):
+                        # 仅当窗口内数量与磁盘笔记数相近时才敢按位置回退，
+                        # 否则宁可留空也不冒串位风险
+                        db_note = db_notes_by_order[idx - 1]
+                    if db_note.get('note_id'):
+                        note_id = db_note['note_id']
                     
                     note_folders.append({
                         'folder': note_folder,
@@ -2021,35 +2381,58 @@ class CrawlerApp:
         self.displayed_notes = list(note_folders)
 
         # 更新统计
-        self.result_count_label.config(text=f"共 {len(note_folders)} 个笔记")
-        self.stats_image_label.config(text=f"图文: {image_count}")
-        self.stats_video_label.config(text=f"视频: {video_count}")
-        self.stats_likes_label.config(text=f"总点赞: {total_likes:,}")
+        self.result_count_label.configure(text=f"共 {len(note_folders)} 个笔记")
+        self.stats_image_label.configure(text=f"图文: {image_count}")
+        self.stats_video_label.configure(text=f"视频: {video_count}")
+        self.stats_likes_label.configure(text=f"总点赞: {total_likes:,}")
     
+    @staticmethod
+    def _scan_batch_summary(folder_path):
+        """统计一个批次目录：返回 (笔记数, 图片数, 视频数)。
+
+        口径与批次明细视图严格一致——只数各 note_ 子目录**顶层**的正图，
+        不含 comments/ 里的评论图；笔记数只算含顶层媒体的目录。此前用
+        递归 glob 把评论图和空目录都算进来，汇总数比明细多、对不上。
+        """
+        import glob
+        note_count = img_count = video_count = 0
+        try:
+            for d in os.listdir(folder_path):
+                note_path = os.path.join(folder_path, d)
+                if not (os.path.isdir(note_path) and d.startswith("note_")):
+                    continue
+                imgs = (glob.glob(os.path.join(note_path, "*.jpg"))
+                        + glob.glob(os.path.join(note_path, "*.png"))
+                        + glob.glob(os.path.join(note_path, "*.webp")))
+                vids = glob.glob(os.path.join(note_path, "*.mp4"))
+                if imgs or vids:
+                    note_count += 1
+                    img_count += len(imgs)
+                    video_count += len(vids)
+        except OSError:
+            pass
+        return note_count, img_count, video_count
+
     def _load_all_batch_images(self):
         """加载所有批次的摘要"""
-        import glob
-        
         # 清空表格
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
-        
+
         self.batch_notes_data = []
         self.current_batch_folder = None
-        
+        self._reset_preview_state()  # 防止上一视图的预览媒体残留
+
         if not os.path.exists("images"):
             return
-        
+
         folders = []
         for folder in os.listdir("images"):
             folder_path = os.path.join("images", folder)
             if os.path.isdir(folder_path):
                 try:
                     mtime = os.path.getmtime(folder_path)
-                    img_count = len(glob.glob(f"{folder_path}/**/*.jpg", recursive=True))
-                    img_count += len(glob.glob(f"{folder_path}/**/*.png", recursive=True))
-                    video_count = len(glob.glob(f"{folder_path}/**/*.mp4", recursive=True))
-                    note_count = len([d for d in os.listdir(folder_path) if os.path.isdir(os.path.join(folder_path, d))])
+                    note_count, img_count, video_count = self._scan_batch_summary(folder_path)
                     folders.append({
                         'name': folder,
                         'path': folder_path,
@@ -2058,7 +2441,7 @@ class CrawlerApp:
                         'videos': video_count,
                         'notes': note_count
                     })
-                except:
+                except OSError:
                     pass
         
         # 按时间排序
@@ -2081,7 +2464,8 @@ class CrawlerApp:
         
         self.batch_notes_data = folders
         self.displayed_notes = list(folders)
-        self.result_count_label.config(text=f"共 {len(folders)} 个爬取批次")
+        self.result_count_label.configure(text=f"共 {len(folders)} 个爬取批次")
+        self._reset_result_stats()  # 汇总视图无图文/视频/点赞概念，清零避免残留
     
     def _delete_batch_folder(self):
         """删除选中的批次文件夹"""
@@ -2090,13 +2474,13 @@ class CrawlerApp:
             messagebox.showinfo("提示", "请先选择一个具体的爬取批次")
             return
         
-        folder_name = selected.split(" (")[0]
+        folder_name = self._batch_label_to_folder(selected)
         folder_path = os.path.join("images", folder_name)
-        
+
         if not os.path.exists(folder_path):
             messagebox.showinfo("提示", "文件夹不存在")
             return
-        
+
         # 计算内容
         import glob
         img_count = len(glob.glob(f"{folder_path}/**/*.jpg", recursive=True))
@@ -2123,21 +2507,22 @@ class CrawlerApp:
                 os.startfile(os.path.abspath("images"))
             return
         
-        folder_name = selected.split(" (")[0]
+        folder_name = self._batch_label_to_folder(selected)
         folder_path = os.path.join("images", folder_name)
-        
+
         if os.path.exists(folder_path):
             os.startfile(os.path.abspath(folder_path))
         else:
             messagebox.showinfo("提示", "文件夹不存在")
     
-    def _on_data_source_change(self, event=None):
-        """切换数据源"""
+    def _on_data_source_change(self, _choice=None):
+        """切换数据源。参数是 CTkComboBox 回传的选中值字符串，此处不用。"""
         source = self.data_source_var.get()
 
         # 清空批次相关数据，避免影响其他视图
         self.batch_notes_data = []
         self.current_batch_folder = None
+        self._reset_preview_state()
         # 批次下拉框必须同步回"全部"：否则它仍显示某个文件夹名，
         # 而表格已切到数据库内容，_on_result_select 会走错分支
         try:
@@ -2145,6 +2530,13 @@ class CrawlerApp:
                 self.crawl_batch_var.set("全部")
         except Exception:
             pass
+        # 搜索/类型筛选属于上一视图的状态，切数据源后清空以保持自洽
+        try:
+            self.search_var.set("")
+            self.type_filter_var.set("全部")
+        except Exception:
+            pass
+        self.filtered_notes = []
 
         if source == "历史数据库":
             self._load_history_data()
@@ -2192,22 +2584,30 @@ class CrawlerApp:
             # 构建SQL查询
             conditions = []
             params = []
-            
+
             if keyword_filter:
-                conditions.append("keyword LIKE ?")
-                params.append(f"%{keyword_filter}%")
-            
+                # 搜索框的直觉是"按内容搜"，故匹配 标题/作者/正文/搜索词
+                # 四列（此前只匹配 keyword 列，而主页推荐/博主抓取该列恒为
+                # 空串，输入标题词必然搜不到，用户误判"筛选坏了"）
+                conditions.append("(title LIKE ? OR author LIKE ? OR content LIKE ? OR keyword LIKE ?)")
+                like = f"%{keyword_filter}%"
+                params.extend([like, like, like, like])
+
             if start_date and end_date:
                 conditions.append("crawl_time >= ? AND crawl_time < ?")
                 params.extend([start_date, end_date])
-            
-            if conditions:
-                sql = f"SELECT * FROM notes WHERE {' AND '.join(conditions)} ORDER BY crawl_time DESC"
-                cursor.execute(sql, params)
-            else:
-                cursor.execute("SELECT * FROM notes ORDER BY crawl_time DESC LIMIT 500")
-            
+
+            # 统一加 LIMIT 上限并多取 1 条用于判断是否被截断
+            HISTORY_LIMIT = 1000
+            where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+            cursor.execute(
+                f"SELECT * FROM notes {where} ORDER BY crawl_time DESC LIMIT ?",
+                params + [HISTORY_LIMIT + 1])
+
             rows = cursor.fetchall()
+            truncated = len(rows) > HISTORY_LIMIT
+            if truncated:
+                rows = rows[:HISTORY_LIMIT]
             columns = [desc[0] for desc in cursor.description]
             conn.close()
             
@@ -2315,9 +2715,10 @@ class CrawlerApp:
             self.batch_notes_data = []
             self.current_batch_folder = None
             self.filtered_notes = []
-            self._refresh_table_with_notes(
-                self.history_notes_data,
-                count_label=f"共 {len(self.history_notes_data)} 条历史记录")
+            n = len(self.history_notes_data)
+            label = (f"仅显示最近 {n} 条（已达上限，请用关键词/时间筛选缩小范围）"
+                     if truncated else f"共 {n} 条历史记录")
+            self._refresh_table_with_notes(self.history_notes_data, count_label=label)
 
         except Exception as e:
             messagebox.showerror("错误", f"加载历史数据失败: {e}")
@@ -2341,14 +2742,19 @@ class CrawlerApp:
     def _add_result_to_table(self, note_data: dict, index: int):
         """添加一条结果到表格"""
         try:
-            if self.data_source_var.get() != "当前爬取":
-                return
-            # 用户在爬取过程中做了排序/筛选（filtered_notes 激活）时，
-            # 不能盲目追加：表格是排序后的序列，末尾插未排序行会让
-            # displayed_notes 与行号错位。此时只更新统计，新笔记待
-            # 重新排序/重置筛选时一并显示。
-            if self.filtered_notes:
-                self._update_result_stats_from_notes(self.all_notes_data)
+            # 只在"当前爬取"全量视图追加实时行。
+            # 追加条件三选一都不满足则只刷统计、不动表格：
+            #  - 数据源非"当前爬取"（用户切到历史/批次）
+            #  - 正处于某个批次视图（current_batch_folder 非空）——此前只判
+            #    data_source 不判批次，爬取中选批次会把 live 行灌进批次表
+            #  - 有筛选/排序（filtered_notes 激活）——末尾插未排序行会错位
+            if (self.data_source_var.get() != "当前爬取"
+                    or getattr(self, 'current_batch_folder', None)
+                    or self.filtered_notes):
+                # 冻结态：统计卡描述"当前所见"（displayed_notes），
+                # 而非仍在增长的 all_notes_data，避免表格/总计/卡片三方打架
+                self._update_result_stats_from_notes(
+                    getattr(self, 'displayed_notes', None) or self.all_notes_data)
                 return
 
             note_type = "视频" if note_data.get('note_type') == "视频" else "图文"
@@ -2374,7 +2780,7 @@ class CrawlerApp:
             self.displayed_notes = list(self.all_notes_data)
 
             count = len(self.result_tree.get_children())
-            self.result_count_label.config(text=f"共 {count} 条记录")
+            self.result_count_label.configure(text=f"共 {count} 条记录")
             self._update_result_stats_from_notes(self.all_notes_data)
             self.result_tree.see(self.result_tree.get_children()[-1])
         except Exception as e:
@@ -2390,10 +2796,41 @@ class CrawlerApp:
                 total_likes += int(n.get('like_count', 0) or 0)
             except (TypeError, ValueError):
                 pass
-        self.stats_image_label.config(text=f"图文: {image_count}")
-        self.stats_video_label.config(text=f"视频: {video_count}")
-        self.stats_likes_label.config(text=f"总点赞: {total_likes:,}")
-    
+        self.stats_image_label.configure(text=f"图文: {image_count}")
+        self.stats_video_label.configure(text=f"视频: {video_count}")
+        self.stats_likes_label.configure(text=f"总点赞: {total_likes:,}")
+
+    def _reset_result_stats(self):
+        """把三张统计卡清零。批次汇总/清空/重新爬取时用，避免残留上一视图数字。"""
+        self.stats_image_label.configure(text="图文: 0")
+        self.stats_video_label.configure(text="视频: 0")
+        self.stats_likes_label.configure(text="总点赞: 0")
+
+    def _render_detail(self, blocks):
+        """把结构化内容渲染进详情面板。
+
+        blocks 是 (kind, text) 序列：
+          ('kv', (键, 值))  字段行，键灰值黑
+          ('section', 标题) 分节标题，品牌色加粗且自带段前距
+          ('body', 文本)    正文段落
+          ('meta', 文本)    评论头等次要信息
+          ('quote', 文本)   缩进引用（评论正文）
+        取代原先用 '='*40 和 '>>> <<<' 拼分隔线的做法——那只有在等宽字体
+        下才对得齐，而这里是比例字体，画出来永远是歪的。
+        """
+        self.detail_text.configure(state=tk.NORMAL)
+        self.detail_text.delete(1.0, tk.END)
+        for kind, text in blocks:
+            if kind == 'kv':
+                key, val = text
+                if val in (None, ''):
+                    continue
+                self.detail_text.insert(tk.END, f"{key}   ", 'field')
+                self.detail_text.insert(tk.END, f"{val}\n", 'value')
+            elif text:
+                self.detail_text.insert(tk.END, f"{text}\n", kind)
+        self.detail_text.configure(state=tk.DISABLED)
+
     def _on_result_select(self, event):
         """点击表格行显示详情"""
         try:
@@ -2433,42 +2870,42 @@ class CrawlerApp:
                         note_type = note.get('note_type', '图文')
                         
                         # 更新顶部信息
-                        self.detail_title_label.config(text=title[:40] + ('...' if len(title) > 40 else ''))
-                        self.detail_likes.config(text=f"❤ {like_count}")
-                        self.detail_collects.config(text=f"⭐ {collect_count}")
-                        self.detail_comments.config(text=f"💬 {comment_count}")
-                        self.detail_author.config(text=f"@{author}" if author else f"{note.get('image_count', 0)}张图片")
+                        self.detail_title_label.configure(text=title[:40] + ('...' if len(title) > 40 else ''))
+                        self.detail_likes.configure(text=f"❤ {like_count}")
+                        self.detail_collects.configure(text=f"⭐ {collect_count}")
+                        self.detail_comments.configure(text=f"💬 {comment_count}")
+                        self.detail_author.configure(text=f"@{author}" if author else f"{note.get('image_count', 0)}张图片")
                         
-                        # 构建详情文本
-                        detail = ""
+                        # 构建详情
+                        blocks = []
                         if title and title != f"笔记 {idx}":
-                            detail += f"标题: {title}\n"
+                            blocks.append(('kv', ("标题", title)))
                         if author:
-                            detail += f"作者: {author}\n"
-                        detail += f"类型: {note_type}\n"
-                        detail += f"图片: {note.get('image_count', 0)}张\n"
-                        detail += f"视频: {'有' if note.get('has_video') else '无'}\n"
-                        
-                        if content:
-                            detail += f"\n--- 内容 ---\n{content[:500]}\n"
-                        
+                            blocks.append(('kv', ("作者", author)))
+                        blocks.append(('kv', ("类型", note_type)))
+                        blocks.append(('kv', ("图片", f"{note.get('image_count', 0)} 张")))
+                        blocks.append(('kv', ("视频", "有" if note.get('has_video') else "无")))
+
                         if tags:
                             try:
                                 tag_list = json.loads(tags) if isinstance(tags, str) else tags
                                 if tag_list:
-                                    detail += f"\n标签: {', '.join(tag_list[:10])}\n"
-                            except:
+                                    blocks.append(('kv', ("标签", '、'.join(tag_list[:10]))))
+                            except (ValueError, TypeError):
                                 pass
-                        
-                        detail += f"\n--- 本地文件 ({note.get('image_count', 0)}张) ---\n"
-                        for img in note.get('images', [])[:10]:
-                            detail += f"• {os.path.basename(img)}\n"
-                        
-                        self.detail_text.config(state=tk.NORMAL)
-                        self.detail_text.delete(1.0, tk.END)
-                        self.detail_text.insert(tk.END, detail)
-                        self.detail_text.config(state=tk.DISABLED)
-                        
+
+                        if content:
+                            blocks.append(('section', "正文"))
+                            blocks.append(('body', content[:500]))
+
+                        images = note.get('images', [])[:10]
+                        if images:
+                            blocks.append(('section', f"本地文件（{note.get('image_count', 0)} 张）"))
+                            for img in images:
+                                blocks.append(('meta', f"· {os.path.basename(img)}"))
+
+                        self._render_detail(blocks)
+
                         # 加载图片预览
                         self._load_batch_note_previews(note)
                         return
@@ -2482,32 +2919,27 @@ class CrawlerApp:
                     self.current_selected_note = {'folder_path': folder['path'], 'keyword': folder['name'].split("_")[0]}
                     
                     # 更新顶部信息
-                    self.detail_title_label.config(text=folder['name'])
-                    self.detail_likes.config(text=f"❤ -")
-                    self.detail_collects.config(text=f"⭐ -")
-                    self.detail_comments.config(text=f"💬 -")
-                    self.detail_author.config(text=f"{folder.get('notes', 0)}个笔记")
+                    self.detail_title_label.configure(text=folder['name'])
+                    self.detail_likes.configure(text=f"❤ -")
+                    self.detail_collects.configure(text=f"⭐ -")
+                    self.detail_comments.configure(text=f"💬 -")
+                    self.detail_author.configure(text=f"{folder.get('notes', 0)}个笔记")
                     
-                    detail = f"笔记数量: {folder.get('notes', 0)}\n"
-                    detail += f"图片数量: {folder.get('images', 0)}\n"
-                    detail += f"视频数量: {folder.get('videos', 0)}\n"
-                    
+                    blocks = [
+                        ('kv', ("笔记数量", folder.get('notes', 0))),
+                        ('kv', ("图片数量", folder.get('images', 0))),
+                        ('kv', ("视频数量", folder.get('videos', 0))),
+                    ]
                     from datetime import datetime
                     mtime = folder.get('mtime', 0)
                     if mtime:
-                        detail += f"创建时间: {datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M:%S')}\n"
-                    
-                    detail += f"\n双击进入查看详细内容"
-                    
-                    self.detail_text.config(state=tk.NORMAL)
-                    self.detail_text.delete(1.0, tk.END)
-                    self.detail_text.insert(tk.END, detail)
-                    self.detail_text.config(state=tk.DISABLED)
-                    
-                    # 清空预览
-                    self.preview_canvas.delete("all")
-                    self.preview_image_paths = []
-                    self.preview_page_label.config(text="")
+                        blocks.append(('kv', ("创建时间", datetime.fromtimestamp(mtime)
+                                              .strftime('%Y-%m-%d %H:%M:%S'))))
+                    blocks.append(('meta', "双击进入查看该批次的详细内容"))
+                    self._render_detail(blocks)
+
+                    # 清空预览（四项状态一起清，防 resize 重绘上一条笔记媒体）
+                    self._reset_preview_state("双击批次行查看笔记与图片")
                     return
             
             # 原有逻辑：数据库或当前爬取
@@ -2531,17 +2963,18 @@ class CrawlerApp:
                 
                 # 更新顶部信息卡片
                 title = note.get('title', '') or '无标题'
-                self.detail_title_label.config(text=title[:40] + ('...' if len(title) > 40 else ''))
-                self.detail_likes.config(text=f"❤ {note.get('like_count', 0)}")
-                self.detail_collects.config(text=f"⭐ {note.get('collect_count', 0)}")
-                self.detail_comments.config(text=f"💬 {note.get('comment_count', 0)}")
-                self.detail_author.config(text=f"@{note.get('author', '')}")
+                self.detail_title_label.configure(text=title[:40] + ('...' if len(title) > 40 else ''))
+                self.detail_likes.configure(text=f"❤ {note.get('like_count', 0)}")
+                self.detail_collects.configure(text=f"⭐ {note.get('collect_count', 0)}")
+                self.detail_comments.configure(text=f"💬 {note.get('comment_count', 0)}")
+                self.detail_author.configure(text=f"@{note.get('author', '')}")
                 
-                # 构建详情文本（简化版，因为主要信息已在上方显示）
-                detail = f"类型: {note.get('note_type', '图文')}\n"
-                detail += f"发布时间: {note.get('publish_time', '')}\n"
-                if note.get('ip_region'):
-                    detail += f"IP地区: {note.get('ip_region', '')}\n"
+                # 构建详情（主要互动数已在上方指标行显示，这里只补充元信息）
+                blocks = [
+                    ('kv', ("类型", note.get('note_type', '图文'))),
+                    ('kv', ("发布时间", note.get('publish_time', ''))),
+                    ('kv', ("IP地区", note.get('ip_region', ''))),
+                ]
                 # tags 在 DB 里是 JSON 字符串，直接显示会带 ["…"] 括号引号
                 tags_val = note.get('tags', '')
                 if isinstance(tags_val, str) and tags_val.startswith('['):
@@ -2551,50 +2984,33 @@ class CrawlerApp:
                         pass
                 if isinstance(tags_val, list):
                     tags_val = '、'.join(str(t) for t in tags_val)
-                if tags_val:
-                    detail += f"标签: {tags_val}\n"
-                if note.get('keyword'):
-                    detail += f"关键词: {note.get('keyword', '')}\n"
-                detail += f"\n--- 内容 ---\n{note.get('content', '')}\n"
-                
-                # 评论 - 醒目显示
+                blocks.append(('kv', ("标签", tags_val)))
+                blocks.append(('kv', ("关键词", note.get('keyword', ''))))
+
+                if note.get('content'):
+                    blocks.append(('section', "正文"))
+                    blocks.append(('body', note.get('content', '')))
+
                 comments = note.get('comments', [])
                 if comments:
-                    detail += f"\n{'='*40}\n"
-                    detail += f">>> 热门评论 ({len(comments)}条) <<<\n"
-                    detail += f"{'='*40}\n\n"
+                    blocks.append(('section', f"热门评论（{len(comments)} 条）"))
                     for i, c in enumerate(comments[:10], 1):
                         if isinstance(c, dict):
                             author = c.get('author', '') or c.get('user', '') or '匿名'
-                            content = c.get('content', '')
-                            time_str = c.get('time', '')
-                            ip_str = c.get('ip', '')
-                            likes = c.get('likes', 0)
-                            has_image = c.get('has_image', False)
-                            
-                            # 构建评论头部信息
-                            header = f"[{i}] @{author}"
-                            if ip_str:
-                                header += f" | {ip_str}"
-                            if time_str:
-                                header += f" | {time_str}"
-                            if likes > 0:
-                                header += f" | ❤️{likes}"
-                            
-                            detail += f"{header}\n"
-                            
-                            # 图片标记
-                            if has_image:
-                                detail += "    [含图片评论]\n"
-                            
-                            detail += f"    {content}\n\n"
+                            parts = [f"{i}. @{author}"]
+                            for extra in (c.get('ip', ''), c.get('time', '')):
+                                if extra:
+                                    parts.append(extra)
+                            if c.get('likes', 0):
+                                parts.append(f"❤{c.get('likes')}")
+                            if c.get('has_image'):
+                                parts.append("含图片")
+                            blocks.append(('meta', "  ·  ".join(parts)))
+                            blocks.append(('quote', c.get('content', '')))
                         else:
-                            detail += f"[{i}] {c}\n\n"
-                
-                self.detail_text.config(state=tk.NORMAL)
-                self.detail_text.delete(1.0, tk.END)
-                self.detail_text.insert(tk.END, detail)
-                self.detail_text.config(state=tk.DISABLED)
+                            blocks.append(('quote', f"{i}. {c}"))
+
+                self._render_detail(blocks)
                 
                 # 加载图片预览
                 self._load_image_previews(note)
@@ -2631,7 +3047,7 @@ class CrawlerApp:
         
         if not all_images and not self.current_video_path:
             self.preview_canvas.create_text(200, 75, text="暂无媒体文件", fill="#888")
-            self.preview_page_label.config(text="")
+            self.preview_page_label.configure(text="")
             return
         
         # 使用通用的分页渲染
@@ -2815,7 +3231,7 @@ class CrawlerApp:
         
         if not valid_images and not self.current_video_path and not comment_images:
             self.preview_canvas.create_text(200, 90, text="暂无本地媒体", fill="#888")
-            self.preview_page_label.config(text="")
+            self.preview_page_label.configure(text="")
             return
         
         # 保存所有图片路径（用于分页）
@@ -2851,7 +3267,7 @@ class CrawlerApp:
         comment_count = len(getattr(self, 'preview_comment_images', []))
 
         if not slots:
-            self.preview_page_label.config(text="")
+            self.preview_page_label.configure(text="")
             cw = max(self.preview_canvas.winfo_width(), 200)
             self.preview_canvas.create_text(cw // 2, 90, text="暂无媒体文件", fill="#888")
             return
@@ -2872,7 +3288,7 @@ class CrawlerApp:
             media_info += " + 视频"
         if comment_count > 0:
             media_info += f" + {comment_count}张评论图"
-        self.preview_page_label.config(text=f"第{self.preview_page + 1}/{max_page}页 ({media_info})")
+        self.preview_page_label.configure(text=f"第{self.preview_page + 1}/{max_page}页 ({media_info})")
 
         try:
             from PIL import Image, ImageTk, ImageDraw
@@ -3007,26 +3423,27 @@ class CrawlerApp:
         viewer.geometry(f"{view_w}x{view_h}+{pos_x}+{pos_y}")
         viewer.minsize(460, 520)
         viewer.transient(self.root)  # 保持在主窗口之上，随主窗口最小化
-        viewer.configure(bg="#1a1a1a")
-        
+        viewer.configure(bg=C['viewer_bg'])
+
         # 当前图片索引
         current_index = [start_index]
         photo_ref = [None]  # 保持图片引用
-        
+
         # 顶部信息栏
-        info_frame = tk.Frame(viewer, bg="#1a1a1a")
-        info_frame.pack(fill=tk.X, pady=5)
-        
-        info_label = tk.Label(info_frame, text="", fg="white", bg="#1a1a1a", font=('Microsoft YaHei UI', 14))
+        info_frame = tk.Frame(viewer, bg=C['viewer_bg'])
+        info_frame.pack(fill=tk.X, pady=SP_SM)
+
+        info_label = tk.Label(info_frame, text="", fg=C['viewer_text'], bg=C['viewer_bg'],
+                              font=UI_FONT(FS_SMALL))
         info_label.pack()
-        
+
         # 图片显示区域
-        canvas = tk.Canvas(viewer, bg="#1a1a1a", highlightthickness=0)
-        canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        
+        canvas = tk.Canvas(viewer, bg=C['viewer_bg'], highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True, padx=SP_MD, pady=SP_XS)
+
         # 底部按钮栏
-        btn_frame = tk.Frame(viewer, bg="#1a1a1a")
-        btn_frame.pack(fill=tk.X, pady=10)
+        btn_frame = tk.Frame(viewer, bg=C['viewer_bg'])
+        btn_frame.pack(fill=tk.X, pady=SP_MD)
         
         def update_image():
             idx = current_index[0]
@@ -3034,10 +3451,16 @@ class CrawlerApp:
                 img_path = self.preview_image_paths[idx]
                 try:
                     img = Image.open(img_path)
-                    
-                    # 计算缩放尺寸（保持比例，适应窗口）
-                    canvas_w = canvas.winfo_width() or 880
-                    canvas_h = canvas.winfo_height() or 550
+
+                    # 计算缩放尺寸（保持比例，适应窗口）。
+                    # winfo 未布局时返回 1（真值），"or 默认值"永不生效，
+                    # 曾导致首帧按 1px 渲染闪空白——必须显式判 <=1
+                    canvas_w = canvas.winfo_width()
+                    canvas_h = canvas.winfo_height()
+                    if canvas_w <= 1:
+                        canvas_w = view_w - 30
+                    if canvas_h <= 1:
+                        canvas_h = view_h - CHROME_H - 20
                     
                     img_w, img_h = img.size
                     # 允许适度放大（≤2x）填满画布：此前上限1.0，小图在
@@ -3056,7 +3479,7 @@ class CrawlerApp:
                     
                     # 更新信息
                     filename = os.path.basename(img_path)
-                    info_label.config(text=f"{idx + 1} / {len(self.preview_image_paths)}  |  {filename}  |  {img_w}x{img_h}")
+                    info_label.configure(text=f"{idx + 1} / {len(self.preview_image_paths)}  |  {filename}  |  {img_w}x{img_h}")
                     
                 except Exception as e:
                     canvas.delete("all")
@@ -3078,11 +3501,17 @@ class CrawlerApp:
                 folder = os.path.dirname(os.path.abspath(path))
                 os.startfile(folder)
         
-        # 按钮
-        ttk.Button(btn_frame, text="< 上一张", command=prev_image, width=12).pack(side=tk.LEFT, padx=20)
-        ttk.Button(btn_frame, text="打开文件夹", command=open_in_explorer, width=12).pack(side=tk.LEFT, padx=10)
-        ttk.Button(btn_frame, text="下一张 >", command=next_image, width=12).pack(side=tk.LEFT, padx=20)
-        ttk.Button(btn_frame, text="关闭", command=viewer.destroy, width=10).pack(side=tk.RIGHT, padx=20)
+        # 按钮：深色底上用半透明灰块 + 浅字，白底描边按钮在这里会刺眼
+        def dark_btn(text, command, side, padx):
+            ctk.CTkButton(btn_frame, text=text, command=command, width=112, height=36,
+                          corner_radius=8, font=UI_FONT(),
+                          fg_color=C['viewer_btn'], hover_color=C['viewer_btn_h'],
+                          text_color=C['viewer_text']).pack(side=side, padx=padx)
+
+        dark_btn("← 上一张", prev_image, tk.LEFT, (SP_LG, SP_SM))
+        dark_btn("打开文件夹", open_in_explorer, tk.LEFT, SP_SM)
+        dark_btn("下一张 →", next_image, tk.LEFT, SP_SM)
+        dark_btn("关闭", viewer.destroy, tk.RIGHT, (SP_SM, SP_LG))
         
         # 键盘绑定
         viewer.bind("<Left>", lambda e: prev_image())
@@ -3101,9 +3530,47 @@ class CrawlerApp:
         viewer.after(50, update_image)
         viewer.focus_set()
     
-    def _on_preview_double_click(self, event):
-        """双击预览图打开查看器"""
-        self._open_image_viewer(0)
+    def _view_current_media(self):
+        """"查看大图"按钮：从当前页第一张图打开查看器。
+
+        纯视频/纯评论图笔记不再静默无反应：视频→直接播放，
+        评论图→打开第一张评论图。
+        """
+        if self.preview_image_paths:
+            # 当前页第一个"笔记图片"槽位的全局索引
+            slots = self._build_preview_slots()
+            ipp = self._preview_items_per_page()
+            page_slots = slots[self.preview_page * ipp:(self.preview_page + 1) * ipp]
+            start_idx = 0
+            for kind, _path, tag in page_slots:
+                if kind == 'image':
+                    try:
+                        start_idx = int(tag[len('img_'):])
+                    except ValueError:
+                        start_idx = 0
+                    break
+            self._open_image_viewer(start_idx)
+        elif self.current_video_path:
+            self._play_video_file(self.current_video_path)
+        elif getattr(self, 'preview_comment_images', []):
+            try:
+                os.startfile(os.path.abspath(self.preview_comment_images[0]))
+            except OSError as e:
+                messagebox.showerror("错误", f"无法打开评论图片: {e}")
+        else:
+            messagebox.showinfo("提示", "当前没有可查看的媒体")
+
+    @staticmethod
+    def _play_video_file(path: str):
+        """用系统播放器打开本地视频文件"""
+        abs_path = os.path.abspath(path)
+        if os.path.exists(abs_path):
+            try:
+                os.startfile(abs_path)
+            except OSError as e:
+                messagebox.showerror("错误", f"无法播放视频: {e}")
+        else:
+            messagebox.showerror("错误", f"视频文件不存在: {abs_path}")
     
     def _on_result_double_click(self, event):
         """双击表格行"""
@@ -3112,175 +3579,121 @@ class CrawlerApp:
         batch_folder = getattr(self, 'current_batch_folder', None)
         
         if batch_notes and not batch_folder:
-            # 全部批次视图，双击进入
+            # 全部批次视图，双击进入。按**行位置**从 displayed_notes 反查，
+            # 与选中/删除一致（不用 values[0]-1，序号列未必等于行位置）
             selected = self.result_tree.selection()
             if selected:
-                item = self.result_tree.item(selected[0])
-                index = int(item['values'][0]) - 1
-                if 0 <= index < len(batch_notes):
-                    folder = batch_notes[index]
+                row_pos = self.result_tree.index(selected[0])
+                folders = getattr(self, 'displayed_notes', None) or batch_notes
+                if 0 <= row_pos < len(folders):
+                    folder = folders[row_pos]
                     folder_name = folder['name']
-                    # 更新下拉框选择
-                    for val in self.crawl_batch_combo['values']:
-                        if val.startswith(folder_name):
+                    # 同步下拉框选择（用文件夹名匹配，容忍标签后缀变化）
+                    for val in self.crawl_batch_combo.cget('values'):
+                        if self._batch_label_to_folder(val) == folder_name:
                             self.crawl_batch_var.set(val)
-                            self._load_batch_images(folder_name)
-                            return
+                            break
+                    self._load_batch_images(folder_name)
         else:
             # 其他视图，打开图片文件夹
             self._open_images_folder()
     
     def _open_images_folder(self):
-        """打开图片文件夹"""
-        if not self.current_selected_note:
+        """打开图片文件夹。
+
+        四种视图的 current_selected_note 字段不同：当前爬取/历史有
+        local_dir/local_images；批次明细是 {path, images, videos, ...}；
+        批次汇总是 {folder_path, ...}。按优先级逐一取，全部兼容。
+        （此前只认 local_images→keyword，批次视图会打开错误的根目录。）
+        """
+        note = self.current_selected_note
+        if not note:
             return
-        
-        local_images = self.current_selected_note.get('local_images', [])
-        if local_images and os.path.exists(local_images[0]):
-            folder = os.path.dirname(os.path.abspath(local_images[0]))
-            os.startfile(folder)
-        else:
-            # 尝试根据关键词找目录
-            keyword = self.current_selected_note.get('keyword', '')
-            folder = f"images/{keyword}"
-            if os.path.exists(folder):
-                os.startfile(os.path.abspath(folder))
-            else:
-                messagebox.showinfo("提示", "未找到本地图片文件夹")
-    
+
+        candidates = []
+        if note.get('local_dir'):
+            candidates.append(note['local_dir'])
+        if note.get('path'):                      # 批次明细：笔记子目录
+            candidates.append(note['path'])
+        if note.get('folder_path'):               # 批次汇总：批次目录
+            candidates.append(note['folder_path'])
+        local_images = note.get('local_images') or []
+        if local_images:
+            candidates.append(os.path.dirname(local_images[0]))
+        if note.get('keyword'):
+            candidates.append(f"images/{note['keyword']}")
+
+        for folder in candidates:
+            abs_folder = os.path.abspath(folder)
+            if os.path.isdir(abs_folder):
+                os.startfile(abs_folder)
+                return
+        messagebox.showinfo("提示", "未找到本地图片文件夹")
+
     def _play_video(self):
-        """播放视频"""
-        if not self.current_selected_note:
+        """播放视频（兼容批次明细的 videos 列表字段）"""
+        note = self.current_selected_note
+        if not note:
             return
-        
-        local_video = self.current_selected_note.get('local_video', '')
+
+        # 各视图的视频字段：local_video(当前/历史) / videos[0](批次明细)
+        local_video = note.get('local_video') or ''
+        if not local_video:
+            videos = note.get('videos') or []
+            if videos:
+                local_video = videos[0]
+
         if local_video:
-            # 转换为绝对路径
             abs_path = os.path.abspath(local_video)
             if os.path.exists(abs_path):
                 try:
                     os.startfile(abs_path)
-                except Exception as e:
+                except OSError as e:
                     messagebox.showerror("错误", f"无法播放视频: {e}")
             else:
                 messagebox.showinfo("提示", f"视频文件不存在: {abs_path}")
         else:
-            video_url = self.current_selected_note.get('video_url', '')
+            video_url = note.get('video_url', '')
             if video_url:
                 import webbrowser
                 webbrowser.open(video_url)
             else:
                 messagebox.showinfo("提示", "该笔记没有视频")
-    
+
     def _open_note_link(self):
-        """打开笔记链接"""
-        if not self.current_selected_note:
+        """打开笔记链接（无 note_link 时用 note_id 拼接）"""
+        note = self.current_selected_note
+        if not note:
             return
-        
-        link = self.current_selected_note.get('note_link', '')
+
+        link = note.get('note_link', '')
+        if not link and note.get('note_id'):
+            link = f"https://www.xiaohongshu.com/explore/{note['note_id']}"
         if link:
             import webbrowser
             webbrowser.open(link)
         else:
             messagebox.showinfo("提示", "没有笔记链接")
     
-    def _delete_crawl_batch(self):
-        """删除整个爬取批次（按关键词和时间删除）"""
-        if not self.current_selected_note:
-            messagebox.showinfo("提示", "请先选择一条记录")
-            return
-        
-        keyword = self.current_selected_note.get('keyword', '')
-        crawl_time = self.current_selected_note.get('crawl_time', '')
-        
-        if not keyword:
-            messagebox.showinfo("提示", "无法确定爬取批次")
-            return
-        
-        # 查找该批次的所有记录
-        try:
-            conn = sqlite3.connect(self.config.db_path)
-            cursor = conn.cursor()
-            
-            # 按关键词和爬取日期查找
-            if crawl_time:
-                date_prefix = crawl_time[:10]  # YYYY-MM-DD
-                cursor.execute("SELECT COUNT(*) FROM notes WHERE keyword = ? AND crawl_time LIKE ?", 
-                              (keyword, f"{date_prefix}%"))
-            else:
-                cursor.execute("SELECT COUNT(*) FROM notes WHERE keyword = ?", (keyword,))
-            
-            count = cursor.fetchone()[0]
-            conn.close()
-            
-            if count == 0:
-                messagebox.showinfo("提示", "未找到该批次的记录")
-                return
-            
-            # 确认删除
-            batch_info = f"关键词: {keyword}"
-            if crawl_time:
-                batch_info += f"\n日期: {crawl_time[:10]}"
-            
-            if not messagebox.askyesno("确认删除批次", 
-                f"确定要删除整个爬取批次吗？\n\n{batch_info}\n共 {count} 条记录\n\n这将同时删除：\n• 数据库中的所有相关记录\n• 对应的图片/视频文件夹"):
-                return
-            
-            # 删除数据库记录
-            conn = sqlite3.connect(self.config.db_path)
-            cursor = conn.cursor()
-            if crawl_time:
-                date_prefix = crawl_time[:10]
-                cursor.execute("DELETE FROM notes WHERE keyword = ? AND crawl_time LIKE ?", 
-                              (keyword, f"{date_prefix}%"))
-            else:
-                cursor.execute("DELETE FROM notes WHERE keyword = ?", (keyword,))
-            deleted_db = cursor.rowcount
-            conn.commit()
-            conn.close()
-            
-            # 删除文件夹
-            deleted_folders = 0
-            import shutil
-            import glob
-            
-            # 查找匹配的文件夹
-            if crawl_time:
-                # 新格式: images/{keyword}_{YYYYMMDD}_*
-                date_str = crawl_time[:10].replace("-", "")
-                pattern = f"images/{keyword}_{date_str}*"
-            else:
-                # 旧格式或所有该关键词的文件夹
-                pattern = f"images/{keyword}*"
-            
-            for folder in glob.glob(pattern):
-                if os.path.isdir(folder):
-                    try:
-                        shutil.rmtree(folder)
-                        deleted_folders += 1
-                    except Exception as e:
-                        print(f"删除文件夹失败: {folder}, {e}")
-            
-            # 刷新显示
-            self._load_history_data()
-            
-            messagebox.showinfo("完成", f"已删除批次:\n• 数据库记录: {deleted_db} 条\n• 文件夹: {deleted_folders} 个")
-            
-        except Exception as e:
-            messagebox.showerror("错误", f"删除失败: {e}")
-    
     def _clear_results(self):
         """清空当前结果"""
+        # 爬取进行中禁止清空内存列表：工作线程正以递增 success 计数作为
+        # 行号写表，清空后新行会以远大于列表长度的 index 插入，序号与
+        # displayed_notes 长度错位，后续点选/删除按行反查越界
+        if self.is_running and self.data_source_var.get() == "当前爬取":
+            messagebox.showinfo("提示", "爬取进行中，请先停止再清空")
+            return
         if self.data_source_var.get() == "当前爬取":
             self.all_notes_data = []
 
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
-        self.result_count_label.config(text="共 0 条记录")
-        self.detail_text.config(state=tk.NORMAL)
+        self.result_count_label.configure(text="共 0 条记录")
+        self._reset_result_stats()
+        self.detail_text.configure(state=tk.NORMAL)
         self.detail_text.delete(1.0, tk.END)
-        self.detail_text.config(state=tk.DISABLED)
-        self.preview_canvas.delete("all")
+        self.detail_text.configure(state=tk.DISABLED)
+        self._reset_preview_state()
         self.current_selected_note = None
         # 重置所有后备序列，避免残留映射导致后续点选/删除错位
         self.displayed_notes = []
@@ -3298,13 +3711,15 @@ class CrawlerApp:
                 return
             except OSError as e:
                 self.log(f"删除目录失败 {local_dir}: {e}", "WARNING")
-        # 回退：从已知图片路径推断所在文件夹
+        # 回退：从已知图片路径推断所在文件夹。
+        # 安全护栏：只删名字形如 note_* 的笔记级目录，绝不 rmtree 其父级
+        # 批次目录——若 local_images 异常指向批次根，误删会连带几十条笔记
         local_images = note.get('local_images', [])
         if isinstance(local_images, str):
             local_images = [p.strip() for p in local_images.split('|') if p.strip()]
         for img_path in local_images:
             folder = os.path.dirname(img_path) if img_path else ''
-            if folder and os.path.isdir(folder):
+            if folder and os.path.isdir(folder) and os.path.basename(folder).startswith('note_'):
                 try:
                     shutil.rmtree(folder)
                     return
@@ -3377,12 +3792,19 @@ class CrawlerApp:
         messagebox.showinfo("完成", f"已删除 {deleted_count} 条记录")
     
     def _export_results(self):
-        """导出结果到Excel"""
-        if self.data_source_var.get() == "历史数据库":
-            data = getattr(self, 'history_notes_data', [])
-        else:
-            data = self.all_notes_data
-        
+        """导出结果到Excel——导出的是**用户当前看到的表格内容**。
+
+        此前只按 data_source_var 二选一取全量列表：批次视图下导出的是
+        无关的内存数据、筛选/排序后仍导出全量，且列名走英文另一套 schema。
+        现统一：displayed_notes（含筛选/排序/批次明细结果）+ 中文列头。
+        """
+        # 批次汇总视图的行是文件夹摘要，不是笔记，无法按笔记 schema 导出
+        data = list(getattr(self, 'displayed_notes', []) or [])
+        if data and 'note_id' not in data[0] and 'path' in data[0] and 'mtime' in data[0]:
+            messagebox.showinfo(
+                "提示", "当前是批次汇总视图（文件夹列表）。\n"
+                       "请双击进入某个批次，或切换数据源后再导出。")
+            return
         if not data:
             messagebox.showwarning("提示", "没有数据可导出")
             return
@@ -3393,108 +3815,91 @@ class CrawlerApp:
                 initialfile=f"爬取结果_{int(time.time())}.xlsx"
             )
             if filepath:
-                df = pd.DataFrame(data)
+                df = self._notes_to_export_df(data)
                 df.to_excel(filepath, index=False)
-                messagebox.showinfo("成功", f"已导出到: {filepath}")
+                messagebox.showinfo("成功", f"已导出 {len(data)} 条到:\n{filepath}")
         except Exception as e:
             messagebox.showerror("错误", f"导出失败: {e}")
     
-    def _create_content_page(self, parent):
-        """创建内容选项页面"""
-        # === 基础内容 ===
-        basic_frame = ttk.LabelFrame(parent, text="基础内容", padding="10")
-        basic_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        row1 = ttk.Frame(basic_frame)
-        row1.pack(fill=tk.X, pady=2)
-        
-        self.get_content_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row1, text="获取笔记正文内容", variable=self.get_content_var).pack(side=tk.LEFT, padx=(0, 20))
-        
-        self.get_tags_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row1, text="提取话题标签 (#xxx)", variable=self.get_tags_var).pack(side=tk.LEFT, padx=(0, 20))
-        
-        self.get_time_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row1, text="获取发布时间", variable=self.get_time_var).pack(side=tk.LEFT)
-        
-        row2 = ttk.Frame(basic_frame)
-        row2.pack(fill=tk.X, pady=2)
-        
-        self.get_interactions_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2, text="获取互动数据（点赞/收藏/评论数）", variable=self.get_interactions_var).pack(side=tk.LEFT)
-        
-        # === 图片视频 ===
-        media_frame = ttk.LabelFrame(parent, text="图片/视频", padding="10")
-        media_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        row3 = ttk.Frame(media_frame)
-        row3.pack(fill=tk.X, pady=2)
-        
-        self.download_images_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row3, text="下载图片", variable=self.download_images_var).pack(side=tk.LEFT, padx=(0, 20))
-        
-        self.get_all_images_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row3, text="获取全部图片（切换轮播）", variable=self.get_all_images_var).pack(side=tk.LEFT, padx=(0, 20))
-        
-        self.download_videos_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row3, text="下载视频", variable=self.download_videos_var).pack(side=tk.LEFT)
-        
-        # === 评论 ===
-        comment_frame = ttk.LabelFrame(parent, text="评论爬取", padding="10")
-        comment_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        row4 = ttk.Frame(comment_frame)
-        row4.pack(fill=tk.X, pady=2)
-        
-        self.get_comments_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row4, text="获取热门评论", variable=self.get_comments_var).pack(side=tk.LEFT, padx=(0, 20))
-        
-        ttk.Label(row4, text="评论数量:").pack(side=tk.LEFT)
-        self.comments_count_var = tk.StringVar(value="10")
-        ttk.Spinbox(row4, from_=1, to=50, textvariable=self.comments_count_var, width=6).pack(side=tk.LEFT, padx=5)
-        
-        # === 导出格式 ===
-        export_frame = ttk.LabelFrame(parent, text="导出设置", padding="10")
-        export_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        row5 = ttk.Frame(export_frame)
-        row5.pack(fill=tk.X, pady=2)
-        
-        ttk.Label(row5, text="导出格式:").pack(side=tk.LEFT)
-        self.export_format_var = tk.StringVar(value="xlsx")
-        ttk.Combobox(row5, textvariable=self.export_format_var,
-                    values=["xlsx", "csv", "json"], width=10, state="readonly").pack(side=tk.LEFT, padx=(5, 20))
-        
-        self.export_db_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row5, text="同时保存到SQLite数据库", variable=self.export_db_var).pack(side=tk.LEFT)
-        
-        # === 快捷预设 ===
-        preset_frame = ttk.LabelFrame(parent, text="快捷预设", padding="10")
-        preset_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        preset_row = ttk.Frame(preset_frame)
-        preset_row.pack(fill=tk.X)
-        
-        ttk.Button(preset_row, text="极速采集", command=self._preset_turbo, width=12).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(preset_row, text="完整数据", command=self._preset_complete, width=12).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(preset_row, text="只下图片", command=self._preset_images, width=12).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(preset_row, text="只下视频", command=self._preset_videos, width=12).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(preset_row, text="只要文本", command=self._preset_text, width=12).pack(side=tk.LEFT)
-    
-    def _create_analysis_page(self, parent):
-        """创建数据分析页面"""
-        # === 分析工具 ===
-        tools_frame = ttk.LabelFrame(parent, text="分析工具", padding="10")
-        tools_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        row1 = ttk.Frame(tools_frame)
-        row1.pack(fill=tk.X, pady=5)
+    def _check(self, parent, text, variable, **pack_kw):
+        """统一勾选项。"""
+        box = ctk.CTkCheckBox(parent, text=text, variable=variable, font=UI_FONT(),
+                              checkbox_width=20, checkbox_height=20)
+        box.pack(**{'side': tk.LEFT, **pack_kw})
+        return box
 
-        ttk.Button(row1, text="刷新统计", command=self._refresh_dashboard_from_db, width=12).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(row1, text="生成统计图表", command=self._generate_charts, width=14).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(row1, text="生成词云", command=self._generate_wordcloud, width=12).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(row1, text="生成分析报告", command=self._generate_report, width=14).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(row1, text="合并所有数据", command=self._merge_data, width=14).pack(side=tk.LEFT)
+    def _create_content_page(self, parent):
+        """创建内容选项页面。
+
+        快捷预设移到最上方：它是"一键设好下面所有开关"的入口，放在被它
+        改写的选项之后不合逻辑。
+        """
+        # === 快捷预设 ===
+        preset = self._card(parent, "快捷预设")
+        preset_row = self._row(preset)
+        for text, cmd in (("极速采集", self._preset_turbo), ("完整数据", self._preset_complete),
+                          ("只下图片", self._preset_images), ("只下视频", self._preset_videos),
+                          ("只要文本", self._preset_text)):
+            self._btn(preset_row, text, cmd, width=104, padx=(0, SP_SM))
+
+        # === 基础内容 ===
+        basic = self._card(parent, "基础内容")
+        row1 = self._row(basic, pady=(0, SP_SM))
+        self.get_content_var = tk.BooleanVar(value=True)
+        self._check(row1, "获取笔记正文内容", self.get_content_var, padx=(0, 26))
+        self.get_tags_var = tk.BooleanVar(value=True)
+        self._check(row1, "提取话题标签 (#xxx)", self.get_tags_var, padx=(0, 26))
+        self.get_time_var = tk.BooleanVar(value=True)
+        self._check(row1, "获取发布时间", self.get_time_var)
+
+        row2 = self._row(basic)
+        self.get_interactions_var = tk.BooleanVar(value=True)
+        self._check(row2, "获取互动数据（点赞 / 收藏 / 评论数）", self.get_interactions_var)
+
+        # === 图片视频 ===
+        media = self._card(parent, "图片 / 视频")
+        row3 = self._row(media)
+        self.download_images_var = tk.BooleanVar(value=True)
+        self._check(row3, "下载图片", self.download_images_var, padx=(0, 26))
+        self.get_all_images_var = tk.BooleanVar(value=True)
+        self._check(row3, "获取全部图片（切换轮播）", self.get_all_images_var, padx=(0, 26))
+        self.download_videos_var = tk.BooleanVar(value=True)
+        self._check(row3, "下载视频", self.download_videos_var)
+
+        # === 评论 ===
+        comment = self._card(parent, "评论爬取")
+        row4 = self._row(comment)
+        self.get_comments_var = tk.BooleanVar(value=True)
+        self._check(row4, "获取热门评论", self.get_comments_var, padx=(0, 26))
+        self._label(row4, "评论数量", padx=(0, SP_SM))
+        self.comments_count_var = tk.StringVar(value="10")
+        self._num_entry(row4, self.comments_count_var)
+
+        # === 导出设置 ===
+        export = self._card(parent, "导出设置")
+        row5 = self._row(export)
+        self._label(row5, "导出格式", padx=(0, SP_SM))
+        self.export_format_var = tk.StringVar(value="xlsx")
+        self._combo(row5, self.export_format_var, ["xlsx", "csv", "json"],
+                    width=120, padx=(0, 26))
+        self.export_db_var = tk.BooleanVar(value=True)
+        self._check(row5, "同时保存到 SQLite 数据库", self.export_db_var)
+
+    def _create_analysis_page(self, parent):
+        """创建数据分析页面。
+
+        仪表盘从"1px 方框 + 与标签同号的数字"改成真正的指标卡：数值用
+        26 号加粗，说明用 13 号灰字，靠字号差建立层次，扫一眼就抓得到数。
+        """
+        # === 分析工具 ===
+        tools = self._card(parent, "分析工具")
+        row1 = self._row(tools)
+        self._btn(row1, "刷新统计", self._refresh_dashboard_from_db, width=104, padx=(0, SP_SM))
+        for text, cmd in (("生成统计图表", self._generate_charts),
+                          ("生成词云", self._generate_wordcloud),
+                          ("生成分析报告", self._generate_report),
+                          ("合并所有数据", self._merge_data)):
+            self._btn(row1, text, cmd, width=116, padx=(0, SP_SM))
 
         # 依赖缺失提示（可选依赖未装时按钮点了只弹框，先在此显式告知）
         missing = []
@@ -3502,17 +3907,17 @@ class CrawlerApp:
         if not HAS_WORDCLOUD: missing.append("wordcloud+jieba(词云)")
         if not HAS_DOCX: missing.append("python-docx(报告)")
         if missing:
-            ttk.Label(tools_frame, text="⚠ 未安装：" + "、".join(missing) + "  相关功能不可用",
-                      foreground="#ef6c00").pack(anchor="w", pady=(6, 0))
-        
+            warn = self._row(tools, pady=(SP_SM, 0))
+            ctk.CTkLabel(warn, text="⚠  未安装：" + "、".join(missing) + "，相关功能不可用",
+                         font=UI_FONT(FS_SMALL), text_color=C['warning'],
+                         fg_color=C['warn_soft'], corner_radius=6, height=30,
+                         padx=12).pack(side=tk.LEFT)
+
         # === 统计仪表盘 ===
-        dashboard_frame = ttk.LabelFrame(parent, text="统计仪表盘", padding="10")
-        dashboard_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 10))
-        
-        # 统计卡片网格
-        stats_grid = ttk.Frame(dashboard_frame)
-        stats_grid.pack(fill=tk.X, pady=10)
-        
+        dashboard = self._card(parent, "统计仪表盘")
+        stats_grid = ctk.CTkFrame(dashboard, fg_color="transparent")
+        stats_grid.pack(fill=tk.X)
+
         self.dashboard_labels = {}
         stats_items = [
             ("total_notes", "总笔记", "0"),
@@ -3524,35 +3929,37 @@ class CrawlerApp:
             ("image_notes", "图文笔记", "0"),
             ("video_notes", "视频笔记", "0"),
         ]
-        
         for i, (key, label, default) in enumerate(stats_items):
-            row = i // 4
-            col = i % 4
-            
-            card = ttk.Frame(stats_grid, relief="solid", borderwidth=1)
-            card.grid(row=row, column=col, padx=10, pady=5, sticky="nsew")
-            
-            ttk.Label(card, text=label, font=('Microsoft YaHei UI', 14)).pack(pady=(5, 0))
-            self.dashboard_labels[key] = ttk.Label(card, text=default, font=('Microsoft YaHei UI', 14, 'bold'), foreground="#667eea")
-            self.dashboard_labels[key].pack(pady=(0, 5))
-        
+            tile = ctk.CTkFrame(stats_grid, fg_color=C['card_alt'], corner_radius=10,
+                                border_width=1, border_color=C['border'])
+            tile.grid(row=i // 4, column=i % 4, padx=(0 if i % 4 == 0 else SP_SM, 0),
+                      pady=(0 if i < 4 else SP_SM, 0), sticky="nsew")
+            self.dashboard_labels[key] = ctk.CTkLabel(
+                tile, text=default, font=UI_FONT(FS_METRIC, bold=True),
+                text_color=C['brand'], anchor="w")
+            self.dashboard_labels[key].pack(anchor="w", padx=SP_MD, pady=(SP_MD, 0))
+            ctk.CTkLabel(tile, text=label, font=UI_FONT(FS_SMALL),
+                         text_color=C['text_sub'], anchor="w").pack(
+                anchor="w", padx=SP_MD, pady=(0, SP_MD))
+
         for i in range(4):
-            stats_grid.columnconfigure(i, weight=1)
-        
+            stats_grid.columnconfigure(i, weight=1, uniform="metric")
+
         # === 历史记录 ===
-        history_frame = ttk.LabelFrame(parent, text="历史记录", padding="10")
-        history_frame.pack(fill=tk.BOTH, expand=True)
-        
+        history = self._card(parent, "历史记录", expand=True, pady=0)
         columns = ("时间", "关键词", "笔记数", "图片数", "文件")
-        self.history_tree = ttk.Treeview(history_frame, columns=columns, show="headings", height=8)
-        
+        self.history_tree = ttk.Treeview(history, columns=columns, show="headings", height=8)
+
+        widths = {"时间": 150, "关键词": 130, "笔记数": 90, "图片数": 90, "文件": 320}
         for col in columns:
             self.history_tree.heading(col, text=col)
-            self.history_tree.column(col, width=100)
-        
-        scrollbar = ttk.Scrollbar(history_frame, orient=tk.VERTICAL, command=self.history_tree.yview)
+            self.history_tree.column(col, width=widths[col],
+                                     anchor="e" if col.endswith("数") else "w",
+                                     stretch=(col == "文件"))
+
+        scrollbar = ttk.Scrollbar(history, orient=tk.VERTICAL, command=self.history_tree.yview)
         self.history_tree.configure(yscrollcommand=scrollbar.set)
-        
+
         self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
@@ -3573,93 +3980,74 @@ class CrawlerApp:
             self.log(f"刷新统计失败: {e}", "WARNING")
 
     def _create_settings_page(self, parent):
-        """创建设置页面"""
-        # === Cookie管理 ===
-        cookie_frame = ttk.LabelFrame(parent, text="Cookie管理", padding="10")
-        cookie_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        row1 = ttk.Frame(cookie_frame)
-        row1.pack(fill=tk.X, pady=2)
-        
+        """创建高级设置页面。"""
+        # === Cookie 管理 ===
+        cookie = self._card(parent, "Cookie 管理")
+        row1 = self._row(cookie)
         self.save_cookies_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row1, text="登录后自动保存Cookie", variable=self.save_cookies_var).pack(side=tk.LEFT, padx=(0, 20))
-        
+        self._check(row1, "登录后自动保存 Cookie", self.save_cookies_var, padx=(0, 26))
         self.cookie_status_var = tk.StringVar(value="未检测到Cookie")
-        ttk.Label(row1, textvariable=self.cookie_status_var, foreground="gray").pack(side=tk.LEFT, padx=(0, 10))
-        
-        ttk.Button(row1, text="清除Cookie", command=self._clear_cookies, width=10).pack(side=tk.LEFT)
-        
+        ctk.CTkLabel(row1, textvariable=self.cookie_status_var, font=UI_FONT(FS_SMALL),
+                     text_color=C['text_sub']).pack(side=tk.LEFT, padx=(0, SP_MD))
+        clear_cookie = self._btn(row1, "清除Cookie", self._clear_cookies, width=104)
+        clear_cookie.configure(text_color=C['danger'])
+
         self._check_cookie_status()
-        
+
         # === 日志设置 ===
-        log_frame = ttk.LabelFrame(parent, text="日志设置", padding="10")
-        log_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        row2 = ttk.Frame(log_frame)
-        row2.pack(fill=tk.X, pady=2)
-        
+        log = self._card(parent, "日志设置")
+        row2 = self._row(log)
         self.log_to_file_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2, text="保存日志到文件", variable=self.log_to_file_var).pack(side=tk.LEFT, padx=(0, 20))
-        
-        ttk.Button(row2, text="打开日志文件", command=self._open_log_file).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(row2, text="清空日志", command=self._clear_log_file).pack(side=tk.LEFT)
-        
+        self._check(row2, "保存日志到文件", self.log_to_file_var, padx=(0, 26))
+        self._btn(row2, "打开日志文件", self._open_log_file, width=116, padx=(0, SP_SM))
+        clear_log = self._btn(row2, "清空日志", self._clear_log_file, width=96)
+        clear_log.configure(text_color=C['danger'])
+
         # === 速度控制 ===
-        speed_frame = ttk.LabelFrame(parent, text="速度控制", padding="10")
-        speed_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        row3 = ttk.Frame(speed_frame)
-        row3.pack(fill=tk.X, pady=2)
-        
-        ttk.Label(row3, text="点击延迟(秒):").pack(side=tk.LEFT)
+        speed = self._card(parent, "速度控制")
+        row3 = self._row(speed)
+        self._label(row3, "点击延迟(秒)", padx=(0, SP_SM))
         self.click_min_var = tk.StringVar(value="0.3")
-        ttk.Entry(row3, textvariable=self.click_min_var, width=5).pack(side=tk.LEFT, padx=2)
-        ttk.Label(row3, text="-").pack(side=tk.LEFT)
+        self._num_entry(row3, self.click_min_var, width=72, padx=(0, SP_XS))
+        self._label(row3, "-", padx=(0, SP_XS))
         self.click_max_var = tk.StringVar(value="0.5")
-        ttk.Entry(row3, textvariable=self.click_max_var, width=5).pack(side=tk.LEFT, padx=(2, 20))
-        
-        ttk.Label(row3, text="滚动延迟(秒):").pack(side=tk.LEFT)
+        self._num_entry(row3, self.click_max_var, width=72, padx=(0, 26))
+
+        self._label(row3, "滚动延迟(秒)", padx=(0, SP_SM))
         self.scroll_min_var = tk.StringVar(value="0.4")
-        ttk.Entry(row3, textvariable=self.scroll_min_var, width=5).pack(side=tk.LEFT, padx=2)
-        ttk.Label(row3, text="-").pack(side=tk.LEFT)
+        self._num_entry(row3, self.scroll_min_var, width=72, padx=(0, SP_XS))
+        self._label(row3, "-", padx=(0, SP_XS))
         self.scroll_max_var = tk.StringVar(value="0.6")
-        ttk.Entry(row3, textvariable=self.scroll_max_var, width=5).pack(side=tk.LEFT)
-        
+        self._num_entry(row3, self.scroll_max_var, width=72)
+
         # === 反爬设置 ===
-        anti_frame = ttk.LabelFrame(parent, text="反爬虫设置", padding="10")
-        anti_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        row4 = ttk.Frame(anti_frame)
-        row4.pack(fill=tk.X, pady=2)
-        
+        anti = self._card(parent, "反爬虫设置")
+        row4 = self._row(anti)
         self.random_delay_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row4, text="随机延迟（模拟人类行为）", variable=self.random_delay_var).pack(side=tk.LEFT, padx=(0, 20))
-        
+        self._check(row4, "随机延迟（模拟人类行为）", self.random_delay_var, padx=(0, 26))
         self.random_scroll_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row4, text="随机滚动距离", variable=self.random_scroll_var).pack(side=tk.LEFT)
-        
+        self._check(row4, "随机滚动距离", self.random_scroll_var)
+
         # === 数据库设置 ===
-        db_frame = ttk.LabelFrame(parent, text="数据库设置", padding="10")
-        db_frame.pack(fill=tk.X, pady=(0, 10))
-        
-        row5 = ttk.Frame(db_frame)
-        row5.pack(fill=tk.X, pady=2)
-        
-        ttk.Label(row5, text="数据库路径:").pack(side=tk.LEFT)
+        db = self._card(parent, "数据库设置")
+        row5 = self._row(db)
+        self._label(row5, "数据库路径", padx=(0, SP_SM))
         self.db_path_var = tk.StringVar(value="data/redbook.db")
-        ttk.Entry(row5, textvariable=self.db_path_var, width=40).pack(side=tk.LEFT, padx=5)
-        
-        ttk.Button(row5, text="浏览", command=self._browse_db_path).pack(side=tk.LEFT)
-    
+        ctk.CTkEntry(row5, textvariable=self.db_path_var, width=400, height=34,
+                     font=UI_FONT()).pack(side=tk.LEFT, padx=(0, SP_SM))
+        self._btn(row5, "浏览", self._browse_db_path, width=80)
+        self._label(row5, "改动后需重启生效", color=C['text_faint'], size=FS_SMALL,
+                    padx=(SP_MD, 0))
+
     # === 事件处理 ===
     def _on_mode_change(self):
         """切换爬取模式"""
         mode = self.crawl_type_var.get()
         
         # 禁用/启用相应输入框
-        self.keyword_entry.config(state=tk.NORMAL if mode == "keyword" else tk.DISABLED)
-        self.blogger_entry.config(state=tk.NORMAL if mode == "blogger" else tk.DISABLED)
-        self.hot_combo.config(state="readonly" if mode == "hot" else tk.DISABLED)
+        self.keyword_entry.configure(state=tk.NORMAL if mode == "keyword" else tk.DISABLED)
+        self.blogger_entry.configure(state=tk.NORMAL if mode == "blogger" else tk.DISABLED)
+        self.hot_combo.configure(state="readonly" if mode == "hot" else tk.DISABLED)
     
     def _check_cookie_status(self):
         """检查Cookie状态"""
@@ -3753,21 +4141,14 @@ class CrawlerApp:
             try:
                 while True:
                     msg, level = self.log_queue.get_nowait()
-                    if HAS_CTK and isinstance(self.log_text, ctk.CTkTextbox):
-                        # CustomTkinter方式（支持 tag 时带级别着色）
-                        self.log_text.configure(state="normal")
-                        if getattr(self, '_ctk_log_tags', False):
-                            self.log_text.insert(tk.END, msg, level)
-                        else:
-                            self.log_text.insert(tk.END, msg)
-                        self.log_text.see(tk.END)
-                        self.log_text.configure(state="disabled")
-                    else:
-                        # 标准tkinter方式
-                        self.log_text.config(state=tk.NORMAL)
+                    self.log_text.configure(state="normal")
+                    # tag 着色让 SUCCESS/ERROR 一眼可辨；建 tag 失败时退回单色
+                    if getattr(self, '_ctk_log_tags', False):
                         self.log_text.insert(tk.END, msg, level)
-                        self.log_text.see(tk.END)
-                        self.log_text.config(state=tk.DISABLED)
+                    else:
+                        self.log_text.insert(tk.END, msg)
+                    self.log_text.see(tk.END)
+                    self.log_text.configure(state="disabled")
             except queue.Empty:
                 pass
             self.root.after(100, consume)
@@ -3821,13 +4202,32 @@ class CrawlerApp:
                 val = val.split(":")[-1].strip()
             self.time_var.set(str(val))
         if "progress" in kwargs:
-            self.total_progress["value"] = kwargs["progress"]
-            self.progress_label.config(text=f"{int(kwargs['progress'])}%")
-    
+            # CTkProgressBar 取 0.0~1.0，而调用方全部按百分比传入
+            pct = max(0.0, min(100.0, float(kwargs["progress"])))
+            self.total_progress.set(pct / 100.0)
+            self.progress_label.configure(text=f"{int(pct)}%")
+
+    def _set_crawl_buttons(self, running: bool):
+        """按运行态切换主操作按钮的可用性与配色。
+
+        停止按钮只在爬取中才是红色实心；空闲时退回描边灰。原先它常驻
+        纯红，静止界面上一个禁用按钮比主操作还抢眼。
+        """
+        self.start_btn.configure(state="disabled" if running else "normal")
+        self.stop_btn.configure(state="normal" if running else "disabled")
+        if running:
+            self.stop_btn.configure(fg_color=C['danger'], hover_color=C['danger_hover'],
+                                    text_color=C['text_on_brand'], border_width=0)
+        else:
+            self.stop_btn.configure(fg_color=C['card'], hover_color=C['brand_soft'],
+                                    text_color=C['text'], border_width=1,
+                                    border_color=C['border_strong'])
+
+
     def _update_dashboard(self, stats):
         for key, value in stats.items():
             if key in self.dashboard_labels:
-                self.dashboard_labels[key].config(text=str(int(value) if isinstance(value, float) else value))
+                self.dashboard_labels[key].configure(text=str(int(value) if isinstance(value, float) else value))
     
     # === 爬取控制 ===
     def _start_crawl(self):
@@ -3987,19 +4387,17 @@ class CrawlerApp:
         # 清空表格UI
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
-        self.result_count_label.config(text="共 0 条记录")
-        
-        # 清空预览区域
-        self.preview_canvas.delete("all")
-        self.preview_images = []
-        self.preview_image_paths = []
-        self.current_video_path = None
+        self.result_count_label.configure(text="共 0 条记录")
+        self._reset_result_stats()  # 三张统计卡同步清零，避免残留上轮数字
+
+        # 清空预览区域（含评论图/页码，防 resize 重绘旧媒体）
+        self._reset_preview_state()
         self.current_selected_note = None
         
         # 清空详情区域
-        self.detail_text.config(state=tk.NORMAL)
+        self.detail_text.configure(state=tk.NORMAL)
         self.detail_text.delete(1.0, tk.END)
-        self.detail_text.config(state=tk.DISABLED)
+        self.detail_text.configure(state=tk.DISABLED)
         
         # 清空批次数据与显示序列
         self.batch_notes_data = []
@@ -4010,9 +4408,8 @@ class CrawlerApp:
         # 确保数据源是"当前爬取"
         self.data_source_var.set("当前爬取")
         
-        self.start_btn.configure(state=tk.DISABLED)
-        self.stop_btn.configure(state=tk.NORMAL)
-        
+        self._set_crawl_buttons(running=True)
+
         thread = threading.Thread(target=self._crawl_thread, daemon=True)
         thread.start()
     
@@ -4328,6 +4725,8 @@ class CrawlerApp:
             
             self.log(f"爬取{status}！笔记: {total_notes}, 图片: {total_images}, 视频: {total_videos}", "SUCCESS")
             self._safe_after(self._refresh_history)
+            # 爬完刷新"爬取批次"下拉框，使新批次立即可选（此前需手动点刷新）
+            self._safe_after(self._refresh_crawl_batches)
             
         except InterruptedError:
             self.log("爬取已取消", "WARNING")
@@ -4344,8 +4743,7 @@ class CrawlerApp:
             self.downloader.reset_stats()
             
             self.is_running = False
-            self._safe_after(lambda: self.start_btn.configure(state=tk.NORMAL))
-            self._safe_after(lambda: self.stop_btn.configure(state=tk.DISABLED))
+            self._safe_after(lambda: self._set_crawl_buttons(running=False))
     
     def _sync_browser_cookies(self, page):
         """将浏览器Cookie同步到下载器"""
@@ -6033,67 +6431,60 @@ class CrawlerApp:
         except Exception:
             return 0
     
-    def _save_data(self, data, keyword):
-        """保存数据"""
-        os.makedirs("data", exist_ok=True)
-        timestamp = int(time.time())
-        
-        # 预处理数据 - 将复杂类型转换为字符串
+    @staticmethod
+    def _notes_to_export_df(data) -> "pd.DataFrame":
+        """笔记 dict 列表 → 可落盘的 DataFrame（唯一的导出扁平化入口）。
+
+        评论转多行文本、tags/图片/路径列表转分隔串，最后统一 rename 成
+        EXPORT_COLUMN_MAPPING 中文列头。_save_data 与 _export_results 共用，
+        保证全仓只有一套导出 schema（回读侧配套 normalize_df_columns）。
+        """
         processed_data = []
         for item in data:
             processed_item = item.copy()
-            
-            # 处理评论 - 将字典列表转为可读字符串（包含完整信息）
-            if 'comments' in processed_item and isinstance(processed_item['comments'], list):
+
+            # 评论: dict 列表 → "[序号] @作者 | IP | 时间 | ❤️赞 | [含图]: 内容"
+            if isinstance(processed_item.get('comments'), list):
                 comments = processed_item['comments']
                 if comments and isinstance(comments[0], dict):
-                    # 格式: "[用户名|IP|时间|赞数|图片标记] 评论内容"
                     comment_strs = []
                     for i, c in enumerate(comments, 1):
                         author = c.get('author', '') or '匿名'
                         content = c.get('content', '')
-                        time_str = c.get('time', '')
-                        ip_str = c.get('ip', '')
-                        likes = c.get('likes', 0)
-                        has_image = c.get('has_image', False)
-                        
-                        if content:
-                            # 构建评论信息
-                            info_parts = [f"@{author}"]
-                            if ip_str:
-                                info_parts.append(ip_str)
-                            if time_str:
-                                info_parts.append(time_str)
-                            if likes > 0:
-                                info_parts.append(f"❤️{likes}")
-                            if has_image:
-                                info_parts.append("[含图]")
-                            
-                            info = " | ".join(info_parts)
-                            comment_strs.append(f"[{i}] {info}: {content}")
+                        if not content:
+                            continue
+                        info_parts = [f"@{author}"]
+                        if c.get('ip'):
+                            info_parts.append(c['ip'])
+                        if c.get('time'):
+                            info_parts.append(c['time'])
+                        if c.get('likes', 0) > 0:
+                            info_parts.append(f"❤️{c['likes']}")
+                        if c.get('has_image'):
+                            info_parts.append("[含图]")
+                        comment_strs.append(f"[{i}] {' | '.join(info_parts)}: {content}")
                     processed_item['comments'] = '\n'.join(comment_strs)
                 else:
                     processed_item['comments'] = '\n'.join(str(c) for c in comments)
-            
-            # 处理标签列表
-            if 'tags' in processed_item and isinstance(processed_item['tags'], list):
+
+            if isinstance(processed_item.get('tags'), list):
                 processed_item['tags'] = ', '.join(processed_item['tags'])
-            
-            # 处理图片URL列表
-            if 'image_urls' in processed_item and isinstance(processed_item['image_urls'], list):
+            if isinstance(processed_item.get('image_urls'), list):
                 processed_item['image_urls'] = ' | '.join(processed_item['image_urls'])
-            
-            # 处理本地图片路径列表
-            if 'local_images' in processed_item and isinstance(processed_item['local_images'], list):
+            if isinstance(processed_item.get('local_images'), list):
                 processed_item['local_images'] = ' | '.join(processed_item['local_images'])
-            
+
             processed_data.append(processed_item)
-        
-        # 转换为DataFrame
+
         df = pd.DataFrame(processed_data)
-        
-        # 重命名列（映射定义见模块级 EXPORT_COLUMN_MAPPING）
-        df = df.rename(columns=EXPORT_COLUMN_MAPPING)
+        return df.rename(columns=EXPORT_COLUMN_MAPPING)
+
+    def _save_data(self, data, keyword):
+        """保存数据"""
+        os.makedirs("data", exist_ok=True)
+        timestamp = int(time.time())
+
+        df = self._notes_to_export_df(data)
         
         ext = self.config.export_format
         filename = f"data/搜索结果_{keyword}_{timestamp}.{ext}"

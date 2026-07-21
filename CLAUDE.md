@@ -6,41 +6,50 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概览
 
-小红书笔记爬虫，**单文件应用**：[crawler_ultimate.py](crawler_ultimate.py)（约 6100 行）。
-技术栈：tkinter GUI + DrissionPage（Chromium 自动化）+ SQLite + pandas。
+小红书笔记爬虫，**单文件应用**：[crawler_ultimate.py](crawler_ultimate.py)（约 6800 行）。
+技术栈：CustomTkinter + ttk 混合 GUI + DrissionPage（Chromium 自动化）+ SQLite + pandas。
 
 > **v5.3 大修说明**：本文档下方"已知未接线/已失效"等章节多数问题已修复。
 > 每条已修项就地标注 ✅；仍需注意的不变量保持原样。行号为近似值，改动前请以 grep 复核。
+>
+> **v5.4 UI 重做**：全界面统一为 CustomTkinter + 小红书品牌红，见下方"界面层"章节。
 
 ```bash
 pip install -r requirements.txt
 python crawler_ultimate.py        # 必须在仓库根目录启动，见下方"相对路径依赖"
 ```
 
-**本仓库没有任何测试、linter 或构建配置**，没有 `pytest`/`ruff`/`black` 设置。验证方式只有手动运行 GUI。新增测试前先与用户确认，不要自行引入测试框架并假定它属于本项目约定。
+**本仓库没有任何测试、linter 或构建配置**，没有 `pytest`/`ruff`/`black` 设置。新增测试前先与用户确认，不要自行引入测试框架并假定它属于本项目约定。GUI 可用无头脚本驱动验证，见下方"改动后如何验证"。
 
-可选依赖（matplotlib / wordcloud / jieba / python-docx）在 `requirements.txt:14-16` 中被**注释掉**，默认不安装；缺失时"数据分析"页三个按钮全部不可用。
+`customtkinter` 现在是**必需依赖**（不再是可选美化项）；缺失时程序弹窗提示安装命令后退出，不再静默降级成另一套长相。
+可选依赖（matplotlib / wordcloud / jieba / python-docx）在 `requirements.txt` 中被**注释掉**，默认不安装；缺失时"数据分析"页三个按钮不可用（页内会显式列出缺哪个）。
 
 ---
 
 ## 架构总览
 
-单文件、单类承担全部职责。`CrawlerApp`（687-5759）同时是 GUI、爬取引擎和持久化协调者。分层只体现在行号区间：
+单文件、单类承担全部职责。`CrawlerApp`（848 起）同时是 GUI、爬取引擎和持久化协调者。分层只体现在行号区间：
 
 | 行号区间 | 职责 |
 |---|---|
-| 68-182 | `CrawlerConfig` dataclass + JSON 持久化白名单 |
-| 185-284 | `FileLogger`（带锁）、`CookieManager`（带锁） |
-| 287-370 | `DatabaseManager` — 单表 `notes` |
-| 373-527 | `MediaDownloader` — 线程池 + 共享 requests.Session |
-| 530-684 | `DataAnalyzer` — 图表/词云/报告，全部受可选依赖门控 |
-| 844-3350 | GUI 五个页面构建 + 结果页交互 |
-| 3410-3573 | 爬取启动 / 配置收集 / 线程派发 |
-| 3573-3833 | `_crawl_thread` 主循环 |
-| 3843-3946 | 登录检测与 Cookie |
-| 4007-4374 | `_standard_crawl` / `_fast_crawl` 两条采集路径 |
-| 4374-5081 | `_extract_full_note` — **单方法 709 行**，全文最复杂处 |
-| 5406-5518 | `_save_data` — 扁平化 + 列名中译 + 落盘 |
+| 74-140 | **设计令牌** `C` / `UI_FONT` / `FS_*` / `SP_*` / `CHART_COLORS` |
+| 141-195 | `EXPORT_COLUMN_MAPPING` + `normalize_df_columns` |
+| 195-320 | `CrawlerConfig` dataclass + JSON 持久化白名单 |
+| 321-422 | `FileLogger`（带锁）、`CookieManager`（带锁） |
+| 423-521 | `DatabaseManager` — 单表 `notes` |
+| 522-690 | `MediaDownloader` — 线程池 + 共享 requests.Session |
+| 691-847 | `DataAnalyzer` — 图表/词云/报告，全部受可选依赖门控 |
+| 943-1219 | `_setup_styles` / `_setup_ctk_theme` — 全局视觉样式 |
+| 1220-1295 | **界面构件工厂** `_card` / `_row` / `_label` / `_btn` / `_combo` / `_num_entry` / `_check` / `_metric` |
+| 1296-1474 | `_create_ui` + `_create_main_page` |
+| 1475-3892 | `_create_result_page` + 结果页全部交互（含 `_render_detail:2786`） |
+| 3893-4130 | 内容选项 / 数据分析 / 高级设置三页 |
+| 4272-4490 | 按钮运行态、爬取启动、配置收集、线程派发 |
+| 4489-4842 | `_crawl_thread` 主循环 |
+| 4843-5016 | 登录检测与 Cookie |
+| 5017-5411 | `_standard_crawl` / `_fast_crawl` 两条采集路径 |
+| 5412-6543 | `_extract_full_note` — **单方法 700+ 行**，全文最复杂处 |
+| 6544-6660 | `_save_data` — 扁平化 + 列名中译 + 落盘 |
 
 `docs/` 三份文档是**选择器与页面结构的权威参考**，改动任何采集逻辑前必读：
 
@@ -88,6 +97,66 @@ const noteId = urlMatch ? urlMatch[1] : state.note.currentNoteId;
 ### 7. 登录态的真实载体是 Chromium profile 目录，不是 cookies.json
 
 `data/browser_profile/`（3617）。`ChromiumPage` 未指定端口，走默认 9222 — **本机已开的 Chrome 调试实例会被直接接管**。
+
+---
+
+## 界面层（v5.4 重做）
+
+改界面前先读这一节，否则很容易把刚统一好的观感重新拆散。
+
+### 1. 设计令牌是颜色/字体/间距的唯一来源
+
+模块级 `C`（颜色）、`UI_FONT()`（字体）、`FS_*`（字号层级）、`SP_*`（间距刻度）、
+`CHART_COLORS`（matplotlib 配色）。**新代码禁止再写 `'#3b82f6'` 这类颜色字面量或
+`('Microsoft YaHei UI', 14)` 这类内联字体元组** —— 重做前全文散着近百处内联字体和
+一堆无关 hex，换主题得全文替换。配色方向是小红书品牌红 `#FF2442`，中性灰承载信息，
+语义色只用于状态。
+
+### 2. 两套渲染体系的分工是刻意的
+
+- **CustomTkinter** 承担全部交互控件（按钮/输入/勾选/单选/下拉/进度条/文本框）。
+  配色走 `_setup_ctk_theme()` 改 `ctk.ThemeManager.theme` 全局默认，
+  **不要逐控件传 `fg_color`** —— 控件数以百计，逐个传必然漂移。
+- **ttk** 只保留没有 CTk 对应实现的：`Treeview` / `Notebook` / `Scrollbar` /
+  `PanedWindow`。它们在 `_setup_styles()` 里被拉到与 CTk 一致的观感。
+  该方法开头 `style.theme_use('clam')` **不可删**：Windows 默认的 `vista` 主题会
+  忽略大部分 `configure` 选项，背景和边框根本改不动。
+
+### 3. 用构件工厂，不要手搭分组
+
+`_card(parent, title)` 造带标题的白色卡片（取代观感陈旧的 `ttk.LabelFrame`），
+返回可直接放内容的内层容器；`_row` / `_label` / `_btn` / `_combo` / `_num_entry` /
+`_check` / `_metric` 覆盖其余常见构件。`_btn` 的 `kind` 取
+`primary`(品牌红实心) / `danger` / `secondary`(白底描边)；破坏性操作用 secondary
+再把 `text_color` 设成 `C['danger']`（红字描边，比红色实心克制）。
+
+### 4. CTk 控件的三个 API 陷阱
+
+- **`.config()` 在 CTk 控件上会直接抛 AttributeError**，CTk 只认 `.configure()`。
+  全文已统一为 `.configure()`（对 tk/ttk 是等价别名）。新代码沿用 `.configure()`。
+- **下拉框回调不是 `<<ComboboxSelected>>` 事件**：`CTkComboBox` 的 `command` 直接
+  收到*选中值字符串*。`_on_batch_select` / `_on_data_source_change` 的形参因此叫
+  `_choice` 而非 `event`。另外它没有 ttk 的 `['values']` 索引赋值与 `.current()`，
+  一律用 `.configure(values=...)` / `.set(v)` / `.cget('values')`。
+- **`CTkProgressBar` 取 0.0~1.0**，而全部调用方按百分比传入，
+  `_apply_ui_update` 负责 `/100` 并钳位。别再写 `total_progress["value"] = x`。
+
+### 5. 表格与详情面板
+
+- Treeview 的 tag **只能作用于整行**，无法只给"类型"列上色。原先按类型把整行染成
+  红/蓝，标题、作者、三列数字全被染色，几十行下来像调色板。现在图文行是正常墨色，
+  只有视频行带一点暖褐（`C['row_video']`）。**不要再往行上加颜色。**
+- 详情面板排版走 `_render_detail(blocks)`，`blocks` 是 `(kind, text)` 序列，
+  kind ∈ `kv` / `section` / `body` / `meta` / `quote`。
+  **不要再用 `'='*40` 拼分隔线** —— 那只有等宽字体下才对得齐，这里是比例字体。
+
+### 6. 已知渲染瑕疵（非 bug，勿"修"）
+
+CTk 用自带的 `CustomTkinter_shapes_font` 画圆角、对勾和下拉箭头，字体经
+`AddFontResourceEx(FR_PRIVATE)` 私有加载 —— 因此 `tkfont.families()` 查不到它，
+但进程内可用，渲染正常。下拉箭头字符实际是 `'Y'`（该字体里 Y 的字形即 chevron），
+高倍放大能看到顶点有 1px 抗锯齿缺口，正常观看距离不可见。**不要试图 hack
+`widget._canvas` 去替换字形**，CTk 每次重绘都会重设该 item 的 font。
 
 ---
 
@@ -150,16 +219,17 @@ images/{关键词|主页推荐}_{YYYYMMDD}_{HHMMSS}/     ← 批次层 (4017 / 4
 
 | 模式 | 触发 | 后备列表 | `current_batch_folder` |
 |---|---|---|---|
-| 当前爬取 | `_show_current_data:2011` | `all_notes_data`（内存） | `None` |
-| 历史数据库 | `_load_history_data:1870` | `history_notes_data`（SQLite） | `None` |
-| 批次汇总 | `_load_all_batch_images:1724` | `batch_notes_data` = **文件夹摘要 dict** | `None` |
-| 单批次明细 | `_load_batch_images:1561` | `batch_notes_data` = **笔记 dict** | 绝对路径 |
+| 当前爬取 | `_show_current_data:2725` | `all_notes_data`（内存） | `None` |
+| 历史数据库 | `_load_history_data:2574` | `history_notes_data`（SQLite） | `None` |
+| 批次汇总 | `_load_all_batch_images:2415` | `batch_notes_data` = **文件夹摘要 dict** | `None` |
+| 单批次明细 | `_load_batch_images:2209` | `batch_notes_data` = **笔记 dict** | 绝对路径 |
 
-**真正的判别式是 `current_batch_folder`，不是下拉框。** `_on_result_select:2062` 靠它区分后两种模式（2087、2146）。`batch_notes_data` 被刻意复用于两种记录结构 —— 这是全文件最易误读之处。
+**真正的判别式是 `current_batch_folder`，不是下拉框。** `_on_result_select:2833` 靠它区分后两种模式。`batch_notes_data` 被刻意复用于两种记录结构 —— 这是全文件最易误读之处。
 
-**行标识是位置性的，从不使用 key**：所有选中/删除/预览都靠 `int(values[0]) - 1`（2148、2183）反查后备列表。改动"序号"列内容，或做了排序却没把排序结果写回后备列表，会**同时**破坏选中、删除和预览。
+**行标识按行位置，不按"序号"列**：`_on_result_select` 用 `result_tree.index(item)` 反查
+`displayed_notes`。详见下方"本次新增的关键不变量"——**不要退回 `int(values[0])-1`**。
 
-**PhotoImage 引用保持**：`ImageTk.PhotoImage` 一旦失去 Python 引用即被 GC，画布变空白。代码统一存进 `self.preview_images`，该列表在每次渲染开头重置（2467）。**新增任何 `create_image` 调用，必须在同一处 append 到 `self.preview_images`。** 独立查看器用 `photo_ref = [None]` 闭包（2630）达到同样目的。
+**PhotoImage 引用保持**：`ImageTk.PhotoImage` 一旦失去 Python 引用即被 GC，画布变空白。代码统一存进 `self.preview_images`，该列表在每次渲染开头重置（`_render_preview_page:3261`）。**新增任何 `create_image` 调用，必须在同一处 append 到 `self.preview_images`。** 独立查看器用 `photo_ref = [None]` 闭包（`_open_image_viewer:3388`）达到同样目的。
 
 ✅ **v5.3：`_open_image_viewer` 的重复定义已删除**，只保留带 `start_index` 的完整实现。预览点击改用 **canvas tag 命中检测**（`find_withtag('current')` + `img_{全局索引}` 标签），不再用坐标除法；分页数 `_preview_max_page()` 已把视频缩略图占的槽位计入。
 
@@ -197,23 +267,38 @@ images/{关键词|主页推荐}_{YYYYMMDD}_{HHMMSS}/     ← 批次层 (4017 / 4
 
 ## 编辑本仓库时的约定
 
-**相对路径依赖** — `"images"` 和 `"data"` 全程作为裸相对路径使用（1273、1735、1917、2342、5600）。程序**只有以仓库根目录为 CWD 启动才能工作**。
+**相对路径依赖** — `"images"` 和 `"data"` 全程作为裸相对路径使用（256、1748、2213、2425 等）。程序**只有以仓库根目录为 CWD 启动才能工作**。
 
-**裸 `except: pass` 仍有残留**（早期类里的 207、358 等）。v5.3 已把新代码与热点路径的裸捕获改为具名异常 + `self.log(...)`。**新代码禁止沿用裸 `except:`**；至少要 `self.log(..., "ERROR")` 或打印。
+**裸 `except: pass` 仍有残留**（794、844、1760、2288 等）。v5.3/v5.4 已把新代码与热点路径的裸捕获改为具名异常 + `self.log(...)`。**新代码禁止沿用裸 `except:`**；至少要 `self.log(..., "ERROR")` 或打印。
 
 **魔法数字与硬编码等待** — 单条笔记最坏约 6 秒固定 sleep，全部内联无常量。预览画布 `thumb_size=240`；画布宽度已改为运行时 `winfo_width()` 读取（不再硬编码 700）。
 
 ✅ **URL 双重编码** — 已收拢到 `_build_search_url()` 单一方法（原在两处重复的 `quote(quote(...))`）。仍是历史遗留的 cargo-cult 编码，未经实测勿改为单次编码。
 
-**函数/文件体量** — 全局规范要求函数 <50 行、文件 <800 行。本文件约 6100 行、`_extract_full_note` 700+ 行，已严重超标。**不要为了"符合规范"发起大范围重构**；按最小单元逐步改，拆分时优先 `_extract_full_note`。
+**函数/文件体量** — 全局规范要求函数 <50 行、文件 <800 行。本文件约 6800 行、`_extract_full_note` 700+ 行，已严重超标。**不要为了"符合规范"发起大范围重构**；按最小单元逐步改，拆分时优先 `_extract_full_note`。
 
-**改动后如何验证**（本仓库无测试框架，只能手动+脚本）：GUI 逻辑可用无头脚本驱动——
-`CrawlerApp()` 起实例后直接调方法、断言 `displayed_notes`/统计标签，用 `PIL.ImageGrab` 截图核验；
-真实爬取需已登录的 `browser_profile`，且当前网络不能被小红书 IP 风控拦截。
+**改动后如何验证**（本仓库无测试框架，只能手动+脚本）：
 
-**提交信息用中文**，沿用现有前缀风格：`修复: xxx` / `优化: xxx` / `配置: xxx` / `v5.3: xxx`。
+```python
+# GUI 全程可无头驱动：起实例 → 直接调方法 → 断言状态
+app = CrawlerApp(); root = app.root
+root.attributes('-topmost', True)          # 桌面可能开着用户自己的实例，避免截图被挡
+app.notebook.select(1)                     # 切页
+app.data_source_var.set("历史数据库"); app._on_data_source_change()
+root.update_idletasks(); root.update()     # 必须手动泵事件循环，没有 mainloop
+app.result_tree.selection_set(app.result_tree.get_children()[0])
+app._on_result_select(None)
+assert app.detail_text.tag_ranges('field') # 断言渲染真的发生了
+ImageGrab.grab(bbox=...).save('shot.png')  # 截图核验观感
+```
 
-**可安全复用的组件**：`FileLogger:185`、`CookieManager:211`、`MediaDownloader.download_batch:474`（协作式取消模型）设计合理。
+覆盖面建议：模式切换（验 `state` 真的变了）、按钮运行态、进度条钳位、日志五级着色、
+数据源/批次/筛选/排序、详情渲染、设置保存→恢复往返、五个预设、仪表盘刷新。
+**真实爬取**需已登录的 `browser_profile`，且网络未被小红书 IP 风控拦截。
+
+**提交信息用中文**，沿用现有前缀风格：`修复: xxx` / `优化: xxx` / `配置: xxx` / `v5.4: xxx`。
+
+**可安全复用的组件**：`FileLogger:321`、`CookieManager:347`、`MediaDownloader.download_batch:623`（协作式取消模型）设计合理。
 
 ---
 
@@ -221,7 +306,7 @@ images/{关键词|主页推荐}_{YYYYMMDD}_{HHMMSS}/     ← 批次层 (4017 / 4
 
 `data/` 与三个 `images/` 批次目录中存在 **4 份字节相同的 `~$cache1`**（771584 B，头部 `4D 5A 50` = Delphi PE 可执行文件）。它们**不是** Office 临时文件（真锁文件名为 `~$<原名>.xlsx` 且仅数百字节）。
 
-同时 `data/*.xlsm` 内含的是一份无关的 33 表《环境质量指标》工作簿，**不是爬取数据** —— 而 `_save_data:5494-5500` 只会写 `.xlsx`/`.csv`/`.json`，**代码不可能产出 `.xlsm`**。
+同时 `data/*.xlsm` 内含的是一份无关的 33 表《环境质量指标》工作簿，**不是爬取数据** —— 而 `_save_data:6492-6508` 只会写 `.xlsx`/`.csv`/`.json`，**代码不可能产出 `.xlsm`**。
 
 对开发的影响：
 - ✅ **`.gitignore` 已补上 `~$*` 与 `*.xlsm`**（本次修改），`git add .` 不会再误提交这些文件。
