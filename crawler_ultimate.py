@@ -3890,22 +3890,31 @@ class CrawlerApp:
         dark_btn("下一张 →", next_image, tk.LEFT, SP_SM)
         dark_btn("关闭", viewer.destroy, tk.RIGHT, (SP_SM, SP_LG))
         
-        # 键盘绑定
+        # 键盘绑定：ESC/Q/点击空白处 均可关闭（多一条退路更好退出）
+        def _close_viewer(_e=None):
+            try:
+                viewer.destroy()
+            except Exception:
+                pass
         viewer.bind("<Left>", lambda e: prev_image())
         viewer.bind("<Right>", lambda e: next_image())
-        viewer.bind("<Escape>", lambda e: viewer.destroy())
+        viewer.bind("<Escape>", _close_viewer)
+        viewer.bind("<q>", _close_viewer)
         viewer.bind("<space>", lambda e: next_image())
-        
+        canvas.bind("<Double-Button-1>", _close_viewer)  # 双击图片区退出
+        viewer.protocol("WM_DELETE_WINDOW", _close_viewer)
+
         # 窗口大小变化时重新加载图片
         def on_resize(event):
             if event.widget == canvas:
                 viewer.after(100, update_image)
         canvas.bind("<Configure>", on_resize)
-        
-        # 初始显示（窗口几何已在创建时按图片比例设定并钳制在屏内；
-        # 此前这里把窗口挪到"主窗口右侧+10px"，主窗口较宽时直接弹出屏幕外）
+
+        # 初始显示（窗口几何已在创建时按图片比例设定并钳制在屏内）
         viewer.after(50, update_image)
-        viewer.focus_set()
+        # 强制把键盘焦点抢到查看器上，否则 ESC 会被发到主窗口、看似"退不出"
+        viewer.transient(self.root)
+        viewer.after(60, lambda: (viewer.lift(), viewer.focus_force()))
     
     def _view_current_media(self):
         """"查看大图"按钮：从当前页第一张图打开查看器。
@@ -4185,7 +4194,7 @@ class CrawlerApp:
                      text_color=C['brand'], fg_color=C['brand_soft'],
                      corner_radius=8, padx=10, height=24).pack(side=tk.LEFT, padx=SP_SM)
 
-        def _close_card():
+        def _close_card(_e=None):
             try:
                 win.grab_release()
             except Exception:
@@ -4545,6 +4554,10 @@ class CrawlerApp:
         win._comment_photos = comment_photos
         win.after(80, show_slot)
         win.protocol("WM_DELETE_WINDOW", _close_card)
+        # 强制把键盘焦点抢到卡片上，确保 ESC 立即可退（否则焦点常留在
+        # 主窗口，按 ESC 像"没反应"）。ESC 已绑定见上方 win.bind
+        win.after(120, lambda: (win.lift(), win.focus_force()))
+        win.bind("<q>", _close_card)  # 多一个退出键
 
     def _open_images_folder(self):
         """打开图片文件夹。
