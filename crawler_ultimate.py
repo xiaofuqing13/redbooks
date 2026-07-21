@@ -4421,17 +4421,51 @@ class CrawlerApp:
                           "提示", "本地离线数据，仅供浏览", parent=win)).pack(side=tk.RIGHT)
         ctk.CTkFrame(right, fg_color=C['border'], height=1).pack(fill=tk.X, padx=SP_MD)
 
-        # —— 底部：互动栏，固定不滚动。小红书式：左"说点什么…"输入框，
-        #    右侧点赞/收藏/评论 图标+数字 ——
+        # 计算当前笔记在列表中的位置，供"上一条/下一条"翻页
+        siblings = [n for n in (getattr(self, 'displayed_notes', None) or [])
+                    if isinstance(n, dict) and n.get('note_id')]
+        cur_id = note.get('note_id')
+        cur_idx = next((k for k, n in enumerate(siblings)
+                        if n.get('note_id') == cur_id), -1)
+
+        def _open_sibling(delta):
+            if cur_idx < 0:
+                return
+            j = cur_idx + delta
+            if 0 <= j < len(siblings):
+                self.current_selected_note = siblings[j]
+                self._open_note_card(siblings[j])  # 会销毁当前卡片并重开
+
+        # —— 底部：互动栏。左"上一条/下一条"翻页，右 点赞/收藏/评论 ——
         engage = ctk.CTkFrame(right, fg_color=C['card'], height=58)
         engage.pack(side=tk.BOTTOM, fill=tk.X)
         engage.pack_propagate(False)
         ctk.CTkFrame(right, fg_color=C['border'], height=1).pack(side=tk.BOTTOM, fill=tk.X)
-        # 左：灰底胶囊"说点什么…"（离线只读，纯视觉对齐）
-        ctk.CTkLabel(engage, text="说点什么...", font=UI_FONT(FS_SMALL),
-                     text_color=C['text_faint'], fg_color=C['card_alt'],
-                     corner_radius=16, height=34, anchor="w", padx=SP_MD).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=(SP_MD, SP_SM), pady=SP_SM)
+        # 左：上一条 / 下一条（到头自动禁用；无兄弟笔记则整体隐藏）
+        nav_l = ctk.CTkFrame(engage, fg_color="transparent")
+        nav_l.pack(side=tk.LEFT, padx=(SP_MD, 0), pady=SP_SM)
+        if cur_idx >= 0 and len(siblings) > 1:
+            prev_btn = ctk.CTkButton(
+                nav_l, text="‹ 上一条", width=88, height=34, corner_radius=17,
+                command=lambda: _open_sibling(-1), font=UI_FONT(FS_SMALL),
+                fg_color=C['card_alt'], hover_color=C['brand_soft'],
+                text_color=C['text'], border_width=1, border_color=C['border'],
+                state=("normal" if cur_idx > 0 else "disabled"))
+            prev_btn.pack(side=tk.LEFT, padx=(0, SP_SM))
+            next_btn = ctk.CTkButton(
+                nav_l, text="下一条 ›", width=88, height=34, corner_radius=17,
+                command=lambda: _open_sibling(1), font=UI_FONT(FS_SMALL, bold=True),
+                fg_color=C['brand'], hover_color=C['brand_hover'],
+                text_color=C['text_on_brand'],
+                state=("normal" if cur_idx < len(siblings) - 1 else "disabled"))
+            next_btn.pack(side=tk.LEFT)
+            # 键盘：PageUp/PageDown 翻笔记（不占用图片轮播的 ←/→）
+            win.bind("<Next>", lambda e: _open_sibling(1))
+            win.bind("<Prior>", lambda e: _open_sibling(-1))
+            # 位置提示
+            ctk.CTkLabel(nav_l, text=f"{cur_idx + 1}/{len(siblings)}",
+                         font=UI_FONT(FS_SMALL - 1), text_color=C['text_faint']).pack(
+                side=tk.LEFT, padx=(SP_SM, 0))
         # 右：点赞/收藏/评论
         eng_right = ctk.CTkFrame(engage, fg_color="transparent")
         eng_right.pack(side=tk.RIGHT, padx=(0, SP_MD))
@@ -4598,6 +4632,29 @@ class CrawlerApp:
                     continue
 
         win._comment_photos = comment_photos
+
+        # 加快评论区滚轮：CTk 默认每格只滚 delta/6 单位，偏慢。给滚动区
+        # 及其全部子控件绑更大步长的处理器并 return "break"，抢在 CTk 的
+        # bind_all 之前生效（内容是静态的，一次性递归绑定即可覆盖）。
+        _pcanvas = getattr(scroll, '_parent_canvas', None)
+
+        def _fast_wheel(event):
+            # CTk 默认 delta/6（≈20单位/格）；这里 delta/2（≈60单位/格）约 3 倍
+            if _pcanvas is not None and _pcanvas.yview() != (0.0, 1.0):
+                _pcanvas.yview_scroll(int(-1 * (event.delta / 2)), "units")
+            return "break"
+
+        def _bind_wheel(widget):
+            try:
+                widget.bind("<MouseWheel>", _fast_wheel)
+            except Exception:
+                pass
+            for ch in widget.winfo_children():
+                _bind_wheel(ch)
+        if _pcanvas is not None:
+            _bind_wheel(scroll)
+            _pcanvas.bind("<MouseWheel>", _fast_wheel)
+
         win.after(80, show_slot)
         win.protocol("WM_DELETE_WINDOW", _close_card)
         # 强制把键盘焦点抢到卡片上，确保 ESC 立即可退（否则焦点常留在
