@@ -1452,6 +1452,17 @@ class CrawlerApp:
         except Exception:
             pass
         self._paint_seg(seg, variable.get())
+
+        # 程序化 variable.set() 不触发 command，CTk 只重涂底色不重涂
+        # 文字色——旧选中段滞留白字，unselect 后成"白底白字"隐形段
+        # （实测：切数据源后"当前爬取"整段消失）。挂 trace 兜底，
+        # 使 set() / _restore_gui_settings 等所有赋值路径都自动补涂。
+        def _repaint(*_args):
+            try:
+                self._paint_seg(seg, variable.get())
+            except Exception:
+                pass  # 控件已销毁（关窗时 trace 仍可能触发）
+        variable.trace_add('write', _repaint)
         seg.pack(**{'side': tk.LEFT, **pack_kw})
         return seg
 
@@ -1621,6 +1632,15 @@ class CrawlerApp:
         self.skip_existing_var = tk.BooleanVar(value=False)
         self._check(filter_row, "跳过已爬取", self.skip_existing_var)
 
+        # 快捷预设：一键改写内容选项+速度，是最常用的配置入口，
+        # 必须在主页可达（原先只在"内容选项"页，首次配置要跨页找）
+        preset_row = self._row(refine, pady=(SP_XS, 0))
+        self._label(preset_row, "快捷预设", width=LABEL_W, padx=(0, SP_SM))
+        for text, cmd in (("极速采集", self._preset_turbo), ("完整数据", self._preset_complete),
+                          ("只下图片", self._preset_images), ("只下视频", self._preset_videos),
+                          ("只要文本", self._preset_text)):
+            self._btn(preset_row, text, cmd, width=96, padx=(0, SP_XS))
+
         btn_frame = self._row(refine, pady=(SP_XS, 0))
         self.start_btn = ctk.CTkButton(
             btn_frame, text="开始爬取", command=self._start_crawl,
@@ -1630,8 +1650,14 @@ class CrawlerApp:
         self.stop_btn = self._btn(btn_frame, "停止", self._stop_crawl, width=90,
                                   padx=(0, SP_SM))
         self.stop_btn.configure(state="disabled")
-        self._btn(btn_frame, "已保存Cookie", self._use_saved_cookies, width=120,
+        self._btn(btn_frame, "Cookie详情", self._use_saved_cookies, width=110,
                   padx=(0, SP_SM))
+        # 登录状态前置：原先藏在"高级设置"页，用户开爬前根本不知道
+        # 会不会又要扫码。变量在这里创建，高级设置页复用同一实例。
+        self.cookie_status_var = tk.StringVar(value="未检测到Cookie")
+        ctk.CTkLabel(btn_frame, textvariable=self.cookie_status_var,
+                     font=UI_FONT(FS_SMALL), text_color=C['text_sub']
+                     ).pack(side=tk.LEFT, padx=(0, SP_SM))
         self._btn(btn_frame, "打开数据", self._open_data_dir, width=100, side=tk.RIGHT)
         self._btn(btn_frame, "打包图片", self._zip_images, width=100, side=tk.RIGHT,
                   padx=(0, SP_SM))
@@ -1718,24 +1744,30 @@ class CrawlerApp:
         toolbar = self._card(parent, pady=(0, SP_SM))
 
         # ---- 上行：数据源分段 + 批次 + 主操作 ----
+        # 数据源是**唯一**的视图入口：当前爬取（内存）/ 历史数据库（SQLite）/
+        # 本地批次（images/ 文件夹）。批次下拉只在"本地批次"下可用——
+        # 此前它与数据源两轴互不协调，组合出 4 种隐式状态，切换后经常
+        # 分不清表格里到底是什么。
         top = self._row(toolbar, pady=(0, SP_MD))
         self._label(top, "数据源", width=LABEL_W, padx=(0, SP_SM))
         self.data_source_var = tk.StringVar(value="当前爬取")
         # 分段控件 command 收到选中值字符串（与旧 combo 约定一致）
         self.data_source_seg = self._seg(
-            top, self.data_source_var, ["当前爬取", "历史数据库"],
-            command=self._on_data_source_change, width=280, padx=(0, SP_LG))
+            top, self.data_source_var, ["当前爬取", "历史数据库", "本地批次"],
+            command=self._on_data_source_change, width=420, padx=(0, SP_LG))
         # 兼容旧代码里对 data_source_combo 的引用（若有）
         self.data_source_combo = self.data_source_seg
 
-        self._label(top, "爬取批次", padx=(0, SP_SM))
+        self._label(top, "批次", padx=(0, SP_SM))
         self.crawl_batch_var = tk.StringVar(value="全部")
-        self.crawl_batch_combo = self._combo(top, self.crawl_batch_var, ["全部"], width=280,
+        self.crawl_batch_combo = self._combo(top, self.crawl_batch_var, ["全部"], width=250,
                                              command=self._on_batch_select, padx=(0, SP_SM))
-        self._btn(top, "刷新批次", self._refresh_crawl_batches, width=110, padx=(0, SP_XS))
-        self._btn(top, "打开目录", self._open_batch_folder, width=110, padx=(0, SP_XS))
-        del_batch = self._btn(top, "删除批次", self._delete_batch_folder, width=110)
-        del_batch.configure(text_color=C['danger'])
+        self._batch_refresh_btn = self._btn(top, "刷新批次", self._refresh_crawl_batches,
+                                            width=100, padx=(0, SP_XS))
+        self._batch_open_btn = self._btn(top, "打开目录", self._open_batch_folder,
+                                         width=100, padx=(0, SP_XS))
+        self._batch_del_btn = self._btn(top, "删除批次", self._delete_batch_folder, width=100)
+        self._batch_del_btn.configure(text_color=C['danger'])
 
         # 主操作靠右：导出用 primary，其余 secondary
         self._btn(top, "导出Excel", self._export_results, kind="primary",
@@ -1747,9 +1779,13 @@ class CrawlerApp:
         bottom = self._row(toolbar)
         self._label(bottom, "搜索", width=LABEL_W, padx=(0, SP_SM))
         self.search_var = tk.StringVar()
-        self.search_entry = ctk.CTkEntry(bottom, textvariable=self.search_var, width=260,
+        # 与历史查询共用同一输入：原先"搜索"（表内筛选）和"关键词"
+        # （SQL 过滤）两个框语义重叠，都匹配标题/作者/正文/关键词，
+        # 用户根本分不清该填哪个
+        self.filter_keyword_var = self.search_var
+        self.search_entry = ctk.CTkEntry(bottom, textvariable=self.search_var, width=300,
                                          height=CTRL_H, font=UI_FONT(),
-                                         placeholder_text="标题 / 作者 / 正文")
+                                         placeholder_text="标题 / 作者 / 正文 / 关键词")
         self.search_entry.pack(side=tk.LEFT, padx=(0, SP_SM))
         self.search_entry.bind("<Return>", lambda e: self._filter_results())
         self._btn(bottom, "筛选", self._filter_results, width=90, padx=(0, SP_XS))
@@ -1760,13 +1796,6 @@ class CrawlerApp:
         self._combo(bottom, self.type_filter_var, ["全部", "图文", "视频"], width=120,
                     command=lambda _v: self._filter_results(), padx=(0, SP_LG))
 
-        self._label(bottom, "关键词", padx=(0, SP_SM))
-        self.filter_keyword_var = tk.StringVar()
-        self.filter_keyword_entry = ctk.CTkEntry(bottom, textvariable=self.filter_keyword_var,
-                                                 width=180, height=CTRL_H, font=UI_FONT(),
-                                                 placeholder_text="限定关键词")
-        self.filter_keyword_entry.pack(side=tk.LEFT)
-
         clear_btn = self._btn(bottom, "清空当前", self._clear_results, width=120, side=tk.RIGHT)
         clear_btn.configure(text_color=C['danger'])
         del_btn = self._btn(bottom, "删除选中", self._delete_selected, width=120,
@@ -1774,6 +1803,7 @@ class CrawlerApp:
         del_btn.configure(text_color=C['danger'])
 
         self._refresh_crawl_batches()
+        self._update_batch_controls_state()
 
         # === 统计条（卡片底 + 药丸）===
         stats_card = ctk.CTkFrame(parent, fg_color=C['card'], corner_radius=CARD_RADIUS,
@@ -2055,8 +2085,30 @@ class CrawlerApp:
             return label
         return re.sub(r' \(\d+张\)( \[[^\]]*\])?$', '', label)
 
+    def _update_batch_controls_state(self):
+        """批次下拉与配套按钮只在"本地批次"数据源下可用。
+
+        灰掉而不是隐藏：让用户知道有这组功能、去哪里启用。
+        "刷新批次"保持常可用——它只重扫文件夹列表，不切视图。
+        """
+        is_batch_mode = self.data_source_var.get() == "本地批次"
+        state = "readonly" if is_batch_mode else "disabled"
+        btn_state = "normal" if is_batch_mode else "disabled"
+        try:
+            self.crawl_batch_combo.configure(state=state)
+            self._batch_open_btn.configure(state=btn_state)
+            self._batch_del_btn.configure(state=btn_state)
+        except Exception:
+            pass  # 构建早期控件未就绪
+
     def _on_batch_select(self, _choice=None):
-        """选择爬取批次。参数是 CTkComboBox 回传的选中值字符串，此处不用。"""
+        """选择爬取批次。参数是 CTkComboBox 回传的选中值字符串，此处不用。
+
+        只在"本地批次"数据源下生效——其余模式下批次下拉是禁用的，
+        这里再加一道守卫，防止程序化 set() 触发误切视图。
+        """
+        if self.data_source_var.get() != "本地批次":
+            return
         selected = self.crawl_batch_var.get()
         if selected == "全部":
             self._load_all_batch_images()
@@ -2077,6 +2129,10 @@ class CrawlerApp:
             self.log("批次汇总视图不支持筛选，请先选择具体批次", "WARNING")
             return
         elif self.data_source_var.get() == "历史数据库":
+            # 历史模式：搜索词下推到 SQL（LIKE 标题/作者/正文/关键词），
+            # 避免只在已加载的前 1000 条里搜漏掉更早的记录；
+            # 载入后下面的内存筛选再叠加类型过滤
+            self._load_history_data()
             source_notes = getattr(self, 'history_notes_data', [])
         else:
             source_notes = self.all_notes_data
@@ -2092,12 +2148,16 @@ class CrawlerApp:
                 if type_filter == "图文" and note_type == "视频":
                     continue
             
-            # 文本搜索
+            # 文本搜索（四列与历史 SQL 的 LIKE 保持一致，
+            # 否则 SQL 按 keyword 列命中的行会被这里滤掉）
             if search_text:
-                title = (note.get('title', '') or '').lower()
-                author = (note.get('author', '') or '').lower()
-                content = (note.get('content', '') or '').lower()
-                if search_text not in title and search_text not in author and search_text not in content:
+                haystack = ' '.join((
+                    note.get('title', '') or '',
+                    note.get('author', '') or '',
+                    note.get('content', '') or '',
+                    note.get('keyword', '') or '',
+                )).lower()
+                if search_text not in haystack:
                     continue
             
             filtered.append(note)
@@ -2767,7 +2827,10 @@ class CrawlerApp:
             messagebox.showinfo("提示", "文件夹不存在")
     
     def _on_data_source_change(self, _choice=None):
-        """切换数据源。参数是 CTkComboBox 回传的选中值字符串，此处不用。"""
+        """切换数据源（三选一：当前爬取 / 历史数据库 / 本地批次）。
+
+        参数是分段控件回传的选中值字符串，此处不用。
+        """
         source = self.data_source_var.get()
 
         # 清空批次相关数据，避免影响其他视图
@@ -2788,9 +2851,19 @@ class CrawlerApp:
         except Exception:
             pass
         self.filtered_notes = []
+        self._update_batch_controls_state()
 
         if source == "历史数据库":
             self._load_history_data()
+        elif source == "本地批次":
+            # 进入批次浏览：重扫文件夹并按当前批次值载入
+            # （默认"全部"→汇总视图，_refresh 可能已恢复上次所选批次）
+            self._refresh_crawl_batches()
+            selected = self.crawl_batch_var.get()
+            if selected == "全部":
+                self._load_all_batch_images()
+            else:
+                self._load_batch_images(self._batch_label_to_folder(selected))
         else:
             self._show_current_data()
     
@@ -4123,10 +4196,10 @@ class CrawlerApp:
             except Exception:
                 pass
 
-        ctk.CTkButton(top, text="✕ 关闭", width=80, height=30, command=_close_card,
-                      fg_color=C['card_alt'], hover_color=C['brand_soft'],
-                      text_color=C['text_sub'], border_width=1, border_color=C['border'],
-                      font=UI_FONT(FS_SMALL)).pack(side=tk.RIGHT, padx=SP_MD, pady=10)
+        ctk.CTkButton(top, text="✕", width=32, height=32, corner_radius=16,
+                      command=_close_card, fg_color=C['card_alt'],
+                      hover_color=C['brand_soft'], text_color=C['text_sub'],
+                      font=UI_FONT(FS_BASE)).pack(side=tk.RIGHT, padx=SP_MD, pady=10)
         # 顶栏与内容之间的分隔线，收住 52px 白条的下缘
         ctk.CTkFrame(win, fg_color=C['border'], height=1).pack(fill=tk.X)
 
@@ -4293,20 +4366,27 @@ class CrawlerApp:
                           "提示", "本地离线数据，仅供浏览", parent=win)).pack(side=tk.RIGHT)
         ctk.CTkFrame(right, fg_color=C['border'], height=1).pack(fill=tk.X, padx=SP_MD)
 
-        # —— 底部：互动栏（点赞/收藏/评论 图标+数字），固定不滚动 ——
-        engage = ctk.CTkFrame(right, fg_color=C['card'], height=52)
+        # —— 底部：互动栏，固定不滚动。小红书式：左"说点什么…"输入框，
+        #    右侧点赞/收藏/评论 图标+数字 ——
+        engage = ctk.CTkFrame(right, fg_color=C['card'], height=58)
         engage.pack(side=tk.BOTTOM, fill=tk.X)
         engage.pack_propagate(False)
         ctk.CTkFrame(right, fg_color=C['border'], height=1).pack(side=tk.BOTTOM, fill=tk.X)
-        eng_inner = ctk.CTkFrame(engage, fg_color="transparent")
-        eng_inner.pack(anchor="center", pady=SP_SM)
+        # 左：灰底胶囊"说点什么…"（离线只读，纯视觉对齐）
+        ctk.CTkLabel(engage, text="说点什么...", font=UI_FONT(FS_SMALL),
+                     text_color=C['text_faint'], fg_color=C['card_alt'],
+                     corner_radius=16, height=34, anchor="w", padx=SP_MD).pack(
+            side=tk.LEFT, fill=tk.X, expand=True, padx=(SP_MD, SP_SM), pady=SP_SM)
+        # 右：点赞/收藏/评论
+        eng_right = ctk.CTkFrame(engage, fg_color="transparent")
+        eng_right.pack(side=tk.RIGHT, padx=(0, SP_MD))
         for icon, num, col in (("♥", likes, C['brand']),
                                ("★", collects, C['warning']),
                                ("💬", n_comments, C['text_sub'])):
-            cell = ctk.CTkFrame(eng_inner, fg_color="transparent")
-            cell.pack(side=tk.LEFT, padx=SP_MD)
+            cell = ctk.CTkFrame(eng_right, fg_color="transparent")
+            cell.pack(side=tk.LEFT, padx=(SP_SM, 0))
             ctk.CTkLabel(cell, text=icon, font=UI_FONT(FS_TITLE),
-                         text_color=col).pack(side=tk.LEFT, padx=(0, 4))
+                         text_color=col).pack(side=tk.LEFT, padx=(0, 3))
             ctk.CTkLabel(cell, text=self._fmt_count(num), font=UI_FONT(FS_SMALL),
                          text_color=C['text_sub']).pack(side=tk.LEFT)
 
@@ -4391,28 +4471,19 @@ class CrawlerApp:
                 col = ctk.CTkFrame(row, fg_color="transparent")
                 col.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(SP_SM, 0))
 
-                head = ctk.CTkFrame(col, fg_color="transparent")
-                head.pack(fill=tk.X)
-                ctk.CTkLabel(head, text=c_author, font=UI_FONT(FS_SMALL),
-                             text_color=C['text_sub'], anchor="w").pack(side=tk.LEFT)
-                if c.get('likes'):
-                    ctk.CTkLabel(head, text=f"❤ {c.get('likes')}",
-                                 font=UI_FONT(FS_SMALL - 1),
-                                 text_color=C['brand']).pack(side=tk.RIGHT)
+                # 昵称（灰、小）
+                ctk.CTkLabel(col, text=c_author, font=UI_FONT(FS_SMALL),
+                             text_color=C['text_sub'], anchor="w").pack(fill=tk.X)
 
+                # 正文（黑）
                 c_body = (c.get('content') or '').strip()
                 if c_body:
                     ctk.CTkLabel(col, text=c_body, font=UI_FONT(FS_SMALL),
                                  text_color=C['text'], anchor="w", justify="left",
-                                 wraplength=max(280, wrap_w - 60)).pack(fill=tk.X)
-
-                meta_bits2 = " · ".join(
-                    str(x) for x in (c.get('time'), c.get('ip')) if x)
-                if meta_bits2:
-                    ctk.CTkLabel(col, text=meta_bits2, font=UI_FONT(FS_SMALL - 1),
-                                 text_color=C['text_faint'], anchor="w").pack(
+                                 wraplength=max(280, wrap_w - 60)).pack(
                         fill=tk.X, pady=(1, 0))
 
+                # 评论配图（圆角）
                 locs = list(c.get('local_images') or [])
                 if locs:
                     img_row = ctk.CTkFrame(col, fg_color="transparent")
@@ -4428,6 +4499,21 @@ class CrawlerApp:
                                      lambda e, p=lp: os.startfile(p) if os.path.isfile(p) else None)
                         except Exception:
                             continue
+
+                # 底部一行：左 时间·地区，右 ♡赞数 + 回复（小红书式）
+                foot = ctk.CTkFrame(col, fg_color="transparent")
+                foot.pack(fill=tk.X, pady=(2, 0))
+                meta_bits2 = "  ".join(
+                    str(x) for x in (c.get('time'), c.get('ip')) if x)
+                if meta_bits2:
+                    ctk.CTkLabel(foot, text=meta_bits2, font=UI_FONT(FS_SMALL - 1),
+                                 text_color=C['text_faint'], anchor="w").pack(side=tk.LEFT)
+                ctk.CTkLabel(foot, text="回复", font=UI_FONT(FS_SMALL - 1),
+                             text_color=C['text_faint']).pack(side=tk.RIGHT)
+                likes_txt = self._fmt_count(c.get('likes', 0)) if c.get('likes') else ""
+                ctk.CTkLabel(foot, text=f"♥ {likes_txt}".strip(),
+                             font=UI_FONT(FS_SMALL - 1),
+                             text_color=C['text_faint']).pack(side=tk.RIGHT, padx=(0, SP_MD))
 
                 if ci < len(comments) - 1:
                     ctk.CTkFrame(scroll, fg_color=C['border'], height=1).pack(
@@ -4849,7 +4935,7 @@ class CrawlerApp:
         row1 = self._row(cookie)
         self.save_cookies_var = tk.BooleanVar(value=True)
         self._check(row1, "登录后自动保存 Cookie", self.save_cookies_var, padx=(0, 26))
-        self.cookie_status_var = tk.StringVar(value="未检测到Cookie")
+        # cookie_status_var 在主页创建（那里也要显示登录状态），此处复用
         ctk.CTkLabel(row1, textvariable=self.cookie_status_var, font=UI_FONT(FS_SMALL),
                      text_color=C['text_sub']).pack(side=tk.LEFT, padx=(0, SP_MD))
         clear_cookie = self._btn(row1, "清除Cookie", self._clear_cookies, width=104)
@@ -5240,7 +5326,13 @@ class CrawlerApp:
     
     def _stop_crawl(self):
         self.should_stop = True
-        self.log("正在停止...", "WARNING")
+        # 立即禁用停止键防连点，并给出反馈——停止是协作式的，最坏要等
+        # 当前笔记的 ~6 秒固定 sleep 走完，没有反馈用户会以为没点上
+        try:
+            self.stop_btn.configure(state="disabled")
+        except Exception:
+            pass
+        self.log("正在停止...（等待当前笔记处理完毕）", "WARNING")
         self._update_ui(status="正在停止...")
         # update_idletasks 只刷新渲染，不重入事件回调（root.update 会）
         self.root.update_idletasks()
@@ -5398,7 +5490,7 @@ class CrawlerApp:
         self.displayed_notes = []
         self.filtered_notes = []
 
-        # 确保数据源是"当前爬取"（同步分段控件外观）
+        # 确保数据源是"当前爬取"（同步分段控件外观与批次控件禁用态）
         self.data_source_var.set("当前爬取")
         try:
             if hasattr(self, "data_source_seg"):
@@ -5406,6 +5498,7 @@ class CrawlerApp:
                 self._paint_seg(self.data_source_seg, "当前爬取")
         except Exception:
             pass
+        self._update_batch_controls_state()
 
         self._set_crawl_buttons(running=True)
 
@@ -5880,6 +5973,17 @@ class CrawlerApp:
             
             self.is_running = False
             self._safe_after(lambda: self._set_crawl_buttons(running=False))
+
+            # 爬完自动切到结果页——仅当用户还停留在主页（tab 0）且本轮
+            # 真的有数据时才切，避免打断正在别的页操作的用户
+            def _jump_to_results():
+                try:
+                    if (self.all_notes_data
+                            and self.notebook.index(self.notebook.select()) == 0):
+                        self.notebook.select(1)
+                except Exception:
+                    pass  # 窗口关闭中 / notebook 已销毁
+            self._safe_after(_jump_to_results)
     
     def _sync_browser_cookies(self, page):
         """将浏览器Cookie同步到下载器"""
