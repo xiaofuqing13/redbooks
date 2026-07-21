@@ -130,7 +130,7 @@ const noteId = urlMatch ? urlMatch[1] : state.note.currentNoteId;
 `primary`(品牌红实心) / `danger` / `secondary`(白底描边)；破坏性操作用 secondary
 再把 `text_color` 设成 `C['danger']`（红字描边，比红色实心克制）。
 
-### 4. CTk 控件的三个 API 陷阱
+### 4. CTk 控件的四个 API 陷阱
 
 - **`.config()` 在 CTk 控件上会直接抛 AttributeError**，CTk 只认 `.configure()`。
   全文已统一为 `.configure()`（对 tk/ttk 是等价别名）。新代码沿用 `.configure()`。
@@ -140,6 +140,10 @@ const noteId = urlMatch ? urlMatch[1] : state.note.currentNoteId;
   一律用 `.configure(values=...)` / `.set(v)` / `.cget('values')`。
 - **`CTkProgressBar` 取 0.0~1.0**，而全部调用方按百分比传入，
   `_apply_ui_update` 负责 `/100` 并钳位。别再写 `total_progress["value"] = x`。
+- **分段控件的文字色不随程序化 `variable.set()` 切换**：`_paint_seg` 把选中段涂成
+  红底白字，而 CTk 在 variable 回调里只重涂底色——旧选中段会滞留白字，unselect 后
+  成"白底白字"隐形段（实测整段视觉消失）。`_seg` 工厂已给变量挂 `trace_add('write')`
+  自动补涂，**新建分段控件必须走 `_seg`，不要裸用 `CTkSegmentedButton`**。
 
 ### 5. 表格与详情面板
 
@@ -213,18 +217,26 @@ images/{关键词|主页推荐}_{YYYYMMDD}_{HHMMSS}/     ← 批次层 (4017 / 4
 
 ---
 
-## GUI 结果页的数据源模型
+## GUI 结果页的数据源模型（v5.4 已理顺为单轴）
 
-结果页由**两个互不协调的下拉框**驱动四种显示模式，全部写入同一个 `result_tree`：
+结果页视图由**数据源三选一分段控件**（当前爬取 / 历史数据库 / 本地批次）唯一驱动，
+批次下拉与"打开目录/删除批次"按钮**只在"本地批次"下可用**（`_update_batch_controls_state`），
+其余模式下禁用。`_on_batch_select` 入口有模式守卫，程序化 `crawl_batch_var.set()`
+不会再误切视图。四种显示形态：
 
-| 模式 | 触发 | 后备列表 | `current_batch_folder` |
-|---|---|---|---|
-| 当前爬取 | `_show_current_data:2725` | `all_notes_data`（内存） | `None` |
-| 历史数据库 | `_load_history_data:2574` | `history_notes_data`（SQLite） | `None` |
-| 批次汇总 | `_load_all_batch_images:2415` | `batch_notes_data` = **文件夹摘要 dict** | `None` |
-| 单批次明细 | `_load_batch_images:2209` | `batch_notes_data` = **笔记 dict** | 绝对路径 |
+| 形态 | 数据源 | 触发 | 后备列表 | `current_batch_folder` |
+|---|---|---|---|---|
+| 当前爬取 | 当前爬取 | `_show_current_data` | `all_notes_data`（内存） | `None` |
+| 历史数据库 | 历史数据库 | `_load_history_data` | `history_notes_data`（SQLite） | `None` |
+| 批次汇总 | 本地批次+批次=全部 | `_load_all_batch_images` | `batch_notes_data` = **文件夹摘要 dict** | `None` |
+| 单批次明细 | 本地批次+具体批次 | `_load_batch_images` | `batch_notes_data` = **笔记 dict** | 绝对路径 |
 
-**真正的判别式是 `current_batch_folder`，不是下拉框。** `_on_result_select:2833` 靠它区分后两种模式。`batch_notes_data` 被刻意复用于两种记录结构 —— 这是全文件最易误读之处。
+**行内判别式仍是 `current_batch_folder`，不是控件值。** `_on_result_select` 靠它区分后两种形态。`batch_notes_data` 被刻意复用于两种记录结构 —— 这是全文件最易误读之处。
+
+**搜索框是单一入口**：`filter_keyword_var` 是 `search_var` 的**别名**（同一 StringVar），
+历史模式下 `_filter_results` 先把搜索词下推到 SQL（`_load_history_data` LIKE 四列）再叠加
+内存类型筛选；内存文本匹配也覆盖同样四列（title/author/content/keyword），两侧口径必须
+保持一致，否则 SQL 命中的行会被内存侧滤掉。**不要再新增第二个搜索输入。**
 
 **行标识按行位置，不按"序号"列**：`_on_result_select` 用 `result_tree.index(item)` 反查
 `displayed_notes`。详见下方"本次新增的关键不变量"——**不要退回 `int(values[0])-1`**。
@@ -249,7 +261,7 @@ images/{关键词|主页推荐}_{YYYYMMDD}_{HHMMSS}/     ← 批次层 (4017 / 4
 | `_get_sorted_note_indices` | 仍是死代码（瀑布流视觉序排序无调用点）。**爬取顺序 = 裸 DOM 顺序 ≠ 视觉顺序**，未改 |
 | `_browse_db_path` | ✅ 已回写 `config.db_path`（经 `_save_gui_settings`），改路径后重启生效 |
 | `save_interval` | 仍是零引用死字段，未清理（避免无谓改动） |
-| 跨运行去重 | `get_existing_note_ids` 仍未被调用；现存数据 `keyword` 列多为空串。未改（属功能增强而非 bug） |
+| 跨运行去重 | ✅ v5.4 已实现。主页"跳过已爬取"开关（`config.skip_existing`，默认关、随设置持久化）→ `_load_preexisting_ids` 载入**全库** note_id（`get_all_note_ids`，不按 keyword 过滤——该列多为空串）→ 标准模式在候选筛选处跳过、极速模式按链接里的 note_id 跳过。跳过不计入连续失败 |
 
 ### 本次新增的关键不变量（务必遵守）
 
