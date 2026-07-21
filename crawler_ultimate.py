@@ -59,6 +59,59 @@ def _enable_dpi_awareness():
     except Exception:
         pass  # 非 Windows 或无相关 API，忽略
 
+# ============================================================
+# 设计令牌 —— 全部 UI 颜色 / 字体 / 间距的单一来源
+# ============================================================
+# ⚠️ 新增界面代码一律从这里取值，不要再往控件上写 '#3b82f6' 这类
+#    颜色字面量或 ('Microsoft YaHei UI', 14) 这类内联字体元组。
+#    本文件历史上散落着近百处内联字体与 hex，换一次主题得全文替换。
+#    配色方向：小红书品牌红为主色，中性灰承载信息，语义色仅用于状态。
+C = {
+    'brand':        '#FF2442',   # 品牌主色：主按钮 / 选中态 / 强调数字
+    'brand_hover':  '#E01834',
+    'brand_soft':   '#FFF0F2',   # 主色的极浅底：选中行、徽标背景
+    'brand_border': '#FFD3DA',
+
+    'danger':       '#E5484D',   # 停止 / 删除
+    'danger_hover': '#C93B40',
+    'success':      '#12864F',   # 成功日志 / 图文标记
+    'warning':      '#B76E00',   # 警告日志 / 依赖缺失提示
+    'info':         '#2563EB',   # 链接类信息
+
+    'bg':           '#F2F3F5',   # 窗口底色（比卡片深一档，卡片才浮得起来）
+    'card':         '#FFFFFF',   # 卡片 / 输入框 / 表格底
+    'card_alt':     '#FAFAFB',   # 斑马纹、只读区底色
+    'border':       '#E4E6EB',   # 常规描边
+    'border_strong':'#D0D3D9',   # 输入框描边（需要更清晰的可点区域暗示）
+
+    'text':         '#1A1A1A',   # 主文字
+    'text_sub':     '#6B7280',   # 次要文字 / 标签
+    'text_faint':   '#9CA3AF',   # 占位提示 / 禁用态
+    'text_on_brand':'#FFFFFF',
+
+    'canvas':       '#F7F7F8',   # 预览画布底
+    'viewer_bg':    '#1A1A1A',   # 图片查看器深色底
+}
+
+FONT_FAMILY = 'Microsoft YaHei UI'
+FONT_MONO = 'Consolas'
+
+# 字号层级：正文 14 为基准，靠 ±1~2 与字重拉开层次，避免全界面一个大小
+FS_METRIC = 26   # 仪表盘大数字
+FS_TITLE = 15    # 卡片标题
+FS_BASE = 14     # 正文、绝大多数控件
+FS_SMALL = 13    # 辅助说明、表格内文字
+FS_MONO = 13     # 日志等宽
+
+
+def UI_FONT(size: int = FS_BASE, bold: bool = False) -> tuple:
+    """构造界面字体元组。取代全文内联的 ('Microsoft YaHei UI', 14)。"""
+    return (FONT_FAMILY, size, 'bold') if bold else (FONT_FAMILY, size)
+
+
+# 间距刻度（像素）：统一节奏，避免各处 pady=2/5/8/10 随手写
+SP_XS, SP_SM, SP_MD, SP_LG = 4, 8, 12, 18
+
 # 导出文件（xlsx/csv）的列名中译映射。
 # ⚠️ 写盘用中文列头，但所有回读代码按英文键取列 —— 回读任何导出文件
 # 前必须先经 normalize_df_columns() 反向归一化，否则统计恒为 0、
@@ -1398,9 +1451,14 @@ class CrawlerApp:
         ttk.Button(preview_nav, text="▶", command=self._next_preview_page, width=3).pack(side=tk.RIGHT, padx=2)
         ttk.Button(preview_nav, text="查看大图", command=self._open_image_viewer, width=8).pack(side=tk.RIGHT, padx=5)
         
-        self.preview_canvas = tk.Canvas(preview_frame, height=280, bg="#f0f0f0")
+        self.preview_canvas = tk.Canvas(preview_frame, height=300, bg="#f0f0f0",
+                                        highlightthickness=0)
         self.preview_canvas.pack(fill=tk.BOTH, expand=True)
         self.preview_canvas.bind("<Double-Button-1>", self._on_preview_double_click)
+        # 画布尺寸变化时按新网格重排（防抖），使缩略图始终铺满可用空间
+        self.preview_canvas.bind("<Configure>", self._on_preview_canvas_resize)
+        self._preview_resize_job = None
+        self._preview_last_grid = (0, 0)
         
         # 存储当前选中的笔记数据
         self.current_selected_note = None
@@ -1409,7 +1467,9 @@ class CrawlerApp:
         self.preview_images = []  # 保持图片引用
         self.current_video_path = None  # 当前预览的视频路径
         self.preview_page = 0  # 预览分页
-        self.preview_page_size = 3  # 每页显示数量（图片放大后减少）
+        # 注：每页数量已改为按画布尺寸自适应（见 _preview_grid），
+        # preview_page_size 不再使用，保留仅为兼容外部引用
+        self.preview_page_size = 3
         self.sort_column = None  # 排序列
         self.sort_reverse = False  # 排序方向
         self.filtered_notes = []  # 筛选后的数据
@@ -1727,17 +1787,73 @@ class CrawlerApp:
             self.preview_page -= 1
             self._render_preview_page()
     
-    def _preview_max_page(self) -> int:
-        """预览总页数：视频缩略图占用第一页的一个槽位，必须计入"""
-        total = len(self.preview_image_paths)
+    # 预览网格布局常量
+    PREVIEW_GAP = 12          # 缩略图间距
+    PREVIEW_PAD = 12          # 画布内边距
+    PREVIEW_TARGET_CELL = 190 # 目标缩略图边长（据此定列数，再回算实际cell撑满宽度）
+
+    def _preview_total_slots(self) -> int:
+        """预览槽位总数：视频缩略图 + 笔记图片 + 评论图片（都参与网格分页）"""
+        n = len(self.preview_image_paths)
         if self.current_video_path:
-            total += 1
-        return max(1, (total + self.preview_page_size - 1) // self.preview_page_size)
+            n += 1
+        n += len(getattr(self, 'preview_comment_images', []))
+        return n
+
+    def _preview_grid(self, canvas_w: int, canvas_h: int):
+        """据画布尺寸算网格：返回 (列数, 行数, 单元宽, 单元高)。
+
+        列数由目标边长定，单元宽回算以铺满整行宽度；行数按可用高度填充。
+        画布尚未完成布局（尺寸≈1）时给出合理兜底，避免除零/挤成一列。
+        """
+        if canvas_w <= 1:
+            canvas_w = 720
+        if canvas_h <= 1:
+            canvas_h = 300
+        gap, pad = self.PREVIEW_GAP, self.PREVIEW_PAD
+        avail_w = max(1, canvas_w - pad * 2)
+        cols = max(1, round((avail_w + gap) / (self.PREVIEW_TARGET_CELL + gap)))
+        cell_w = (avail_w - (cols - 1) * gap) / cols
+        cell_h = cell_w  # 方形单元，缩略图按原比例居中放入
+        avail_h = max(1, canvas_h - pad * 2)
+        rows = max(1, int((avail_h + gap) // (cell_h + gap)))
+        return cols, rows, cell_w, cell_h
+
+    def _preview_items_per_page(self) -> int:
+        cols, rows, _, _ = self._preview_grid(
+            self.preview_canvas.winfo_width(), self.preview_canvas.winfo_height())
+        return max(1, cols * rows)
+
+    def _preview_max_page(self) -> int:
+        """预览总页数（基于自适应网格每页容量）"""
+        total = self._preview_total_slots()
+        ipp = self._preview_items_per_page()
+        return max(1, (total + ipp - 1) // ipp)
 
     def _next_preview_page(self):
         """下一页预览"""
         if self.preview_page < self._preview_max_page() - 1:
             self.preview_page += 1
+            self._render_preview_page()
+
+    def _on_preview_canvas_resize(self, event):
+        """画布尺寸变化 → 防抖后按新网格重排（仅当每页容量真的变了）"""
+        if self._preview_resize_job is not None:
+            try:
+                self.root.after_cancel(self._preview_resize_job)
+            except Exception:
+                pass
+        self._preview_resize_job = self.root.after(120, self._maybe_reflow_preview)
+
+    def _maybe_reflow_preview(self):
+        self._preview_resize_job = None
+        if not self.preview_image_paths and not self.current_video_path \
+                and not getattr(self, 'preview_comment_images', []):
+            return
+        cols, rows, _, _ = self._preview_grid(
+            self.preview_canvas.winfo_width(), self.preview_canvas.winfo_height())
+        if (cols, rows) != self._preview_last_grid:
+            self.preview_page = min(self.preview_page, self._preview_max_page() - 1)
             self._render_preview_page()
     
     # 注：此处原有一个无参版 _open_image_viewer（仅 os.startfile 第一张图），
@@ -2709,121 +2825,100 @@ class CrawlerApp:
         # 使用分页显示
         self._render_preview_page()
     
+    def _build_preview_slots(self):
+        """把视频/笔记图/评论图统一成有序槽位列表，供网格分页与点击命中。
+
+        每个槽位: (kind, path, click_tag)。click_tag 与 _on_preview_click_with_video
+        约定一致：video_thumb / img_{全局索引} / comment_img_{索引}。
+        """
+        slots = []
+        if self.current_video_path:
+            slots.append(('video', self.current_video_path, 'video_thumb'))
+        for i, p in enumerate(self.preview_image_paths):
+            slots.append(('image', p, f'img_{i}'))
+        for i, p in enumerate(getattr(self, 'preview_comment_images', [])):
+            slots.append(('comment', p, f'comment_img_{i}'))
+        return slots
+
     def _render_preview_page(self):
-        """渲染当前预览页"""
+        """渲染当前预览页——自适应网格铺满画布，多行多列显示。"""
         self.preview_canvas.delete("all")
         self.preview_images = []
-        
-        total = len(self.preview_image_paths)
+
+        slots = self._build_preview_slots()
+        total_imgs = len(self.preview_image_paths)
         has_video = self.current_video_path is not None
-        
-        # 计算分页
-        items_per_page = self.preview_page_size
-        if has_video and self.preview_page == 0:
-            items_per_page -= 1  # 第一页留一个位置给视频
-        
-        start = self.preview_page * self.preview_page_size
-        if has_video and self.preview_page == 0:
-            start = 0
-        elif has_video:
-            start = (self.preview_page * self.preview_page_size) - 1
-        
-        end = min(start + items_per_page, total)
-        page_images = self.preview_image_paths[start:end] if total > 0 else []
-        
-        # 获取评论图片数量
         comment_count = len(getattr(self, 'preview_comment_images', []))
 
-        # 更新分页标签
-        if total > 0 or has_video or comment_count > 0:
-            max_page = self._preview_max_page()
-            media_info = f"{total}张图片"
-            if has_video:
-                media_info += " + 视频"
-            if comment_count > 0:
-                media_info += f" + {comment_count}张评论图"
-            self.preview_page_label.config(text=f"第{self.preview_page + 1}/{max_page}页 ({media_info})")
-        else:
+        if not slots:
             self.preview_page_label.config(text="")
-        
+            cw = max(self.preview_canvas.winfo_width(), 200)
+            self.preview_canvas.create_text(cw // 2, 90, text="暂无媒体文件", fill="#888")
+            return
+
+        canvas_w = self.preview_canvas.winfo_width()
+        canvas_h = self.preview_canvas.winfo_height()
+        cols, rows, cell_w, cell_h = self._preview_grid(canvas_w, canvas_h)
+        self._preview_last_grid = (cols, rows)
+        ipp = max(1, cols * rows)
+
+        max_page = max(1, (len(slots) + ipp - 1) // ipp)
+        self.preview_page = max(0, min(self.preview_page, max_page - 1))
+        page_slots = slots[self.preview_page * ipp:(self.preview_page + 1) * ipp]
+
+        # 分页标签
+        media_info = f"{total_imgs}张图片"
+        if has_video:
+            media_info += " + 视频"
+        if comment_count > 0:
+            media_info += f" + {comment_count}张评论图"
+        self.preview_page_label.config(text=f"第{self.preview_page + 1}/{max_page}页 ({media_info})")
+
         try:
             from PIL import Image, ImageTk, ImageDraw
-            x_offset = 10
-            thumb_size = 240  # 放大预览图尺寸
-            
-            # 第一页先显示视频缩略图
-            if has_video and self.preview_page == 0:
+            gap, pad = self.PREVIEW_GAP, self.PREVIEW_PAD
+            cw_i, ch_i = int(cell_w), int(cell_h)
+            inner = max(24, min(cw_i, ch_i) - 8)  # 缩略图最大边长（留边）
+
+            for k, (kind, path, tag) in enumerate(page_slots):
+                r, c = divmod(k, cols)
+                cell_x = pad + c * (cell_w + gap)
+                cell_y = pad + r * (cell_h + gap)
                 try:
-                    video_thumb = Image.new('RGB', (thumb_size, thumb_size), color=(35, 35, 35))
-                    draw = ImageDraw.Draw(video_thumb)
-                    
-                    # 绘制播放按钮
-                    cx, cy = thumb_size // 2, thumb_size // 2 - 10
-                    r = 30
-                    play_points = [(cx - r//2, cy - r), (cx - r//2, cy + r), (cx + r, cy)]
-                    draw.polygon(play_points, fill=(255, 255, 255))
-                    draw.text((thumb_size//2 - 25, thumb_size - 25), "VIDEO", fill=(180, 180, 180))
-                    
-                    photo = ImageTk.PhotoImage(video_thumb)
+                    if kind == 'video':
+                        thumb = Image.new('RGB', (inner, inner), color=(35, 35, 35))
+                        draw = ImageDraw.Draw(thumb)
+                        cx, cy = inner // 2, inner // 2 - 6
+                        rr = max(14, inner // 7)
+                        draw.polygon([(cx - rr//2, cy - rr), (cx - rr//2, cy + rr),
+                                      (cx + rr, cy)], fill=(255, 255, 255))
+                        draw.text((inner//2 - 20, inner - 22), "VIDEO", fill=(180, 180, 180))
+                        photo = ImageTk.PhotoImage(thumb)
+                    else:
+                        img = Image.open(path)
+                        if kind == 'comment':
+                            img.thumbnail((inner - 6, inner - 6))
+                            bordered = Image.new('RGB', (img.width + 6, img.height + 6),
+                                                 color=(33, 150, 243))  # 蓝框标记评论图
+                            bordered.paste(img, (3, 3))
+                            img = bordered
+                        else:
+                            img.thumbnail((inner, inner))
+                        photo = ImageTk.PhotoImage(img)
+
                     self.preview_images.append(photo)
-                    self.preview_canvas.create_image(x_offset, 10, anchor="nw", image=photo, tags="video_thumb")
-                    x_offset += thumb_size + 10
-                except:
-                    pass
-            
-            # 显示笔记图片
-            # tag 记录的是"全局索引"（start+i），点击命中直接读 tag，
-            # 不再做坐标除法（曾因步长写错导致点 A 开 B）
-            for i, img_path in enumerate(page_images):
-                try:
-                    img = Image.open(img_path)
-                    img.thumbnail((thumb_size, thumb_size))
-                    photo = ImageTk.PhotoImage(img)
-                    self.preview_images.append(photo)
-                    self.preview_canvas.create_image(
-                        x_offset, 10, anchor="nw", image=photo,
-                        tags=("preview_item", f"img_{start + i}"))
-                    x_offset += thumb_size + 10
+                    # 缩略图在单元格内居中
+                    px = cell_x + (cell_w - photo.width()) / 2
+                    py = cell_y + (cell_h - photo.height()) / 2
+                    self.preview_canvas.create_image(px, py, anchor="nw", image=photo,
+                                                     tags=("preview_item", tag))
                 except Exception:
                     continue
 
-            # 如果是最后一页且有评论图片，显示评论图片（带蓝色边框标记）
-            comment_images = getattr(self, 'preview_comment_images', [])
-            is_last_page = (self.preview_page >= self._preview_max_page() - 1)
-
-            canvas_w = self.preview_canvas.winfo_width()
-            if canvas_w <= 1:  # 尚未完成布局时的兜底
-                canvas_w = 700
-            if is_last_page and comment_images and x_offset < canvas_w:
-                # 添加分隔线
-                self.preview_canvas.create_line(x_offset + 5, 10, x_offset + 5, thumb_size + 10, fill="#2196F3", width=2)
-                x_offset += 15
-
-                # 显示评论图片（最多显示剩余空间能容纳的数量）
-                remaining_slots = max(0, (canvas_w - x_offset) // (thumb_size + 10))
-                for i, img_path in enumerate(comment_images[:remaining_slots]):
-                    try:
-                        img = Image.open(img_path)
-                        img.thumbnail((thumb_size - 6, thumb_size - 6))
-
-                        # 创建带蓝色边框的图片
-                        bordered = Image.new('RGB', (thumb_size, thumb_size), color=(33, 150, 243))  # 蓝色边框
-                        bordered.paste(img, (3, 3))
-
-                        photo = ImageTk.PhotoImage(bordered)
-                        self.preview_images.append(photo)
-                        self.preview_canvas.create_image(
-                            x_offset, 10, anchor="nw", image=photo,
-                            tags=("preview_item", f"comment_img_{i}"))
-                        x_offset += thumb_size + 10
-                    except Exception:
-                        continue
-            
-            # 绑定点击事件
             self.preview_canvas.bind("<Button-1>", self._on_preview_click_with_video)
-            
             if not self.preview_images:
-                self.preview_canvas.create_text(200, 90, text="媒体加载失败", fill="#888")
+                self.preview_canvas.create_text(canvas_w // 2 if canvas_w > 1 else 200,
+                                                90, text="媒体加载失败", fill="#888")
         except ImportError:
             self.preview_canvas.create_text(200, 90, text="需要安装Pillow: pip install Pillow", fill="#888")
         except Exception as e:
