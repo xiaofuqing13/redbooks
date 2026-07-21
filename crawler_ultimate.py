@@ -49,7 +49,7 @@ import requests
 from DrissionPage import ChromiumPage, ChromiumOptions
 
 # 版本信息
-VERSION = "5.3"
+VERSION = "5.4"
 APP_NAME = f"小红书爬虫终极版 v{VERSION}"
 
 
@@ -115,12 +115,23 @@ C = {
 # 图表配色：与界面同源，生成的 PNG 才像同一个产品出来的
 CHART_COLORS = [C['brand'], '#2D9C8F', '#E8A33D', '#6B7280', '#8B5CF6']
 
+# 评论区头像占位色板 (底色, 字色)：按作者名 hash 取，低饱和不抢正文
+AVATAR_PALETTE = [
+    ('#FFE4E8', '#C2334D'),
+    ('#E7F0FE', '#2563EB'),
+    ('#E6F6EE', '#12864F'),
+    ('#FFF3E0', '#B76E00'),
+    ('#F1EAFE', '#7C3AED'),
+    ('#E8F7F6', '#0E7C6B'),
+]
+
 FONT_FAMILY = 'Microsoft YaHei UI'
 FONT_MONO = 'Consolas'
 
-# 字号层级：正文 14 为基准，靠 ±1~2 与字重拉开层次，避免全界面一个大小
+# 字号层级：正文 14 为基准（适中），靠 ±1~2 与字重拉开层次。
+# 过大在 1080p/笔记本上会挤爆日志区；过小在 4K 上发虚。
 FS_METRIC = 26   # 仪表盘大数字
-FS_TITLE = 15    # 卡片标题
+FS_TITLE = 15    # 卡片标题 / 详情标题
 FS_BASE = 14     # 正文、绝大多数控件
 FS_SMALL = 13    # 辅助说明、表格内文字
 FS_MONO = 13     # 日志等宽
@@ -133,6 +144,16 @@ def UI_FONT(size: int = FS_BASE, bold: bool = False) -> tuple:
 
 # 间距刻度（像素）：统一节奏，避免各处 pady=2/5/8/10 随手写
 SP_XS, SP_SM, SP_MD, SP_LG = 4, 8, 12, 18
+
+# 控件默认尺寸：所有工厂方法与新代码应引用这里
+CTRL_H = 34          # 输入框 / 下拉 / 次要按钮高度
+BTN_H = 36           # 主操作按钮高度
+CTRL_RADIUS = 8      # 输入/按钮圆角
+CARD_RADIUS = 10     # 卡片圆角
+ROW_H = 38           # Treeview 行高（与 FS_SMALL 匹配）
+CHIP_H = 28          # 统计药丸高度
+LABEL_W = 76         # 表单字段标签统一宽度
+LOG_MIN_H = 200      # 运行日志最小高度，防止被上方卡片挤没
 
 # 导出文件（xlsx/csv）的列名中译映射。
 # ⚠️ 写盘用中文列头，但所有回读代码按英文键取列 —— 回读任何导出文件
@@ -245,8 +266,8 @@ class CrawlerConfig:
     # 窗口位置
     window_x: int = -1
     window_y: int = -1
-    window_width: int = 1000
-    window_height: int = 750
+    window_width: int = 1280
+    window_height: int = 820
     
     def save_to_file(self):
         """保存配置到文件"""
@@ -567,37 +588,65 @@ class MediaDownloader:
                 )
     
     def _normalize_url(self, url: str) -> str:
-        """标准化URL"""
+        """标准化URL；视频 CDN 强制 https，去掉尾部无用转义"""
         if not url:
             return ""
-        if url.startswith('//'):
-            return 'https:' + url
-        if not url.startswith('http'):
-            return 'https://' + url
+        url = str(url).strip().replace("\\u002F", "/").replace("\\/", "/")
+        if url.startswith("//"):
+            url = "https:" + url
+        if not url.startswith("http"):
+            url = "https://" + url
+        # 小红书媒体 CDN 用 http 常被拦，统一升 https
+        if url.startswith("http://") and ("xhscdn.com" in url or "xiaohongshu.com" in url):
+            url = "https://" + url[len("http://"):]
         return url
-    
-    def download_file(self, url: str, local_path: str, 
+
+    def download_file(self, url: str, local_path: str,
                       stop_flag: Optional[Callable] = None,
-                      min_size: int = 1024) -> Optional[str]:
-        """下载单个文件"""
+                      min_size: int = 1024,
+                      is_video: bool = False) -> Optional[str]:
+        """下载单个文件。视频加大超时/重试，并带更完整的防盗链头。"""
         url = self._normalize_url(url)
-        if not url:
+        if not url or url.startswith("blob:"):
             return None
-            
-        for attempt in range(self.retry_times):
+
+        retries = max(self.retry_times, 4 if is_video else self.retry_times)
+        timeout = max(self.timeout, 90 if is_video else self.timeout)
+        headers = {
+            "Referer": "https://www.xiaohongshu.com/",
+            "Origin": "https://www.xiaohongshu.com",
+            "User-Agent": random.choice(self.USER_AGENTS),
+            "Accept": "*/*" if is_video else "image/webp,image/apng,image/*,*/*;q=0.8",
+        }
+        if is_video:
+            headers["Accept-Encoding"] = "identity"
+
+        last_err = ""
+        for attempt in range(retries):
             if stop_flag and stop_flag():
                 return None
             try:
-                response = self.session.get(url, timeout=self.timeout, stream=True)
-                response.raise_for_status()
-                
-                # 确保目录存在
-                os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                
-                # 流式写入
+                response = self.session.get(
+                    url, timeout=timeout, stream=True, headers=headers,
+                    allow_redirects=True)
+                # 部分 CDN 对无 Cookie 返回 403/302 登录页
+                if response.status_code >= 400:
+                    last_err = f"HTTP {response.status_code}"
+                    if attempt < retries - 1:
+                        time.sleep(0.4 * (attempt + 1))
+                        continue
+                    break
+
+                ctype = (response.headers.get("Content-Type") or "").lower()
+                # m3u8 播放列表不是完整视频，记失败并换候选 URL
+                if "mpegurl" in ctype or url.endswith(".m3u8"):
+                    last_err = "m3u8 playlist"
+                    break
+
+                os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
                 total_size = 0
-                with open(local_path, 'wb') as f:
-                    for chunk in response.iter_content(chunk_size=16384):
+                with open(local_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=64 * 1024):
                         if stop_flag and stop_flag():
                             f.close()
                             if os.path.exists(local_path):
@@ -606,28 +655,84 @@ class MediaDownloader:
                         if chunk:
                             f.write(chunk)
                             total_size += len(chunk)
-                
-                # 检查文件大小（过小视为失败，计入统计）
-                if total_size < min_size:
-                    os.remove(local_path)
-                    with self._lock:
-                        self._stats['failed'] += 1
-                    return None
+
+                # 过小视为失败（防 HTML 错误页）
+                need = min_size if not is_video else max(min_size, 30 * 1024)
+                if total_size < need:
+                    if os.path.exists(local_path):
+                        os.remove(local_path)
+                    last_err = f"too small {total_size}B"
+                    if attempt < retries - 1:
+                        time.sleep(0.3 * (attempt + 1))
+                        continue
+                    break
+
+                # 视频文件头粗检：非 HTML
+                try:
+                    with open(local_path, "rb") as f:
+                        head = f.read(16)
+                    if head[:1] == b"<" or head[:15].lower().startswith(b"<!doctype"):
+                        os.remove(local_path)
+                        last_err = "got HTML"
+                        continue
+                except Exception:
+                    pass
 
                 with self._lock:
-                    self._stats['success'] += 1
-                    self._stats['bytes'] += total_size
+                    self._stats["success"] += 1
+                    self._stats["bytes"] += total_size
                 return local_path
 
             except requests.Timeout:
-                if attempt < self.retry_times - 1:
-                    time.sleep(0.2 * (attempt + 1))
-            except Exception:
-                if attempt < self.retry_times - 1:
-                    time.sleep(0.1)
+                last_err = "timeout"
+                if attempt < retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+            except Exception as e:
+                last_err = str(e)[:80]
+                if attempt < retries - 1:
+                    time.sleep(0.3 * (attempt + 1))
 
         with self._lock:
-            self._stats['failed'] += 1
+            self._stats["failed"] += 1
+        self._last_error = last_err
+        return None
+
+    def download_video_candidates(self, urls: List[str], local_path: str,
+                                  stop_flag: Optional[Callable] = None) -> Optional[str]:
+        """依次尝试多个视频 URL（不同 CDN / backup），直到成功。"""
+        seen = set()
+        candidates = []
+        for u in urls or []:
+            nu = self._normalize_url(u)
+            if not nu or nu in seen or nu.startswith("blob:"):
+                continue
+            seen.add(nu)
+            candidates.append(nu)
+            # originVideoKey 形态：尝试多 CDN 前缀
+            for host in (
+                "https://sns-video-bd.xhscdn.com/",
+                "https://sns-video-al.xhscdn.com/",
+                "https://sns-video-qc.xhscdn.com/",
+                "https://sns-video-v3.xhscdn.com/",
+            ):
+                if "xhscdn.com/" in nu and "/stream/" in nu:
+                    # 已是完整 stream URL，换 host 再试
+                    try:
+                        path = nu.split("xhscdn.com/", 1)[1]
+                        alt = host + path
+                        if alt not in seen:
+                            seen.add(alt)
+                            candidates.append(alt)
+                    except Exception:
+                        pass
+
+        for u in candidates:
+            if stop_flag and stop_flag():
+                return None
+            result = self.download_file(
+                u, local_path, stop_flag=stop_flag, min_size=30 * 1024, is_video=True)
+            if result:
+                return result
         return None
     
     def download_batch(self, tasks: List[Tuple[str, str]], 
@@ -859,7 +964,7 @@ class CrawlerApp:
         # DPI 缩放因子：DPI 感知后点号字体自动放大，最小尺寸也须同比放大，
         # 否则在 175% 屏上窗口相对字体过小、控件挤成一团
         self.ui_scale = self._detect_ui_scale()
-        self.root.minsize(int(900 * self.ui_scale), int(640 * self.ui_scale))
+        self.root.minsize(int(1000 * self.ui_scale), int(680 * self.ui_scale))
         
         self.config = CrawlerConfig()
         # 加载上次的配置
@@ -922,9 +1027,9 @@ class CrawlerApp:
             sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
         except tk.TclError:
             return 1000, 700, 80, 60
-        min_w, min_h = 880, 620
-        max_w, max_h = int(sw * 0.88), int(sh * 0.86)
-        default_w, default_h = int(sw * 0.82), int(sh * 0.82)
+        min_w, min_h = 1000, 680
+        max_w, max_h = int(sw * 0.90), int(sh * 0.88)
+        default_w, default_h = min(1280, max_w), min(820, max_h)
         # 保存值须在 [min, 屏宽] 内才采用，否则回落到默认
         w = int(w) if (w and min_w <= int(w) <= sw) else default_w
         h = int(h) if (h and min_h <= int(h) <= sh) else default_h
@@ -985,12 +1090,12 @@ class CrawlerApp:
         style.configure("TSeparator", background=C['border'])
 
         # ---- 表格 ----
-        # 行高与字号绑定：38px 是 14pt 中文加行距的舒适值，改字号需同步
+        # 行高与字号绑定：ROW_H 随 FS_SMALL 同步调整
         style.configure("Treeview",
             background=C['card'],
             foreground=C['text'],
             fieldbackground=C['card'],
-            rowheight=38,
+            rowheight=ROW_H,
             borderwidth=0,
             font=UI_FONT(FS_SMALL),
         )
@@ -998,7 +1103,7 @@ class CrawlerApp:
             background=C['card_alt'],
             foreground=C['text_sub'],
             font=UI_FONT(FS_SMALL, bold=True),
-            padding=(10, 10),
+            padding=(12, 12),
             relief="flat",
             borderwidth=0,
         )
@@ -1014,9 +1119,9 @@ class CrawlerApp:
         style.layout("Treeview", [('Treeview.treearea', {'sticky': 'nswe'})])  # 去掉外框
 
         # ---- 标签页 ----
-        style.configure("TNotebook", background=C['bg'], borderwidth=0, tabmargins=(0, 0, 0, 0))
+        style.configure("TNotebook", background=C['bg'], borderwidth=0, tabmargins=(4, 4, 4, 0))
         style.configure("TNotebook.Tab",
-            padding=(26, 13),
+            padding=(32, 16),
             font=UI_FONT(),
             background=C['bg'],
             foreground=C['text_sub'],
@@ -1043,7 +1148,7 @@ class CrawlerApp:
                 arrowcolor=C['text_sub'],
                 insertcolor=C['text'],
                 borderwidth=1,
-                padding=(8, 6),
+                padding=(10, 8),
             )
             style.map(name,
                 bordercolor=[('focus', C['brand']), ('hover', C['border_strong'])],
@@ -1054,7 +1159,7 @@ class CrawlerApp:
                 arrowcolor=[('disabled', C['text_faint'])],
             )
 
-        # ---- 滚动条：细窄浅灰，不抢视线 ----
+        # ---- 滚动条：略加宽便于点击，仍保持浅灰不抢视线 ----
         for orient in ("Vertical.TScrollbar", "Horizontal.TScrollbar"):
             style.configure(orient,
                 background=C['border_strong'],
@@ -1062,7 +1167,7 @@ class CrawlerApp:
                 bordercolor=C['bg'],
                 arrowcolor=C['text_sub'],
                 borderwidth=0,
-                width=12,
+                width=14,
             )
             style.map(orient, background=[('active', C['text_faint'])])
 
@@ -1074,7 +1179,7 @@ class CrawlerApp:
             lightcolor=C['brand'],
             darkcolor=C['brand'],
             borderwidth=0,
-            thickness=10,
+            thickness=12,
         )
 
         # ---- ttk 按钮（仅弹窗等少数 CTk 未覆盖处使用）----
@@ -1087,7 +1192,7 @@ class CrawlerApp:
             darkcolor=C['card'],
             borderwidth=1,
             focusthickness=0,
-            padding=(12, 7),
+            padding=(14, 9),
         )
         style.map("TButton",
             background=[('pressed', C['brand_soft']), ('active', C['card_alt'])],
@@ -1123,7 +1228,7 @@ class CrawlerApp:
                 "fg_color": dual(C['card']),
                 "top_fg_color": dual(C['card']),
                 "border_color": dual(C['border']),
-                "corner_radius": 10,
+                "corner_radius": CARD_RADIUS,
                 "border_width": 0,
             },
             "CTkButton": {
@@ -1132,7 +1237,8 @@ class CrawlerApp:
                 "border_color": dual(C['border_strong']),
                 "text_color": dual(C['text_on_brand']),
                 "text_color_disabled": dual(C['text_faint']),
-                "corner_radius": 8,
+                "corner_radius": CTRL_RADIUS,
+                "height": CTRL_H,
             },
             "CTkLabel": {
                 "fg_color": "transparent",
@@ -1143,8 +1249,9 @@ class CrawlerApp:
                 "border_color": dual(C['border_strong']),
                 "text_color": dual(C['text']),
                 "placeholder_text_color": dual(C['text_faint']),
-                "corner_radius": 8,
+                "corner_radius": CTRL_RADIUS,
                 "border_width": 1,
+                "height": CTRL_H,
             },
             "CTkCheckBox": {
                 "fg_color": dual(C['brand']),
@@ -1167,6 +1274,7 @@ class CrawlerApp:
                 "fg_color": dual(C['border']),
                 "progress_color": dual(C['brand']),
                 "border_color": dual(C['border']),
+                "height": 12,
             },
             "CTkTextbox": {
                 "fg_color": dual(C['card']),
@@ -1174,7 +1282,7 @@ class CrawlerApp:
                 "text_color": dual(C['text']),
                 "scrollbar_button_color": dual(C['border_strong']),
                 "scrollbar_button_hover_color": dual(C['text_faint']),
-                "corner_radius": 8,
+                "corner_radius": CTRL_RADIUS,
             },
             "CTkComboBox": {
                 "fg_color": dual(C['card']),
@@ -1186,8 +1294,9 @@ class CrawlerApp:
                 "button_hover_color": dual(C['brand_soft']),
                 "text_color": dual(C['text']),
                 "text_color_disabled": dual(C['text_faint']),
-                "corner_radius": 8,
+                "corner_radius": CTRL_RADIUS,
                 "border_width": 1,
+                "height": CTRL_H,
                 "dropdown_fg_color": dual(C['card']),
                 "dropdown_hover_color": dual(C['brand_soft']),
                 "dropdown_text_color": dual(C['text']),
@@ -1198,7 +1307,7 @@ class CrawlerApp:
                 "button_hover_color": dual(C['brand_soft']),
                 "text_color": dual(C['text']),
                 "text_color_disabled": dual(C['text_faint']),
-                "corner_radius": 8,
+                "corner_radius": CTRL_RADIUS,
                 "dropdown_fg_color": dual(C['card']),
                 "dropdown_hover_color": dual(C['brand_soft']),
                 "dropdown_text_color": dual(C['text']),
@@ -1207,6 +1316,18 @@ class CrawlerApp:
                 "fg_color": "transparent",
                 "button_color": dual(C['border_strong']),
                 "button_hover_color": dual(C['text_faint']),
+            },
+            "CTkSegmentedButton": {
+                "fg_color": dual(C['bg']),
+                "selected_color": dual(C['brand']),
+                "selected_hover_color": dual(C['brand_hover']),
+                "unselected_color": dual(C['card']),
+                "unselected_hover_color": dual(C['brand_soft']),
+                "text_color": dual(C['text_on_brand']),
+                "text_color_disabled": dual(C['text_faint']),
+                "corner_radius": CTRL_RADIUS,
+                "border_width": 1,
+                "border_color": dual(C['border']),
             },
         }
         for widget, options in merges.items():
@@ -1220,18 +1341,18 @@ class CrawlerApp:
     # ttk.LabelFrame。统一在这里造，各页面才不会各写一套分组样式。
     def _card(self, parent, title=None, expand=False, pady=(0, SP_MD)):
         """创建带标题的卡片，返回可直接放内容的内层容器。"""
-        shell = ctk.CTkFrame(parent, fg_color=C['card'], corner_radius=10,
+        shell = ctk.CTkFrame(parent, fg_color=C['card'], corner_radius=CARD_RADIUS,
                              border_width=1, border_color=C['border'])
         shell.pack(fill=tk.BOTH if expand else tk.X, expand=expand, pady=pady)
 
         if title:
             head = ctk.CTkLabel(shell, text=title, font=UI_FONT(FS_TITLE, bold=True),
                                 text_color=C['text'], anchor="w")
-            head.pack(fill=tk.X, padx=SP_MD + 2, pady=(SP_MD, SP_XS))
+            head.pack(fill=tk.X, padx=SP_MD + 4, pady=(SP_MD + 2, SP_SM))
 
         body = ctk.CTkFrame(shell, fg_color="transparent")
         body.pack(fill=tk.BOTH, expand=True,
-                  padx=SP_MD + 2, pady=(0, SP_MD) if title else SP_MD)
+                  padx=SP_MD + 4, pady=(0, SP_MD + 2) if title else SP_MD + 2)
         return body
 
     def _row(self, parent, pady=0):
@@ -1240,14 +1361,19 @@ class CrawlerApp:
         row.pack(fill=tk.X, pady=pady)
         return row
 
-    def _label(self, parent, text, color=None, bold=False, size=FS_BASE, **pack_kw):
-        """行内文字标签。默认次要灰——界面里大部分标签都是字段名。"""
-        lbl = ctk.CTkLabel(parent, text=text, font=UI_FONT(size, bold=bold),
-                           text_color=color or C['text_sub'], anchor="w")
+    def _label(self, parent, text, color=None, bold=False, size=FS_BASE,
+               width=None, **pack_kw):
+        """行内文字标签。默认次要灰——界面里大部分标签都是字段名。
+        传入 width=LABEL_W 可让表单字段纵向对齐。"""
+        kw = dict(text=text, font=UI_FONT(size, bold=bold),
+                  text_color=color or C['text_sub'], anchor="w")
+        if width is not None:
+            kw["width"] = width
+        lbl = ctk.CTkLabel(parent, **kw)
         lbl.pack(**{'side': tk.LEFT, **pack_kw})
         return lbl
 
-    def _btn(self, parent, text, command, kind="secondary", width=100, **pack_kw):
+    def _btn(self, parent, text, command, kind="secondary", width=120, **pack_kw):
         """统一按钮。kind: primary(品牌红) / danger(红) / secondary(白底描边)。"""
         styles = {
             "primary": dict(fg_color=C['brand'], hover_color=C['brand_hover'],
@@ -1258,12 +1384,57 @@ class CrawlerApp:
                               text_color=C['text'], border_width=1,
                               border_color=C['border_strong']),
         }
-        btn = ctk.CTkButton(parent, text=text, command=command, width=width, height=34,
-                            corner_radius=8, font=UI_FONT(), **styles[kind])
+        h = BTN_H if kind == "primary" else CTRL_H
+        btn = ctk.CTkButton(parent, text=text, command=command, width=width, height=h,
+                            corner_radius=CTRL_RADIUS, font=UI_FONT(), **styles[kind])
         btn.pack(**{'side': tk.LEFT, **pack_kw})
         return btn
 
-    def _combo(self, parent, variable, values, width=140, command=None, **pack_kw):
+    def _paint_seg(self, seg, selected: str):
+        """分段按钮：选中=品牌红底白字，未选中=白底灰字（CTk 默认字色不随选中切换）。"""
+        buttons = getattr(seg, "_buttons_dict", None) or {}
+        for value, btn in buttons.items():
+            if value == selected:
+                btn.configure(fg_color=C['brand'], hover_color=C['brand_hover'],
+                              text_color=C['text_on_brand'])
+            else:
+                btn.configure(fg_color=C['card'], hover_color=C['brand_soft'],
+                              text_color=C['text_sub'])
+
+    def _seg(self, parent, variable, values, command=None, width=None, **pack_kw):
+        """分段选择器（品牌红选中态），用于模式/数据源等互斥选项。"""
+        values = list(values)
+
+        def on_change(val):
+            self._paint_seg(seg, val)
+            if command is not None:
+                command(val)
+
+        seg = ctk.CTkSegmentedButton(
+            parent, values=values, variable=variable, command=on_change,
+            font=UI_FONT(), height=CTRL_H,
+            selected_color=C['brand'], selected_hover_color=C['brand_hover'],
+            unselected_color=C['card'], unselected_hover_color=C['brand_soft'],
+            text_color=C['text_sub'],
+            fg_color=C['border'], corner_radius=CTRL_RADIUS,
+            border_width=0,
+        )
+        if width is not None:
+            seg.configure(width=width)
+        try:
+            cur = variable.get()
+            if cur in values:
+                seg.set(cur)
+            elif values:
+                seg.set(values[0])
+                variable.set(values[0])
+        except Exception:
+            pass
+        self._paint_seg(seg, variable.get())
+        seg.pack(**{'side': tk.LEFT, **pack_kw})
+        return seg
+
+    def _combo(self, parent, variable, values, width=150, command=None, **pack_kw):
         """只读下拉框。
 
         注意回调约定与 ttk 不同：CTk 的 command 直接收到选中值字符串，
@@ -1271,15 +1442,15 @@ class CrawlerApp:
         签名，需接受一个位置参数并忽略它。
         """
         box = ctk.CTkComboBox(parent, variable=variable, values=[str(v) for v in values],
-                              width=width, height=34, font=UI_FONT(),
+                              width=width, height=CTRL_H, font=UI_FONT(),
                               dropdown_font=UI_FONT(), state="readonly", command=command)
         box.pack(**{'side': tk.LEFT, **pack_kw})
         return box
 
-    def _num_entry(self, parent, variable, width=84, **pack_kw):
+    def _num_entry(self, parent, variable, width=88, **pack_kw):
         """数字输入框。取代 ttk.Spinbox——步进箭头在本界面几乎无人点，
         却带来一个无法圆角化、高度也对不齐的方框控件。"""
-        entry = ctk.CTkEntry(parent, textvariable=variable, width=width, height=34,
+        entry = ctk.CTkEntry(parent, textvariable=variable, width=width, height=CTRL_H,
                              font=UI_FONT(), justify="center")
         entry.pack(**{'side': tk.LEFT, **pack_kw})
         return entry
@@ -1287,10 +1458,10 @@ class CrawlerApp:
     def _metric(self, parent, caption, textvariable, color=None):
         """状态指标：小字说明在上、大字数值在下，靠字号差建立层次。"""
         cell = ctk.CTkFrame(parent, fg_color="transparent")
-        cell.pack(side=tk.LEFT, padx=(0, 28))
+        cell.pack(side=tk.LEFT, padx=(0, 32))
         ctk.CTkLabel(cell, text=caption, font=UI_FONT(FS_SMALL),
                      text_color=C['text_sub'], anchor="w").pack(anchor="w")
-        ctk.CTkLabel(cell, textvariable=textvariable, font=UI_FONT(FS_TITLE + 3, bold=True),
+        ctk.CTkLabel(cell, textvariable=textvariable, font=UI_FONT(FS_TITLE + 4, bold=True),
                      text_color=color or C['text'], anchor="w").pack(anchor="w")
         return cell
 
@@ -1301,7 +1472,7 @@ class CrawlerApp:
         这里统一给出，各页构建函数收到的 parent 已经留好边距。
         """
         main_container = ctk.CTkFrame(self.root, fg_color="transparent")
-        main_container.pack(fill=tk.BOTH, expand=True, padx=SP_MD, pady=SP_MD)
+        main_container.pack(fill=tk.BOTH, expand=True, padx=SP_LG, pady=SP_MD)
 
         notebook = ttk.Notebook(main_container)
         notebook.pack(fill=tk.BOTH, expand=True)
@@ -1322,123 +1493,132 @@ class CrawlerApp:
             build(inner)
 
     def _create_main_page(self, parent):
-        """创建主页面。
+        """创建主页面：紧凑单屏布局，无需拖分隔条即可看到配置+状态+日志。
 
-        分组从原先的 5 张零碎 LabelFrame 收敛为 3 张卡片：采集目标、
-        筛选与速度、运行状态。原布局把"爬取模式/搜索配置/筛选/速度"各
-        占一张卡，纵向碎片化，把日志挤到只剩一条缝——现在日志能真正
-        撑满剩余空间。
+        - 上区：采集/筛选/按钮/状态（尽量压扁、按模式隐藏无关行）
+        - 下区：运行日志自动占满剩余高度
         """
-        # ================= 采集目标 =================
-        target = self._card(parent, "采集目标")
+        parent.grid_rowconfigure(1, weight=1, minsize=LOG_MIN_H)
+        parent.grid_columnconfigure(0, weight=1)
+        self._main_paned = None  # 不再用可拖分割条
 
+        top = ctk.CTkFrame(parent, fg_color="transparent")
+        top.grid(row=0, column=0, sticky="ew")
+
+        # ================= 采集目标（紧凑：模式相关行按需显示）=================
+        target = self._card(top, "采集目标", pady=(0, SP_SM))
+
+        self._CRAWL_TYPE_LABELS = ("关键词搜索", "博主主页", "热门榜单")
+        self._CRAWL_TYPE_TO_LABEL = {
+            "keyword": "关键词搜索", "blogger": "博主主页", "hot": "热门榜单"}
+        self._CRAWL_LABEL_TO_TYPE = {v: k for k, v in self._CRAWL_TYPE_TO_LABEL.items()}
         self.crawl_type_var = tk.StringVar(value="keyword")
-        mode_row = self._row(target, pady=(0, SP_MD))
-        for text, value in (("关键词搜索", "keyword"), ("博主主页", "blogger"), ("热门榜单", "hot")):
-            ctk.CTkRadioButton(mode_row, text=text, variable=self.crawl_type_var,
-                               value=value, command=self._on_mode_change,
-                               font=UI_FONT(), radiobutton_width=19, radiobutton_height=19,
-                               border_width_unchecked=2, border_width_checked=6,
-                               ).pack(side=tk.LEFT, padx=(0, 26))
+        self.crawl_type_label_var = tk.StringVar(
+            value=self._CRAWL_TYPE_TO_LABEL[self.crawl_type_var.get()])
 
-        # 三种模式的输入框始终同时可见，靠禁用态提示当前生效项
-        row1 = self._row(target, pady=(0, SP_SM))
-        self._label(row1, "搜索关键词", padx=(0, SP_SM))
+        mode_row = self._row(target, pady=(0, SP_XS))
+        self._label(mode_row, "采集模式", width=LABEL_W, padx=(0, SP_SM))
+        self.crawl_type_seg = self._seg(
+            mode_row, self.crawl_type_label_var, self._CRAWL_TYPE_LABELS,
+            command=self._on_mode_seg_change, width=380)
+
+        # 关键词行
+        self._kw_row = self._row(target, pady=(0, SP_XS))
+        self._label(self._kw_row, "搜索关键词", width=LABEL_W, padx=(0, SP_SM))
         self.keyword_var = tk.StringVar(value="鞋子")
-        self.keyword_entry = ctk.CTkEntry(row1, textvariable=self.keyword_var, width=320,
-                                          height=34, font=UI_FONT(),
-                                          placeholder_text="留空则采集主页推荐")
+        self.keyword_entry = ctk.CTkEntry(
+            self._kw_row, textvariable=self.keyword_var, width=360,
+            height=CTRL_H, font=UI_FONT(), placeholder_text="留空则采集主页推荐")
         self.keyword_entry.pack(side=tk.LEFT, padx=(0, SP_SM))
-        self._label(row1, "多个关键词用逗号分隔", color=C['text_faint'], size=FS_SMALL)
+        self._label(self._kw_row, "多个用逗号分隔", color=C['text_faint'], size=FS_SMALL)
 
-        row1b = self._row(target, pady=(0, SP_SM))
-        self._label(row1b, "博主主页URL", padx=(0, SP_SM))
+        # 博主行（默认隐藏）
+        self._blogger_row = self._row(target, pady=(0, SP_XS))
+        self._label(self._blogger_row, "博主主页URL", width=LABEL_W, padx=(0, SP_SM))
         self.blogger_url_var = tk.StringVar()
-        self.blogger_entry = ctk.CTkEntry(row1b, textvariable=self.blogger_url_var, width=430,
-                                          height=34, font=UI_FONT(),
-                                          placeholder_text="https://www.xiaohongshu.com/user/profile/...")
+        self.blogger_entry = ctk.CTkEntry(
+            self._blogger_row, textvariable=self.blogger_url_var, width=480,
+            height=CTRL_H, font=UI_FONT(),
+            placeholder_text="https://www.xiaohongshu.com/user/profile/...")
         self.blogger_entry.pack(side=tk.LEFT)
-        self.blogger_entry.configure(state=tk.DISABLED)
 
-        row1c = self._row(target, pady=(0, SP_MD))
-        self._label(row1c, "热门分类", padx=(0, SP_SM))
+        # 热门分类行（默认隐藏）
+        self._hot_row = self._row(target, pady=(0, SP_XS))
+        self._label(self._hot_row, "热门分类", width=LABEL_W, padx=(0, SP_SM))
         self.hot_category_var = tk.StringVar(value="综合")
-        self.hot_combo = self._combo(row1c, self.hot_category_var,
-                                     ["综合", "美食", "穿搭", "美妆", "旅行", "家居", "数码"],
-                                     width=130)
-        self.hot_combo.configure(state=tk.DISABLED)
+        self.hot_combo = self._combo(
+            self._hot_row, self.hot_category_var,
+            ["综合", "美食", "穿搭", "美妆", "旅行", "家居", "数码"], width=150)
 
-        row2 = self._row(target)
+        # 数量 + 速度同一行，省垂直空间（始终在模式相关输入之下）
+        self._count_row = self._row(target, pady=(0, 0))
         self.scroll_var = tk.StringVar(value="10")
-        self._label(row2, "最多笔记", padx=(0, SP_SM))
+        self._label(self._count_row, "最多笔记", width=LABEL_W, padx=(0, SP_SM))
         self.max_notes_var = tk.StringVar(value="30")
-        self._num_entry(row2, self.max_notes_var, padx=(0, 28))
-        self._label(row2, "并行下载", padx=(0, SP_SM))
+        self._num_entry(self._count_row, self.max_notes_var, width=80, padx=(0, SP_MD))
+        self._label(self._count_row, "并行", padx=(0, SP_XS))
         self.parallel_var = tk.StringVar(value="10")
-        self._num_entry(row2, self.parallel_var)
+        self._num_entry(self._count_row, self.parallel_var, width=80, padx=(0, SP_LG))
 
-        # ================= 筛选与速度 =================
-        refine = self._card(parent, "筛选与速度")
+        self.crawl_mode_var = tk.StringVar(value="standard")
+        self._CRAWL_MODE_LABELS = ("标准模式（完整数据）", "极速模式（仅列表）")
+        self._CRAWL_MODE_TO_LABEL = {
+            "standard": "标准模式（完整数据）", "turbo": "极速模式（仅列表）"}
+        self._CRAWL_LABEL_TO_MODE = {v: k for k, v in self._CRAWL_MODE_TO_LABEL.items()}
+        self.crawl_mode_label_var = tk.StringVar(
+            value=self._CRAWL_MODE_TO_LABEL[self.crawl_mode_var.get()])
+        self._label(self._count_row, "速度", padx=(0, SP_SM))
+        self.crawl_mode_seg = self._seg(
+            self._count_row, self.crawl_mode_label_var, self._CRAWL_MODE_LABELS,
+            command=self._on_speed_seg_change, width=340)
 
-        filter_row = self._row(refine, pady=(0, SP_MD))
-        self._label(filter_row, "点赞", padx=(0, SP_SM))
+        # ================= 筛选 + 操作同一卡片 =================
+        refine = self._card(top, "筛选与操作", pady=(0, SP_SM))
+
+        filter_row = self._row(refine, pady=(0, SP_XS))
+        self._label(filter_row, "点赞", width=LABEL_W, padx=(0, SP_SM))
         self.min_likes_var = tk.StringVar(value="0")
-        ctk.CTkEntry(filter_row, textvariable=self.min_likes_var, width=90, height=34,
+        ctk.CTkEntry(filter_row, textvariable=self.min_likes_var, width=90, height=CTRL_H,
                      font=UI_FONT()).pack(side=tk.LEFT, padx=(0, SP_XS))
         self._label(filter_row, "~", padx=(0, SP_XS))
         self.max_likes_var = tk.StringVar(value="999999")
-        ctk.CTkEntry(filter_row, textvariable=self.max_likes_var, width=110, height=34,
-                     font=UI_FONT()).pack(side=tk.LEFT, padx=(0, 24))
+        ctk.CTkEntry(filter_row, textvariable=self.max_likes_var, width=100, height=CTRL_H,
+                     font=UI_FONT()).pack(side=tk.LEFT, padx=(0, SP_MD))
 
-        self._label(filter_row, "类型", padx=(0, SP_SM))
+        self._label(filter_row, "类型", padx=(0, SP_XS))
         self.note_type_var = tk.StringVar(value="全部")
         self._combo(filter_row, self.note_type_var, ["全部", "图文", "视频"],
-                    width=110, padx=(0, 24))
+                    width=100, padx=(0, SP_MD))
 
-        self._label(filter_row, "时间", padx=(0, SP_SM))
+        self._label(filter_row, "时间", padx=(0, SP_XS))
         self.date_filter_var = tk.StringVar(value="全部")
         self._combo(filter_row, self.date_filter_var, ["全部", "今天", "本周", "本月"],
-                    width=110)
+                    width=100)
 
-        self.crawl_mode_var = tk.StringVar(value="standard")
-        speed_row = self._row(refine)
-        self._label(speed_row, "采集速度", padx=(0, SP_MD))
-        # "快速模式"已移除：引擎中 fast 与 standard 完全等价，属误导性死选项
-        for text, value in (("标准模式（完整数据）", "standard"), ("极速模式（仅列表信息）", "turbo")):
-            ctk.CTkRadioButton(speed_row, text=text, variable=self.crawl_mode_var,
-                               value=value, font=UI_FONT(), radiobutton_width=19,
-                               radiobutton_height=19, border_width_unchecked=2,
-                               border_width_checked=6).pack(side=tk.LEFT, padx=(0, 26))
-
-        # ================= 操作条 =================
-        btn_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        btn_frame.pack(fill=tk.X, pady=(0, SP_MD))
-
-        self.start_btn = ctk.CTkButton(btn_frame, text="开始爬取", command=self._start_crawl,
-                                       width=128, height=38, corner_radius=8,
-                                       font=UI_FONT(bold=True))
+        btn_frame = self._row(refine, pady=(SP_XS, 0))
+        self.start_btn = ctk.CTkButton(
+            btn_frame, text="开始爬取", command=self._start_crawl,
+            width=140, height=BTN_H, corner_radius=CTRL_RADIUS,
+            font=UI_FONT(bold=True))
         self.start_btn.pack(side=tk.LEFT, padx=(0, SP_SM))
-        # 停止按钮平时为描边灰，仅在爬取中才变红——原先禁用态仍是刺眼的
-        # 纯红块，静止界面上比主操作还抢眼
-        self.stop_btn = self._btn(btn_frame, "停止", self._stop_crawl, width=88,
+        self.stop_btn = self._btn(btn_frame, "停止", self._stop_crawl, width=90,
                                   padx=(0, SP_SM))
         self.stop_btn.configure(state="disabled")
-        self._btn(btn_frame, "已保存Cookie", self._use_saved_cookies, width=130)
+        self._btn(btn_frame, "已保存Cookie", self._use_saved_cookies, width=120,
+                  padx=(0, SP_SM))
+        self._btn(btn_frame, "打开数据", self._open_data_dir, width=100, side=tk.RIGHT)
+        self._btn(btn_frame, "打包图片", self._zip_images, width=100, side=tk.RIGHT,
+                  padx=(0, SP_SM))
 
-        self._btn(btn_frame, "打开数据", self._open_data_dir, side=tk.RIGHT)
-        self._btn(btn_frame, "打包图片", self._zip_images, side=tk.RIGHT, padx=(0, SP_SM))
-
-        # ================= 运行状态 =================
-        status_card = self._card(parent, "运行状态")
-
-        prog_row = self._row(status_card, pady=(0, SP_MD))
-        # corner_radius=0：圆角端点在进度为 0 时仍会画出一个色块，
-        # 静止界面上像个突兀的红点
-        self.total_progress = ctk.CTkProgressBar(prog_row, height=8, corner_radius=0)
+        # ================= 运行状态：进度+指标一行 =================
+        status_card = self._card(top, "运行状态", pady=(0, SP_SM))
+        prog_row = self._row(status_card, pady=(0, SP_XS))
+        self.total_progress = ctk.CTkProgressBar(prog_row, height=10, corner_radius=0)
         self.total_progress.set(0)
-        self.total_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, SP_MD))
-        self.progress_label = ctk.CTkLabel(prog_row, text="0%", font=UI_FONT(bold=True),
-                                           text_color=C['brand'], width=52, anchor="e")
+        self.total_progress.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, SP_SM))
+        self.progress_label = ctk.CTkLabel(
+            prog_row, text="0%", font=UI_FONT(bold=True),
+            text_color=C['brand'], width=48, anchor="e")
         self.progress_label.pack(side=tk.LEFT)
 
         stat_row = self._row(status_card)
@@ -1453,155 +1633,184 @@ class CrawlerApp:
         self._metric(stat_row, "视频", self.videos_var)
         self._metric(stat_row, "用时", self.time_var)
 
-        # ================= 运行日志 =================
-        log_body = self._card(parent, "运行日志", expand=True, pady=0)
-        # 无边框：外层卡片已经描过一次，再加就是双层框
-        self.log_text = ctk.CTkTextbox(log_body, height=150, corner_radius=8,
-                                       font=(FONT_MONO, FS_MONO), fg_color=C['card_alt'],
-                                       text_color=C['text'], border_width=0)
-        self.log_text.pack(fill=tk.BOTH, expand=True)
-        # CTkTextbox 支持 tag 着色（委托给内部 tkinter.Text），
-        # 日志级别靠颜色一眼区分
+        # 按当前模式显示/隐藏输入行
+        self._apply_mode_row_visibility()
+
+        # ================= 运行日志（自动占满剩余空间，无需拖拽）=================
+        log_shell = ctk.CTkFrame(
+            parent, fg_color=C['card'], corner_radius=CARD_RADIUS,
+            border_width=1, border_color=C['border'])
+        log_shell.grid(row=1, column=0, sticky="nsew", pady=(0, 0))
+        self._log_shell = log_shell
+
+        log_head = ctk.CTkFrame(log_shell, fg_color="transparent")
+        log_head.pack(fill=tk.X, padx=SP_MD, pady=(SP_SM, SP_XS))
+        ctk.CTkLabel(
+            log_head, text="运行日志", font=UI_FONT(FS_TITLE, bold=True),
+            text_color=C['text'], anchor="w"
+        ).pack(side=tk.LEFT)
+        ctk.CTkLabel(
+            log_head, text="实时输出",
+            font=UI_FONT(FS_SMALL - 1), text_color=C['text_faint']
+        ).pack(side=tk.LEFT, padx=(SP_SM, 0))
+
+        self.log_text = ctk.CTkTextbox(
+            log_shell, height=LOG_MIN_H, corner_radius=CTRL_RADIUS,
+            font=(FONT_MONO, FS_MONO), fg_color=C['card_alt'],
+            text_color=C['text'], border_width=0, wrap="word")
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=SP_MD, pady=(0, SP_SM))
+
+        self._ctk_log_tags = False
+        self._log_inner = None
         try:
-            self.log_text.tag_config("INFO", foreground=C['text'])
-            self.log_text.tag_config("SUCCESS", foreground=C['success'])
-            self.log_text.tag_config("WARNING", foreground=C['warning'])
-            self.log_text.tag_config("ERROR", foreground=C['danger'])
-            self.log_text.tag_config("DEBUG", foreground=C['text_sub'])
+            tb = getattr(self.log_text, "_textbox", None)
+            self._log_inner = tb
+            target = tb or self.log_text
+            for name, color in (
+                ("INFO", C['text']), ("SUCCESS", C['success']),
+                ("WARNING", C['warning']), ("ERROR", C['danger']),
+                ("DEBUG", C['text_sub']),
+            ):
+                target.tag_config(name, foreground=color)
             self._ctk_log_tags = True
         except Exception:
             self._ctk_log_tags = False
-        self.log_text.configure(state="disabled")
+        try:
+            self.log_text.configure(state="disabled")
+        except Exception:
+            pass
 
     def _create_result_page(self, parent):
         """创建爬取结果展示页面。
 
-        工具栏收在一张卡片里分两行：上行是"看哪批数据"（数据源/批次），
-        下行是"在这批里找什么"（搜索/类型）。原先两行按钮平铺、宽度相同，
-        主次不分——现在破坏性操作统一为红字描边，读得出轻重。
+        布局层次：
+        1. 工具栏卡片（数据源分段 + 批次 + 检索）
+        2. 统计药丸条
+        3. 左表格 / 右详情+媒体 分栏
+        详情区全部收进白卡片，避免标题/指标/正文各自悬浮。
         """
         toolbar = self._card(parent, pady=(0, SP_SM))
 
-        # ---- 上行：数据源 / 批次 ----
-        top = self._row(toolbar, pady=(0, SP_SM))
-        self._label(top, "数据源", padx=(0, SP_SM))
+        # ---- 上行：数据源分段 + 批次 + 主操作 ----
+        top = self._row(toolbar, pady=(0, SP_MD))
+        self._label(top, "数据源", width=LABEL_W, padx=(0, SP_SM))
         self.data_source_var = tk.StringVar(value="当前爬取")
-        # CTk 的 command 收到的是选中值字符串，正好落在 handler 的
-        # event 形参位置（两个 handler 都不使用该参数）
-        self.data_source_combo = self._combo(top, self.data_source_var,
-                                             ["当前爬取", "历史数据库"], width=140,
-                                             command=self._on_data_source_change,
-                                             padx=(0, SP_LG))
+        # 分段控件 command 收到选中值字符串（与旧 combo 约定一致）
+        self.data_source_seg = self._seg(
+            top, self.data_source_var, ["当前爬取", "历史数据库"],
+            command=self._on_data_source_change, width=280, padx=(0, SP_LG))
+        # 兼容旧代码里对 data_source_combo 的引用（若有）
+        self.data_source_combo = self.data_source_seg
 
         self._label(top, "爬取批次", padx=(0, SP_SM))
         self.crawl_batch_var = tk.StringVar(value="全部")
-        self.crawl_batch_combo = self._combo(top, self.crawl_batch_var, ["全部"], width=300,
+        self.crawl_batch_combo = self._combo(top, self.crawl_batch_var, ["全部"], width=280,
                                              command=self._on_batch_select, padx=(0, SP_SM))
-        self._btn(top, "刷新批次", self._refresh_crawl_batches, width=88, padx=(0, SP_XS))
-        self._btn(top, "打开目录", self._open_batch_folder, width=88, padx=(0, SP_XS))
-        del_batch = self._btn(top, "删除批次", self._delete_batch_folder, width=88)
+        self._btn(top, "刷新批次", self._refresh_crawl_batches, width=110, padx=(0, SP_XS))
+        self._btn(top, "打开目录", self._open_batch_folder, width=110, padx=(0, SP_XS))
+        del_batch = self._btn(top, "删除批次", self._delete_batch_folder, width=110)
         del_batch.configure(text_color=C['danger'])
 
-        # 读取类操作靠右，与左侧"选哪批数据"分开
-        self._btn(top, "导出Excel", self._export_results, width=96, side=tk.RIGHT)
-        self._btn(top, "复制全部", self._copy_all_data, width=88, side=tk.RIGHT, padx=(0, SP_XS))
-        self._btn(top, "刷新", self._refresh_results, width=64, side=tk.RIGHT, padx=(0, SP_XS))
+        # 主操作靠右：导出用 primary，其余 secondary
+        self._btn(top, "导出Excel", self._export_results, kind="primary",
+                  width=120, side=tk.RIGHT)
+        self._btn(top, "复制全部", self._copy_all_data, width=110, side=tk.RIGHT, padx=(0, SP_XS))
+        self._btn(top, "刷新", self._refresh_results, width=90, side=tk.RIGHT, padx=(0, SP_XS))
 
         # ---- 下行：本批内的检索 ----
         bottom = self._row(toolbar)
-        self._label(bottom, "搜索", padx=(0, SP_SM))
+        self._label(bottom, "搜索", width=LABEL_W, padx=(0, SP_SM))
         self.search_var = tk.StringVar()
-        self.search_entry = ctk.CTkEntry(bottom, textvariable=self.search_var, width=200,
-                                         height=34, font=UI_FONT(),
+        self.search_entry = ctk.CTkEntry(bottom, textvariable=self.search_var, width=260,
+                                         height=CTRL_H, font=UI_FONT(),
                                          placeholder_text="标题 / 作者 / 正文")
         self.search_entry.pack(side=tk.LEFT, padx=(0, SP_SM))
         self.search_entry.bind("<Return>", lambda e: self._filter_results())
-        self._btn(bottom, "筛选", self._filter_results, width=64, padx=(0, SP_XS))
-        self._btn(bottom, "重置", self._reset_filter, width=64, padx=(0, SP_LG))
+        self._btn(bottom, "筛选", self._filter_results, width=90, padx=(0, SP_XS))
+        self._btn(bottom, "重置", self._reset_filter, width=90, padx=(0, SP_LG))
 
         self._label(bottom, "类型", padx=(0, SP_SM))
         self.type_filter_var = tk.StringVar(value="全部")
-        self._combo(bottom, self.type_filter_var, ["全部", "图文", "视频"], width=110,
+        self._combo(bottom, self.type_filter_var, ["全部", "图文", "视频"], width=120,
                     command=lambda _v: self._filter_results(), padx=(0, SP_LG))
 
         self._label(bottom, "关键词", padx=(0, SP_SM))
         self.filter_keyword_var = tk.StringVar()
         self.filter_keyword_entry = ctk.CTkEntry(bottom, textvariable=self.filter_keyword_var,
-                                                 width=150, height=34, font=UI_FONT(),
+                                                 width=180, height=CTRL_H, font=UI_FONT(),
                                                  placeholder_text="限定关键词")
         self.filter_keyword_entry.pack(side=tk.LEFT)
 
-        # 破坏性操作单独靠右，红字描边与其余按钮区分
-        clear_btn = self._btn(bottom, "清空当前", self._clear_results, width=96, side=tk.RIGHT)
+        clear_btn = self._btn(bottom, "清空当前", self._clear_results, width=120, side=tk.RIGHT)
         clear_btn.configure(text_color=C['danger'])
-        del_btn = self._btn(bottom, "删除选中", self._delete_selected, width=96,
+        del_btn = self._btn(bottom, "删除选中", self._delete_selected, width=120,
                             side=tk.RIGHT, padx=(0, SP_XS))
         del_btn.configure(text_color=C['danger'])
 
-        # 初始化批次列表
         self._refresh_crawl_batches()
 
-        # === 统计条：药丸标签，比原先一行彩色文字更有分量 ===
-        stats_frame = ctk.CTkFrame(parent, fg_color="transparent")
-        stats_frame.pack(fill=tk.X, pady=(0, SP_SM))
+        # === 统计条（卡片底 + 药丸）===
+        stats_card = ctk.CTkFrame(parent, fg_color=C['card'], corner_radius=CARD_RADIUS,
+                                  border_width=1, border_color=C['border'])
+        stats_card.pack(fill=tk.X, pady=(0, SP_SM))
+        stats_frame = ctk.CTkFrame(stats_card, fg_color="transparent")
+        stats_frame.pack(fill=tk.X, padx=SP_MD, pady=SP_SM)
 
-        def chip(text, fg, bg):
-            lbl = ctk.CTkLabel(stats_frame, text=text, font=UI_FONT(FS_SMALL, bold=True),
-                               text_color=fg, fg_color=bg, corner_radius=13,
-                               height=28, padx=14)
+        def chip(text, fg, bg, bordered=False):
+            if bordered:
+                shell = ctk.CTkFrame(stats_frame, fg_color=bg, corner_radius=CHIP_H // 2,
+                                     border_width=1, border_color=C['border'], height=CHIP_H)
+                shell.pack(side=tk.LEFT, padx=(0, SP_SM))
+                lbl = ctk.CTkLabel(shell, text=text, font=UI_FONT(FS_BASE, bold=True),
+                                   text_color=fg, fg_color="transparent",
+                                   height=CHIP_H - 2, padx=18)
+                lbl.pack(padx=1, pady=1)
+                return lbl
+            lbl = ctk.CTkLabel(stats_frame, text=text, font=UI_FONT(FS_BASE, bold=True),
+                               text_color=fg, fg_color=bg, corner_radius=CHIP_H // 2,
+                               height=CHIP_H, padx=18)
             lbl.pack(side=tk.LEFT, padx=(0, SP_SM))
             return lbl
 
         self.result_count_label = chip("总计: 0 条", C['brand'], C['brand_soft'])
-        self.stats_image_label = chip("图文: 0", C['text_sub'], C['card'])
-        self.stats_video_label = chip("视频: 0", C['text_sub'], C['card'])
-        self.stats_likes_label = chip("总点赞: 0", C['text_sub'], C['card'])
+        self.stats_image_label = chip("图文: 0", C['text_sub'], C['card_alt'], bordered=True)
+        self.stats_video_label = chip("视频: 0", C['text_sub'], C['card_alt'], bordered=True)
+        self.stats_likes_label = chip("总点赞: 0", C['text_sub'], C['card_alt'], bordered=True)
 
         # === 主区域：左边表格，右边详情 ===
         main_paned = ttk.PanedWindow(parent, orient=tk.HORIZONTAL)
         main_paned.pack(fill=tk.BOTH, expand=True)
-        
-        # 左侧：结果表格
-        left_frame = ctk.CTkFrame(main_paned, fg_color=C['card'], corner_radius=10,
+
+        left_frame = ctk.CTkFrame(main_paned, fg_color=C['card'], corner_radius=CARD_RADIUS,
                                   border_width=1, border_color=C['border'])
         main_paned.add(left_frame, weight=3)
-        
+
         columns = ("序号", "类型", "标题", "作者", "点赞", "收藏", "评论")
         self.result_tree = ttk.Treeview(left_frame, columns=columns, show="headings", height=22)
-        
-        # 行样式：斑马纹 + 克制的类型区分。
-        # 原先按类型把**整行**染成 #FF5722 / #2196F3，标题、作者、三列数字
-        # 全被染色，几十行下来像调色板。现在图文行是正常墨色，只有视频行
-        # 带一点暖褐偏移，扫视仍能分辨，但不再喧宾夺主。
-        # （Treeview 的 tag 只能作用于整行，无法只给"类型"列上色。）
+
+        # 行样式：斑马纹 + 克制的类型区分（tag 只能整行上色，勿再染整行高饱和色）
         self.result_tree.tag_configure('oddrow', background=C['card_alt'])
         self.result_tree.tag_configure('evenrow', background=C['card'])
         self.result_tree.tag_configure('video', foreground=C['row_video'])
         self.result_tree.tag_configure('image', foreground=C['text'])
-        
-        # 表头 - 点击可排序
+
         for col in columns:
             self.result_tree.heading(col, text=col, command=lambda c=col: self._sort_by_column(c))
-        
-        # 列宽：14 号字体下 40px 连表头都显示不全；标题列可伸展，
-        # 数字列右对齐固定宽
-        self.result_tree.column("序号", width=56, minwidth=48, anchor="center", stretch=False)
-        self.result_tree.column("类型", width=64, minwidth=56, anchor="center", stretch=False)
-        self.result_tree.column("标题", width=300, minwidth=180, anchor="w", stretch=True)
-        self.result_tree.column("作者", width=110, minwidth=80, anchor="w", stretch=False)
-        self.result_tree.column("点赞", width=76, minwidth=64, anchor="e", stretch=False)
-        self.result_tree.column("收藏", width=76, minwidth=64, anchor="e", stretch=False)
-        self.result_tree.column("评论", width=76, minwidth=64, anchor="e", stretch=False)
-        
-        # 只需纵向滚动条：标题列 stretch，其余列定宽，横向永远不会溢出
-        # （原先还建了个横向滚动条并接上 xscrollcommand，却从未 pack 出来）
+
+        self.result_tree.column("序号", width=72, minwidth=56, anchor="center", stretch=False)
+        self.result_tree.column("类型", width=80, minwidth=64, anchor="center", stretch=False)
+        self.result_tree.column("标题", width=400, minwidth=220, anchor="w", stretch=True)
+        self.result_tree.column("作者", width=140, minwidth=100, anchor="w", stretch=False)
+        self.result_tree.column("点赞", width=96, minwidth=80, anchor="e", stretch=False)
+        self.result_tree.column("收藏", width=96, minwidth=80, anchor="e", stretch=False)
+        self.result_tree.column("评论", width=96, minwidth=80, anchor="e", stretch=False)
+
         scrollbar_y = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.result_tree.yview)
         self.result_tree.configure(yscrollcommand=scrollbar_y.set)
 
-        self.result_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(SP_XS, 0), pady=SP_XS)
-        scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y, pady=SP_XS)
-        
-        # 右键菜单
+        self.result_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(SP_SM, 0), pady=SP_SM)
+        scrollbar_y.pack(side=tk.RIGHT, fill=tk.Y, pady=SP_SM)
+
         self.tree_context_menu = tk.Menu(self.result_tree, tearoff=0)
         self.tree_context_menu.add_command(label="复制标题", command=self._copy_title)
         self.tree_context_menu.add_command(label="复制作者", command=self._copy_author)
@@ -1612,58 +1821,105 @@ class CrawlerApp:
         self.tree_context_menu.add_separator()
         self.tree_context_menu.add_command(label="删除此条", command=self._delete_single_note)
         self.result_tree.bind("<Button-3>", self._show_tree_context_menu)
-        
-        # 右侧：详情面板
+
+        # 右侧：小红书式详情 —— 上媒体 / 下标题互动与正文评论
         right_frame = ctk.CTkFrame(main_paned, fg_color="transparent")
         main_paned.add(right_frame, weight=2)
 
-        # 详情顶部：标题 + 快捷操作
-        detail_header = ctk.CTkFrame(right_frame, fg_color="transparent")
-        detail_header.pack(fill=tk.X, padx=SP_SM, pady=(0, SP_SM))
+        # ---- 媒体区（置顶，仿笔记大图）----
+        preview_shell = ctk.CTkFrame(right_frame, fg_color=C['card'], corner_radius=CARD_RADIUS,
+                                     border_width=1, border_color=C['border'])
+        preview_shell.pack(fill=tk.BOTH, expand=True, padx=(SP_SM, 0), pady=(0, SP_SM))
+        preview_frame = ctk.CTkFrame(preview_shell, fg_color="transparent")
+        preview_frame.pack(fill=tk.BOTH, expand=True, padx=SP_SM, pady=SP_SM)
+
+        preview_nav = ctk.CTkFrame(preview_frame, fg_color="transparent")
+        preview_nav.pack(fill=tk.X, pady=(0, SP_XS))
+
+        ctk.CTkLabel(preview_nav, text="笔记媒体", font=UI_FONT(FS_SMALL, bold=True),
+                     text_color=C['text']).pack(side=tk.LEFT, padx=(0, SP_SM))
+        self.preview_page_label = ctk.CTkLabel(preview_nav, text="", font=UI_FONT(FS_SMALL),
+                                               text_color=C['text_sub'])
+        self.preview_page_label.pack(side=tk.LEFT)
+
+        for icon, cmd in (("▶", self._next_preview_page), ("◀", self._prev_preview_page)):
+            ctk.CTkButton(preview_nav, text=icon, command=cmd, width=32, height=28,
+                          corner_radius=CTRL_RADIUS, fg_color=C['card_alt'],
+                          hover_color=C['brand_soft'], text_color=C['text_sub'],
+                          border_width=1, border_color=C['border'],
+                          font=UI_FONT(FS_SMALL)).pack(side=tk.RIGHT, padx=2)
+        self._btn(preview_nav, "查看大图", self._view_current_media, width=88,
+                  side=tk.RIGHT, padx=(0, SP_XS))
+
+        # 评论图说明（有评论图时更新文案）
+        self.preview_hint_label = ctk.CTkLabel(
+            preview_frame,
+            text="点击表格行打开详情卡片 · 评论图在卡片内原样展示",
+            font=UI_FONT(FS_SMALL - 1), text_color=C['text_faint'], anchor="w")
+        self.preview_hint_label.pack(fill=tk.X, pady=(0, SP_XS))
+
+        self.preview_canvas = tk.Canvas(preview_frame, height=280, bg=C['canvas'],
+                                        highlightthickness=0)
+        self.preview_canvas.pack(fill=tk.BOTH, expand=True)
+
+        # ---- 信息区：标题 / 互动 / 正文评论 ----
+        detail_card = ctk.CTkFrame(right_frame, fg_color=C['card'], corner_radius=CARD_RADIUS,
+                                   border_width=1, border_color=C['border'])
+        detail_card.pack(fill=tk.BOTH, expand=True, padx=(SP_SM, 0))
+        detail_inner = ctk.CTkFrame(detail_card, fg_color="transparent")
+        detail_inner.pack(fill=tk.BOTH, expand=True, padx=SP_MD, pady=SP_SM)
+
+        detail_header = ctk.CTkFrame(detail_inner, fg_color="transparent")
+        detail_header.pack(fill=tk.X, pady=(0, SP_XS))
 
         self.detail_title_label = ctk.CTkLabel(detail_header, text="选择笔记查看详情",
                                                font=UI_FONT(FS_TITLE, bold=True),
                                                text_color=C['text'], anchor="w",
-                                               wraplength=360, justify="left")
+                                               wraplength=420, justify="left")
         self.detail_title_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        # 图标按钮：正方形、无边框，悬停才浮出底色
         btn_frame = ctk.CTkFrame(detail_header, fg_color="transparent")
         btn_frame.pack(side=tk.RIGHT)
+        self._btn(btn_frame, "详情卡片", self._open_current_note_card, width=88,
+                  kind="primary", padx=(0, SP_XS))
         for icon, cmd, tip in (("📂", self._open_images_folder, "打开文件夹"),
                                ("▶", self._play_video, "播放视频"),
                                ("🔗", self._open_note_link, "打开原文"),
                                ("📋", self._copy_note_content, "复制正文")):
-            ctk.CTkButton(btn_frame, text=icon, command=cmd, width=36, height=32,
-                          corner_radius=8, fg_color="transparent",
+            ctk.CTkButton(btn_frame, text=icon, command=cmd, width=34, height=30,
+                          corner_radius=CTRL_RADIUS, fg_color=C['card_alt'],
                           hover_color=C['brand_soft'], text_color=C['text_sub'],
-                          font=UI_FONT()).pack(side=tk.LEFT, padx=2)
+                          border_width=1, border_color=C['border'],
+                          font=UI_FONT(FS_SMALL)).pack(side=tk.LEFT, padx=2)
 
-        # 互动数据：图标 + 数值，颜色只标记指标本身，不铺满整行
-        info_cards = ctk.CTkFrame(right_frame, fg_color="transparent")
-        info_cards.pack(fill=tk.X, padx=SP_SM, pady=(0, SP_SM))
+        # 作者 + 互动（仿小红书详情顶栏）
+        info_cards = ctk.CTkFrame(detail_inner, fg_color="transparent")
+        info_cards.pack(fill=tk.X, pady=(0, SP_XS))
+
+        self.detail_author = ctk.CTkLabel(info_cards, text="", text_color=C['text'],
+                                          font=UI_FONT(FS_BASE, bold=True), anchor="w")
+        self.detail_author.pack(side=tk.LEFT, padx=(0, SP_MD))
 
         self.detail_likes = ctk.CTkLabel(info_cards, text="❤ 0", text_color=C['brand'],
                                          font=UI_FONT(bold=True))
-        self.detail_likes.pack(side=tk.LEFT, padx=(0, SP_LG))
+        self.detail_likes.pack(side=tk.LEFT, padx=(0, SP_MD))
         self.detail_collects = ctk.CTkLabel(info_cards, text="⭐ 0", text_color=C['warning'],
                                             font=UI_FONT(bold=True))
-        self.detail_collects.pack(side=tk.LEFT, padx=(0, SP_LG))
+        self.detail_collects.pack(side=tk.LEFT, padx=(0, SP_MD))
         self.detail_comments = ctk.CTkLabel(info_cards, text="💬 0", text_color=C['info'],
                                             font=UI_FONT(bold=True))
-        self.detail_comments.pack(side=tk.LEFT, padx=(0, SP_LG))
-        self.detail_author = ctk.CTkLabel(info_cards, text="", text_color=C['text_sub'],
-                                          font=UI_FONT(FS_SMALL))
-        self.detail_author.pack(side=tk.RIGHT)
+        self.detail_comments.pack(side=tk.LEFT)
 
-        # 详情正文：无边框只读文本，靠底色与卡片区分
+        # 正文 + 评论
+        text_shell = ctk.CTkFrame(detail_inner, fg_color=C['card_alt'],
+                                  corner_radius=CTRL_RADIUS, border_width=0)
+        text_shell.pack(fill=tk.BOTH, expand=True)
         self.detail_text = scrolledtext.ScrolledText(
-            right_frame, height=8, state=tk.DISABLED, wrap=tk.WORD,
-            font=UI_FONT(FS_SMALL), bg=C['card'], fg=C['text'],
+            text_shell, height=10, state=tk.DISABLED, wrap=tk.WORD,
+            font=UI_FONT(FS_SMALL), bg=C['card_alt'], fg=C['text'],
             relief="flat", borderwidth=0, padx=SP_SM, pady=SP_SM,
             insertbackground=C['text'], selectbackground=C['brand_soft'],
             selectforeground=C['brand'])
-        # 详情排版靠 tag，不靠 ASCII 分隔线（见 _render_detail）
         self.detail_text.tag_configure('field', foreground=C['text_sub'],
                                        font=UI_FONT(FS_SMALL))
         self.detail_text.tag_configure('value', foreground=C['text'],
@@ -1672,48 +1928,17 @@ class CrawlerApp:
                                        font=UI_FONT(FS_SMALL), spacing1=3, spacing3=3)
         self.detail_text.tag_configure('section', foreground=C['brand'],
                                        font=UI_FONT(FS_SMALL, bold=True),
-                                       spacing1=14, spacing3=6)
+                                       spacing1=12, spacing3=4)
         self.detail_text.tag_configure('meta', foreground=C['text_faint'],
                                        font=UI_FONT(FS_SMALL - 1), spacing1=6)
         self.detail_text.tag_configure('quote', foreground=C['text'],
-                                       font=UI_FONT(FS_SMALL), lmargin1=18,
-                                       lmargin2=18, spacing3=8)
-
-        # ScrolledText 内建的是 tk.Scrollbar（带上下箭头的 Win95 样式），
-        # 压成无边框细条才不至于在一屏现代控件里跳出来
+                                       font=UI_FONT(FS_SMALL), lmargin1=16,
+                                       lmargin2=16, spacing3=6)
         self.detail_text.vbar.configure(
-            bg=C['border_strong'], troughcolor=C['card'],
+            bg=C['border_strong'], troughcolor=C['card_alt'],
             activebackground=C['text_faint'], borderwidth=0,
             highlightthickness=0, width=12, relief="flat", elementborderwidth=0)
-        self.detail_text.pack(fill=tk.BOTH, expand=True, padx=SP_SM, pady=(0, SP_SM))
-
-        # 媒体预览
-        preview_shell = ctk.CTkFrame(right_frame, fg_color=C['card'], corner_radius=10,
-                                     border_width=1, border_color=C['border'])
-        preview_shell.pack(fill=tk.BOTH, expand=True, padx=SP_SM)
-        preview_frame = ctk.CTkFrame(preview_shell, fg_color="transparent")
-        preview_frame.pack(fill=tk.BOTH, expand=True, padx=SP_SM, pady=SP_SM)
-
-        preview_nav = ctk.CTkFrame(preview_frame, fg_color="transparent")
-        preview_nav.pack(fill=tk.X, pady=(0, SP_SM))
-
-        ctk.CTkLabel(preview_nav, text="媒体预览", font=UI_FONT(FS_SMALL, bold=True),
-                     text_color=C['text']).pack(side=tk.LEFT, padx=(0, SP_SM))
-        self.preview_page_label = ctk.CTkLabel(preview_nav, text="", font=UI_FONT(FS_SMALL),
-                                               text_color=C['text_sub'])
-        self.preview_page_label.pack(side=tk.LEFT)
-
-        for icon, cmd in (("▶", self._next_preview_page), ("◀", self._prev_preview_page)):
-            ctk.CTkButton(preview_nav, text=icon, command=cmd, width=34, height=30,
-                          corner_radius=8, fg_color="transparent",
-                          hover_color=C['brand_soft'], text_color=C['text_sub'],
-                          font=UI_FONT()).pack(side=tk.RIGHT, padx=2)
-        self._btn(preview_nav, "查看大图", self._view_current_media, width=96,
-                  side=tk.RIGHT, padx=(0, SP_SM))
-
-        self.preview_canvas = tk.Canvas(preview_frame, height=300, bg=C['canvas'],
-                                        highlightthickness=0)
-        self.preview_canvas.pack(fill=tk.BOTH, expand=True)
+        self.detail_text.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
         # 注意：不要再绑 <Double-Button-1> 开查看器——单击已经打开，
         # 双击会先后触发两次（Button-1 + Double-Button-1）叠出两个窗口
         # 画布尺寸变化时按新网格重排（防抖），使缩略图始终铺满可用空间
@@ -2135,9 +2360,9 @@ class CrawlerApp:
             self._render_preview_page()
     
     # 预览网格布局常量
-    PREVIEW_GAP = 12          # 缩略图间距
-    PREVIEW_PAD = 12          # 画布内边距
-    PREVIEW_TARGET_CELL = 190 # 目标缩略图边长（据此定列数，再回算实际cell撑满宽度）
+    PREVIEW_GAP = 16          # 缩略图间距
+    PREVIEW_PAD = 16          # 画布内边距
+    PREVIEW_TARGET_CELL = 220 # 目标缩略图边长（据此定列数，再回算实际cell撑满宽度）
 
     def _preview_total_slots(self) -> int:
         """预览槽位总数：视频缩略图 + 笔记图片 + 评论图片（都参与网格分页）"""
@@ -2870,11 +3095,13 @@ class CrawlerApp:
                         note_type = note.get('note_type', '图文')
                         
                         # 更新顶部信息
-                        self.detail_title_label.configure(text=title[:40] + ('...' if len(title) > 40 else ''))
+                        self.detail_title_label.configure(
+                            text=title if len(title) <= 60 else title[:60] + '...')
                         self.detail_likes.configure(text=f"❤ {like_count}")
                         self.detail_collects.configure(text=f"⭐ {collect_count}")
                         self.detail_comments.configure(text=f"💬 {comment_count}")
-                        self.detail_author.configure(text=f"@{author}" if author else f"{note.get('image_count', 0)}张图片")
+                        self.detail_author.configure(
+                            text=f"@{author}" if author else f"{note.get('image_count', 0)}张图片")
                         
                         # 构建详情
                         blocks = []
@@ -2908,6 +3135,8 @@ class CrawlerApp:
 
                         # 加载图片预览
                         self._load_batch_note_previews(note)
+                        # 点击即弹出小红书式详情卡片
+                        self._open_note_card(note)
                         return
                 return
             
@@ -2961,14 +3190,16 @@ class CrawlerApp:
                 note = notes[index]
                 self.current_selected_note = note
                 
-                # 更新顶部信息卡片
+                # 更新顶部信息卡片（仿小红书：标题完整、作者突出）
                 title = note.get('title', '') or '无标题'
-                self.detail_title_label.configure(text=title[:40] + ('...' if len(title) > 40 else ''))
+                self.detail_title_label.configure(
+                    text=title if len(title) <= 60 else title[:60] + '...')
                 self.detail_likes.configure(text=f"❤ {note.get('like_count', 0)}")
                 self.detail_collects.configure(text=f"⭐ {note.get('collect_count', 0)}")
                 self.detail_comments.configure(text=f"💬 {note.get('comment_count', 0)}")
-                self.detail_author.configure(text=f"@{note.get('author', '')}")
-                
+                author = note.get('author', '') or ''
+                self.detail_author.configure(text=f"@{author}" if author else "")
+
                 # 构建详情（主要互动数已在上方指标行显示，这里只补充元信息）
                 blocks = [
                     ('kv', ("类型", note.get('note_type', '图文'))),
@@ -2985,36 +3216,45 @@ class CrawlerApp:
                 if isinstance(tags_val, list):
                     tags_val = '、'.join(str(t) for t in tags_val)
                 blocks.append(('kv', ("标签", tags_val)))
-                blocks.append(('kv', ("关键词", note.get('keyword', ''))))
+                if note.get('keyword'):
+                    blocks.append(('kv', ("关键词", note.get('keyword', ''))))
 
                 if note.get('content'):
                     blocks.append(('section', "正文"))
                     blocks.append(('body', note.get('content', '')))
 
                 comments = note.get('comments', [])
+                if isinstance(comments, str):
+                    try:
+                        comments = json.loads(comments) if comments else []
+                    except (ValueError, TypeError):
+                        comments = []
                 if comments:
                     blocks.append(('section', f"热门评论（{len(comments)} 条）"))
-                    for i, c in enumerate(comments[:10], 1):
+                    for i, c in enumerate(comments[:15], 1):
                         if isinstance(c, dict):
-                            author = c.get('author', '') or c.get('user', '') or '匿名'
-                            parts = [f"{i}. @{author}"]
+                            c_author = c.get('author', '') or c.get('user', '') or '匿名'
+                            parts = [f"{i}. @{c_author}"]
                             for extra in (c.get('ip', ''), c.get('time', '')):
                                 if extra:
-                                    parts.append(extra)
+                                    parts.append(str(extra))
                             if c.get('likes', 0):
                                 parts.append(f"❤{c.get('likes')}")
-                            if c.get('has_image'):
-                                parts.append("含图片")
+                            n_imgs = len(c.get('images') or [])
+                            if c.get('has_image') or n_imgs:
+                                parts.append(f"🖼{n_imgs or 1}图（上方蓝框可点）")
                             blocks.append(('meta', "  ·  ".join(parts)))
-                            blocks.append(('quote', c.get('content', '')))
+                            blocks.append(('quote', c.get('content', '') or ''))
                         else:
                             blocks.append(('quote', f"{i}. {c}"))
 
                 self._render_detail(blocks)
-                
-                # 加载图片预览
+
+                # 加载图片/视频/评论图预览
                 self._load_image_previews(note)
-                
+                # 点击即弹出小红书式详情卡片（左图右文+完整评论）
+                self._open_note_card(note)
+
         except Exception as e:
             print(f"选择错误: {e}")
     
@@ -3040,12 +3280,25 @@ class CrawlerApp:
                     self.current_video_path = abs_v
                     break
         
-        # 保存所有图片路径（用于分页和大图查看）
+        # 批次目录下 comments/ 子文件夹中的评论图
+        comment_images = []
+        note_dir = ""
+        if all_images:
+            note_dir = os.path.dirname(all_images[0])
+        elif self.current_video_path:
+            note_dir = os.path.dirname(self.current_video_path)
+        if note_dir:
+            cdir = os.path.join(note_dir, 'comments')
+            if os.path.isdir(cdir):
+                comment_images = [
+                    os.path.abspath(f) for f in glob.glob(os.path.join(cdir, '*.*'))
+                    if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
+                ]
         self.preview_image_paths = all_images
-        self.preview_comment_images = []  # 批次模式无评论图片
-        self.preview_page = 0  # 重置分页
-        
-        if not all_images and not self.current_video_path:
+        self.preview_comment_images = comment_images
+        self.preview_page = 0
+
+        if not all_images and not self.current_video_path and not comment_images:
             self.preview_canvas.create_text(200, 75, text="暂无媒体文件", fill="#888")
             self.preview_page_label.configure(text="")
             return
@@ -3169,76 +3422,101 @@ class CrawlerApp:
                     except:
                         pass
         
-        # 过滤有效路径
-        valid_images = [p for p in local_images if p and os.path.exists(p)]
-        
+        # 过滤有效路径（排除 comments 子目录里的图，评论图单独列）
+        valid_images = []
+        for p in local_images:
+            if not p or not os.path.exists(p):
+                continue
+            # 跳过评论目录里的图，避免和笔记图混在一起
+            parts = os.path.normpath(p).split(os.sep)
+            if 'comments' in parts:
+                continue
+            valid_images.append(p)
+
+        # 笔记媒体目录：local_dir 优先，其次图片/视频所在目录
+        note_dir = ""
+        local_dir = note.get('local_dir', '') or ''
+        if local_dir and os.path.isdir(os.path.abspath(local_dir)):
+            note_dir = os.path.abspath(local_dir)
+        elif valid_images:
+            note_dir = os.path.dirname(os.path.abspath(valid_images[0]))
+
         # 查找视频文件
-        local_video = note.get('local_video', '')
-        
-        # 转换为绝对路径检查
+        local_video = note.get('local_video', '') or ''
         if local_video:
             abs_video = os.path.abspath(local_video)
-            if not os.path.exists(abs_video):
-                local_video = ""
-            else:
-                local_video = abs_video
-        
+            local_video = abs_video if os.path.exists(abs_video) else ""
+
+        if not local_video and note_dir:
+            video_path = os.path.join(note_dir, 'video.mp4')
+            if os.path.exists(video_path):
+                local_video = video_path
+
         if not local_video:
-            # 尝试从图片目录查找视频
-            if valid_images:
-                video_dir = os.path.dirname(os.path.abspath(valid_images[0]))
-                video_path = os.path.join(video_dir, 'video.mp4')
-                if os.path.exists(video_path):
-                    local_video = video_path
-            
-            # 如果还没找到，使用 batch_dir 精确查找
-            if not local_video:
-                batch_dir = note.get('batch_dir', '')
-                idx = None
-                try:
-                    selected = self.result_tree.selection()
-                    if selected:
-                        item = self.result_tree.item(selected[0])
-                        idx = int(item['values'][0])
-                except:
-                    pass
-                
-                # 只使用 batch_dir 精确匹配，不跨批次查找
-                if batch_dir and idx:
-                    abs_batch = os.path.abspath(batch_dir)
-                    pattern = f"{abs_batch}/note_{idx}_*/video.mp4"
-                    videos = glob.glob(pattern)
-                    if videos:
-                        local_video = os.path.abspath(videos[0])
-        
+            batch_dir = note.get('batch_dir', '')
+            idx = None
+            try:
+                selected = self.result_tree.selection()
+                if selected:
+                    item = self.result_tree.item(selected[0])
+                    idx = int(item['values'][0])
+            except Exception:
+                pass
+            if batch_dir and idx:
+                abs_batch = os.path.abspath(batch_dir)
+                videos = glob.glob(f"{abs_batch}/note_{idx}_*/video.mp4")
+                if videos:
+                    local_video = os.path.abspath(videos[0])
+                    if not note_dir:
+                        note_dir = os.path.dirname(local_video)
+
         self.current_video_path = local_video if local_video and os.path.exists(local_video) else None
-        
-        # 查找评论图片（在 comments 子文件夹中）
+
+        # 评论图片：始终从 note_dir/comments 读取（视频笔记也可能有评论图）
         comment_images = []
-        if valid_images:
-            note_dir = os.path.dirname(valid_images[0])
+        if note_dir:
             comments_dir = os.path.join(note_dir, 'comments')
-            if os.path.exists(comments_dir):
-                comment_images = [os.path.abspath(f) for f in glob.glob(f"{comments_dir}/*.*")
-                                  if f.lower().endswith(('.jpg', '.png', '.webp'))]
-        elif batch_dir and idx:
-            abs_batch = os.path.abspath(batch_dir)
-            pattern = f"{abs_batch}/note_{idx}_*/comments/*.*"
-            comment_images = [os.path.abspath(f) for f in glob.glob(pattern)
-                              if f.lower().endswith(('.jpg', '.png', '.webp'))]
-        
-        self.preview_comment_images = comment_images  # 保存评论图片路径
-        
+            if os.path.isdir(comments_dir):
+                comment_images = [
+                    os.path.abspath(f) for f in glob.glob(os.path.join(comments_dir, '*.*'))
+                    if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
+                ]
+        if not comment_images:
+            batch_dir = note.get('batch_dir', '')
+            try:
+                selected = self.result_tree.selection()
+                idx = int(self.result_tree.item(selected[0])['values'][0]) if selected else None
+            except Exception:
+                idx = None
+            if batch_dir and idx:
+                abs_batch = os.path.abspath(batch_dir)
+                comment_images = [
+                    os.path.abspath(f) for f in glob.glob(f"{abs_batch}/note_{idx}_*/comments/*.*")
+                    if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
+                ]
+
+        self.preview_comment_images = comment_images
+
+        try:
+            if hasattr(self, 'preview_hint_label'):
+                if comment_images:
+                    self.preview_hint_label.configure(
+                        text=f"含 {len(comment_images)} 张评论图（蓝框）· 点击可打开")
+                else:
+                    self.preview_hint_label.configure(
+                        text="蓝框 = 评论图片 · 点击缩略图可打开")
+        except Exception:
+            pass
+
         if not valid_images and not self.current_video_path and not comment_images:
+            self.preview_canvas.delete("all")
             self.preview_canvas.create_text(200, 90, text="暂无本地媒体", fill="#888")
             self.preview_page_label.configure(text="")
+            self.preview_image_paths = []
             return
-        
-        # 保存所有图片路径（用于分页）
+
         self.preview_image_paths = valid_images
-        self.preview_page = 0  # 重置分页
-        
-        # 使用分页显示
+        self.preview_page = 0
         self._render_preview_page()
     
     def _build_preview_slots(self):
@@ -3503,8 +3781,8 @@ class CrawlerApp:
         
         # 按钮：深色底上用半透明灰块 + 浅字，白底描边按钮在这里会刺眼
         def dark_btn(text, command, side, padx):
-            ctk.CTkButton(btn_frame, text=text, command=command, width=112, height=36,
-                          corner_radius=8, font=UI_FONT(),
+            ctk.CTkButton(btn_frame, text=text, command=command, width=120, height=CTRL_H,
+                          corner_radius=CTRL_RADIUS, font=UI_FONT(),
                           fg_color=C['viewer_btn'], hover_color=C['viewer_btn_h'],
                           text_color=C['viewer_text']).pack(side=side, padx=padx)
 
@@ -3573,14 +3851,12 @@ class CrawlerApp:
             messagebox.showerror("错误", f"视频文件不存在: {abs_path}")
     
     def _on_result_double_click(self, event):
-        """双击表格行"""
-        # 如果在全部批次视图，双击进入该批次
+        """双击表格行：批次汇总→进入批次；笔记行→打开小红书式详情卡片"""
         batch_notes = getattr(self, 'batch_notes_data', [])
         batch_folder = getattr(self, 'current_batch_folder', None)
-        
+
         if batch_notes and not batch_folder:
-            # 全部批次视图，双击进入。按**行位置**从 displayed_notes 反查，
-            # 与选中/删除一致（不用 values[0]-1，序号列未必等于行位置）
+            # 全部批次视图，双击进入。按**行位置**从 displayed_notes 反查
             selected = self.result_tree.selection()
             if selected:
                 row_pos = self.result_tree.index(selected[0])
@@ -3588,16 +3864,534 @@ class CrawlerApp:
                 if 0 <= row_pos < len(folders):
                     folder = folders[row_pos]
                     folder_name = folder['name']
-                    # 同步下拉框选择（用文件夹名匹配，容忍标签后缀变化）
                     for val in self.crawl_batch_combo.cget('values'):
                         if self._batch_label_to_folder(val) == folder_name:
                             self.crawl_batch_var.set(val)
                             break
                     self._load_batch_images(folder_name)
         else:
-            # 其他视图，打开图片文件夹
-            self._open_images_folder()
-    
+            # 笔记视图：弹出仿小红书详情卡片
+            note = getattr(self, 'current_selected_note', None)
+            if note and not (note.get('folder_path') and 'note_id' not in note and 'title' not in note):
+                self._open_note_card(note)
+            else:
+                self._open_current_note_card()
+
+    def _open_current_note_card(self):
+        """打开当前选中笔记的小红书式详情卡片"""
+        note = getattr(self, 'current_selected_note', None)
+        if not note:
+            messagebox.showinfo("提示", "请先在表格中选择一条笔记")
+            return
+        # 批次汇总行不是笔记
+        if note.get('folder_path') and not note.get('note_id') and not note.get('title') and not note.get('path'):
+            messagebox.showinfo("提示", "请双击进入具体批次后再查看笔记详情")
+            return
+        self._open_note_card(note)
+
+    def _parse_note_comments(self, note) -> list:
+        """把笔记 comments 字段归一化为 list[dict]（兼容 JSON 字符串）"""
+        comments = note.get('comments', []) if note else []
+        if isinstance(comments, str):
+            try:
+                comments = json.loads(comments) if comments.strip() else []
+            except (ValueError, TypeError):
+                comments = []
+        if not isinstance(comments, list):
+            return []
+        out = []
+        for c in comments:
+            if isinstance(c, dict):
+                out.append(dict(c))
+            elif c:
+                out.append({'author': '匿名', 'content': str(c), 'images': [], 'local_images': []})
+        return out
+
+    def _collect_note_media(self, note) -> dict:
+        """收集一条笔记的本地媒体：封面图、视频、评论图、笔记目录。"""
+        import glob
+        images, comment_images = [], []
+        video = None
+        note_dir = ""
+
+        for key in ('local_dir', 'path'):
+            d = note.get(key) or ''
+            if d and os.path.isdir(os.path.abspath(d)):
+                note_dir = os.path.abspath(d)
+                break
+
+        for p in (note.get('local_images') or note.get('images') or []):
+            ap = os.path.abspath(p)
+            if os.path.isfile(ap) and 'comments' not in ap.replace('\\', '/').split('/'):
+                images.append(ap)
+                if not note_dir:
+                    note_dir = os.path.dirname(ap)
+
+        if note_dir:
+            for ext in ('*.jpg', '*.jpeg', '*.png', '*.webp'):
+                for p in glob.glob(os.path.join(note_dir, ext)):
+                    ap = os.path.abspath(p)
+                    if ap not in images:
+                        images.append(ap)
+
+        for cand in (
+            note.get('local_video'),
+            *(note.get('videos') or []),
+            os.path.join(note_dir, 'video.mp4') if note_dir else '',
+        ):
+            if cand and os.path.isfile(os.path.abspath(cand)):
+                video = os.path.abspath(cand)
+                if not note_dir:
+                    note_dir = os.path.dirname(video)
+                break
+
+        cdir = os.path.join(note_dir, 'comments') if note_dir else ''
+        disk_comment_imgs = []
+        if cdir and os.path.isdir(cdir):
+            disk_comment_imgs = sorted(
+                os.path.abspath(f) for f in glob.glob(os.path.join(cdir, '*.*'))
+                if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))
+            )
+            comment_images = list(disk_comment_imgs)
+
+        comments = self._parse_note_comments(note)
+        used = set()
+        for c in comments:
+            locs = []
+            for p in (c.get('local_images') or []):
+                ap = os.path.abspath(p)
+                if os.path.isfile(ap):
+                    locs.append(ap)
+                    used.add(ap)
+            # 历史数据无 local_images：按 has_image 顺序从磁盘评论图里贴 1 张
+            if not locs and (c.get('has_image') or c.get('images')):
+                for p in disk_comment_imgs:
+                    if p not in used:
+                        locs.append(p)
+                        used.add(p)
+                        break
+            c['local_images'] = locs
+            for p in locs:
+                if p not in comment_images:
+                    comment_images.append(p)
+        for p in disk_comment_imgs:
+            if p not in comment_images:
+                comment_images.append(p)
+
+        return {
+            'images': images,
+            'video': video,
+            'comment_images': comment_images,
+            'note_dir': note_dir,
+            'comments': comments,
+        }
+
+    def _open_note_card(self, note: dict):
+        """弹出仿小红书笔记详情卡片：左大图轮播 + 右作者/正文/评论（含评论图）。"""
+        if not note:
+            return
+        try:
+            from PIL import Image, ImageTk
+        except ImportError:
+            messagebox.showerror("错误", "需要 Pillow：pip install Pillow")
+            return
+
+        old = getattr(self, '_note_card_win', None)
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception:
+                pass
+            self._note_card_win = None
+
+        media = self._collect_note_media(note)
+        images = media['images']
+        video = media['video']
+        comments = media['comments']
+        slots = []
+        if video:
+            slots.append(('video', video))
+        for p in images:
+            slots.append(('image', p))
+        if not slots and media['comment_images']:
+            for p in media['comment_images']:
+                slots.append(('image', p))
+
+        title = (note.get('title') or '无标题').strip()
+        author = (note.get('author') or '未知作者').strip()
+        content = (note.get('content') or '').strip()
+        tags_val = note.get('tags', '')
+        if isinstance(tags_val, str) and tags_val.startswith('['):
+            try:
+                tags_val = json.loads(tags_val)
+            except (ValueError, TypeError):
+                pass
+        if isinstance(tags_val, list):
+            tags_val = '  '.join(f'#{t}' for t in tags_val if t)
+        elif tags_val:
+            tags_val = '  '.join(
+                f'#{t.strip()}' for t in str(tags_val).replace('、', ',').split(',') if t.strip())
+        else:
+            tags_val = ''
+
+        likes = note.get('like_count', 0) or 0
+        collects = note.get('collect_count', 0) or 0
+        n_comments = note.get('comment_count', 0) or len(comments)
+        pub = note.get('publish_time') or ''
+        ipr = note.get('ip_region') or ''
+        ntype = note.get('note_type') or '图文'
+
+        sw = self.root.winfo_screenwidth()
+        sh = self.root.winfo_screenheight()
+        win_w = min(1180, int(sw * 0.88))
+        win_h = min(760, int(sh * 0.88))
+        try:
+            mx, my = self.root.winfo_x(), self.root.winfo_y()
+            mw, mh = self.root.winfo_width(), self.root.winfo_height()
+            pos_x = max(0, min(mx + (mw - win_w) // 2, sw - win_w))
+            pos_y = max(0, min(my + (mh - win_h) // 2, sh - win_h))
+        except tk.TclError:
+            pos_x, pos_y = 60, 40
+
+        win = ctk.CTkToplevel(self.root)
+        self._note_card_win = win
+        win.title(f"笔记详情 · {title[:40]}")
+        win.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
+        win.minsize(900, 560)
+        win.configure(fg_color=C['bg'])
+        try:
+            win.transient(self.root)
+            win.grab_set()
+        except Exception:
+            pass
+
+        top = ctk.CTkFrame(win, fg_color=C['card'], corner_radius=0, height=52)
+        top.pack(fill=tk.X)
+        top.pack_propagate(False)
+        # 品牌色竖条作为标题的视觉锚点
+        ctk.CTkFrame(top, fg_color=C['brand'], corner_radius=2,
+                     width=4, height=20).pack(side=tk.LEFT, padx=(SP_MD, SP_SM), pady=16)
+        ctk.CTkLabel(top, text="笔记详情", font=UI_FONT(FS_TITLE, bold=True),
+                     text_color=C['text']).pack(side=tk.LEFT)
+        ctk.CTkLabel(top, text=ntype, font=UI_FONT(FS_SMALL),
+                     text_color=C['brand'], fg_color=C['brand_soft'],
+                     corner_radius=8, padx=10, height=24).pack(side=tk.LEFT, padx=SP_SM)
+
+        def _close_card():
+            try:
+                win.grab_release()
+            except Exception:
+                pass
+            self._note_card_win = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        ctk.CTkButton(top, text="✕ 关闭", width=80, height=30, command=_close_card,
+                      fg_color=C['card_alt'], hover_color=C['brand_soft'],
+                      text_color=C['text_sub'], border_width=1, border_color=C['border'],
+                      font=UI_FONT(FS_SMALL)).pack(side=tk.RIGHT, padx=SP_MD, pady=10)
+        # 顶栏与内容之间的分隔线，收住 52px 白条的下缘
+        ctk.CTkFrame(win, fg_color=C['border'], height=1).pack(fill=tk.X)
+
+        body = ctk.CTkFrame(win, fg_color="transparent")
+        body.pack(fill=tk.BOTH, expand=True, padx=SP_MD, pady=SP_MD)
+        body.grid_columnconfigure(0, weight=5, uniform="card")
+        body.grid_columnconfigure(1, weight=4, uniform="card")
+        body.grid_rowconfigure(0, weight=1)
+
+        # 左：媒体
+        left = ctk.CTkFrame(body, fg_color=C['viewer_bg'], corner_radius=CARD_RADIUS)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, SP_SM))
+        canvas = tk.Canvas(left, bg=C['viewer_bg'], highlightthickness=0)
+        canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 0))
+        nav = ctk.CTkFrame(left, fg_color="transparent", height=44)
+        nav.pack(fill=tk.X, padx=8, pady=(4, 8))
+        # 翻页控件整体居中：‹  页码  ›（此前两个按钮都 side=RIGHT，
+        # 后包的 › 排在 ‹ 左边，方向看起来是反的）
+        nav_inner = ctk.CTkFrame(nav, fg_color="transparent")
+        nav_inner.pack(anchor="center")
+        idx_var = tk.IntVar(value=0)
+        photo_hold = [None]
+        nav_btns = {}
+
+        def _sync_nav(i):
+            """刷新页码文本与按钮禁用态（首页禁‹、末页禁›、单页全禁）"""
+            lbl = nav_btns.get('label')
+            if lbl is not None:
+                if not slots:
+                    lbl.configure(text="0 / 0")
+                else:
+                    kind = slots[i][0]
+                    lbl.configure(text=f"{i + 1} / {len(slots)}"
+                                       + ("  ·  视频" if kind == 'video' else ""))
+            if nav_btns.get('prev') is not None:
+                nav_btns['prev'].configure(
+                    state="normal" if slots and i > 0 else "disabled")
+            if nav_btns.get('next') is not None:
+                nav_btns['next'].configure(
+                    state="normal" if slots and i < len(slots) - 1 else "disabled")
+
+        def show_slot(i=None):
+            if not slots:
+                canvas.delete("all")
+                cw = max(canvas.winfo_width(), 200)
+                ch = max(canvas.winfo_height(), 200)
+                canvas.create_text(cw // 2, ch // 2, text="暂无媒体", fill="#888",
+                                   font=UI_FONT(FS_TITLE))
+                _sync_nav(0)
+                return
+            if i is None:
+                i = idx_var.get()
+            i = max(0, min(i, len(slots) - 1))
+            idx_var.set(i)
+            kind, path = slots[i]
+            _sync_nav(i)
+            canvas.delete("all")
+            cw = canvas.winfo_width() or 480
+            ch = canvas.winfo_height() or 520
+            if cw <= 1:
+                cw = 480
+            if ch <= 1:
+                ch = 520
+            try:
+                if kind == 'video':
+                    cover = images[0] if images else None
+                    if cover and os.path.isfile(cover):
+                        img = Image.open(cover)
+                        img.thumbnail((cw - 8, ch - 8), Image.Resampling.LANCZOS)
+                        photo_hold[0] = ImageTk.PhotoImage(img)
+                        canvas.create_image(cw // 2, ch // 2, image=photo_hold[0])
+                    canvas.create_polygon(
+                        cw//2-12, ch//2-18, cw//2-12, ch//2+18, cw//2+18, ch//2,
+                        fill="white", tags="play")
+                    canvas.create_text(cw//2, ch//2+48, text="点击播放视频",
+                                      fill="#ccc", font=UI_FONT(FS_SMALL), tags="play")
+                else:
+                    img = Image.open(path)
+                    img.thumbnail((cw - 8, ch - 8), Image.Resampling.LANCZOS)
+                    photo_hold[0] = ImageTk.PhotoImage(img)
+                    canvas.create_image(cw // 2, ch // 2, image=photo_hold[0])
+            except Exception as e:
+                canvas.create_text(cw // 2, ch // 2, text=f"加载失败\n{e}",
+                                   fill="#aaa", font=UI_FONT(FS_SMALL))
+
+        def prev_slot():
+            if slots:
+                show_slot(idx_var.get() - 1)
+
+        def next_slot():
+            if slots:
+                show_slot(idx_var.get() + 1)
+
+        def on_canvas_click(_e=None):
+            if not slots:
+                return
+            kind, path = slots[idx_var.get()]
+            if kind == 'video' and path and os.path.isfile(path):
+                try:
+                    os.startfile(path)
+                except OSError as ex:
+                    messagebox.showerror("错误", f"无法播放: {ex}", parent=win)
+
+        canvas.bind("<Button-1>", on_canvas_click)
+        canvas.bind("<Configure>", lambda e: show_slot())
+        # ‹ 页码 › 正序居中；按钮状态由 _sync_nav 维护
+        nav_btns['prev'] = ctk.CTkButton(
+            nav_inner, text="‹", width=38, height=30, corner_radius=15,
+            command=prev_slot, font=UI_FONT(FS_TITLE),
+            fg_color=C['viewer_btn'], hover_color=C['viewer_btn_h'],
+            text_color=C['viewer_text'], text_color_disabled='#5A5A5A')
+        nav_btns['prev'].pack(side=tk.LEFT)
+        nav_btns['label'] = ctk.CTkLabel(nav_inner, text="", width=110,
+                                         font=UI_FONT(FS_SMALL),
+                                         text_color=C['viewer_text'])
+        nav_btns['label'].pack(side=tk.LEFT, padx=SP_SM)
+        nav_btns['next'] = ctk.CTkButton(
+            nav_inner, text="›", width=38, height=30, corner_radius=15,
+            command=next_slot, font=UI_FONT(FS_TITLE),
+            fg_color=C['viewer_btn'], hover_color=C['viewer_btn_h'],
+            text_color=C['viewer_text'], text_color_disabled='#5A5A5A')
+        nav_btns['next'].pack(side=tk.LEFT)
+        # 键盘操作：←/→ 翻页，Esc 关闭
+        win.bind("<Left>", lambda e: prev_slot())
+        win.bind("<Right>", lambda e: next_slot())
+        win.bind("<Escape>", lambda e: _close_card())
+
+        # 右：信息 + 评论
+        right = ctk.CTkFrame(body, fg_color=C['card'], corner_radius=CARD_RADIUS,
+                             border_width=1, border_color=C['border'])
+        right.grid(row=0, column=1, sticky="nsew")
+        scroll = ctk.CTkScrollableFrame(right, fg_color="transparent")
+        scroll.pack(fill=tk.BOTH, expand=True, padx=SP_MD, pady=SP_MD)
+        wrap_w = max(320, win_w // 2 - 80)
+
+        author_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        author_row.pack(fill=tk.X, pady=(0, SP_SM))
+        ctk.CTkLabel(author_row, text=(author[:1] if author else "作"),
+                     width=36, height=36, corner_radius=18,
+                     fg_color=C['brand_soft'], text_color=C['brand'],
+                     font=UI_FONT(bold=True)).pack(side=tk.LEFT, padx=(0, SP_SM))
+        ctk.CTkLabel(author_row, text=f"@{author}", font=UI_FONT(bold=True),
+                     text_color=C['text'], anchor="w").pack(
+            side=tk.LEFT, fill=tk.X, expand=True)
+        meta_bits = " · ".join(x for x in (pub, ipr) if x)
+        if meta_bits:
+            ctk.CTkLabel(author_row, text=meta_bits, font=UI_FONT(FS_SMALL - 1),
+                         text_color=C['text_faint']).pack(side=tk.RIGHT)
+
+        ctk.CTkLabel(scroll, text=title, font=UI_FONT(FS_TITLE, bold=True),
+                     text_color=C['text'], anchor="w", justify="left",
+                     wraplength=wrap_w).pack(fill=tk.X, pady=(0, SP_XS))
+        if content:
+            ctk.CTkLabel(scroll, text=content, font=UI_FONT(FS_SMALL),
+                         text_color=C['text'], anchor="w", justify="left",
+                         wraplength=wrap_w).pack(fill=tk.X, pady=(0, SP_SM))
+        if tags_val:
+            ctk.CTkLabel(scroll, text=tags_val, font=UI_FONT(FS_SMALL),
+                         text_color=C['info'], anchor="w", justify="left",
+                         wraplength=wrap_w).pack(fill=tk.X, pady=(0, SP_SM))
+
+        stats = ctk.CTkFrame(scroll, fg_color=C['card_alt'], corner_radius=CTRL_RADIUS)
+        stats.pack(fill=tk.X, pady=(0, SP_MD))
+        for txt, col in ((f"❤  {likes}", C['brand']),
+                         (f"⭐  {collects}", C['warning']),
+                         (f"💬  {n_comments}", C['info'])):
+            ctk.CTkLabel(stats, text=txt, font=UI_FONT(bold=True),
+                         text_color=col, padx=14, pady=8).pack(side=tk.LEFT)
+
+        act = ctk.CTkFrame(scroll, fg_color="transparent")
+        act.pack(fill=tk.X, pady=(0, SP_MD))
+        ctk.CTkButton(act, text="打开原文", width=90, height=30,
+                      command=self._open_note_link,
+                      font=UI_FONT(FS_SMALL)).pack(side=tk.LEFT, padx=(0, SP_XS))
+        ctk.CTkButton(act, text="打开文件夹", width=100, height=30,
+                      fg_color=C['card_alt'], hover_color=C['brand_soft'],
+                      text_color=C['text'], border_width=1, border_color=C['border'],
+                      command=self._open_images_folder,
+                      font=UI_FONT(FS_SMALL)).pack(side=tk.LEFT, padx=(0, SP_XS))
+        if video:
+            ctk.CTkButton(
+                act, text="播放视频", width=90, height=30,
+                fg_color=C['card_alt'], hover_color=C['brand_soft'],
+                text_color=C['text'], border_width=1, border_color=C['border'],
+                command=lambda p=video: os.startfile(p) if os.path.isfile(p) else None,
+                font=UI_FONT(FS_SMALL)).pack(side=tk.LEFT)
+
+        ctk.CTkLabel(scroll, text=f"共 {len(comments)} 条评论",
+                     font=UI_FONT(FS_BASE, bold=True),
+                     text_color=C['text'], anchor="w").pack(fill=tk.X, pady=(SP_SM, SP_SM))
+        ctk.CTkFrame(scroll, fg_color=C['border'], height=1).pack(fill=tk.X, pady=(0, SP_SM))
+
+        comment_photos = []
+
+        def rounded_thumb(path, max_side=100, radius=10):
+            """圆角缩略图（替代原来生硬的2px蓝色描边）"""
+            from PIL import ImageDraw
+            im = Image.open(path).convert("RGB")
+            im.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+            mask = Image.new("L", im.size, 0)
+            ImageDraw.Draw(mask).rounded_rectangle(
+                (0, 0, im.width - 1, im.height - 1), radius=radius, fill=255)
+            out = Image.new("RGBA", im.size, (0, 0, 0, 0))
+            out.paste(im, (0, 0), mask)
+            return ImageTk.PhotoImage(out)
+
+        def avatar_colors(name: str):
+            return AVATAR_PALETTE[sum(ord(ch) for ch in (name or '匿'))
+                                  % len(AVATAR_PALETTE)]
+
+        if not comments:
+            ctk.CTkLabel(
+                scroll, text="暂无评论数据（爬取时请开启「获取热门评论」并重新爬取）",
+                font=UI_FONT(FS_SMALL), text_color=C['text_faint'],
+                anchor="w").pack(fill=tk.X)
+        else:
+            # 流式评论：彩色圆头像 + 内容列 + 细分隔线。
+            # 原先每条一整块灰底卡片，几十条排下来沉闷且层级混乱
+            for ci, c in enumerate(comments):
+                row = ctk.CTkFrame(scroll, fg_color="transparent")
+                row.pack(fill=tk.X, pady=(0, 2))
+                c_author = c.get('author') or c.get('user') or '匿名'
+                av_bg, av_fg = avatar_colors(c_author)
+                ctk.CTkLabel(row, text=(c_author[:1] or '匿'),
+                             width=32, height=32, corner_radius=16,
+                             fg_color=av_bg, text_color=av_fg,
+                             font=UI_FONT(FS_SMALL, bold=True)).pack(
+                    side=tk.LEFT, anchor="n", pady=(2, 0))
+                col = ctk.CTkFrame(row, fg_color="transparent")
+                col.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(SP_SM, 0))
+
+                head = ctk.CTkFrame(col, fg_color="transparent")
+                head.pack(fill=tk.X)
+                ctk.CTkLabel(head, text=c_author, font=UI_FONT(FS_SMALL),
+                             text_color=C['text_sub'], anchor="w").pack(side=tk.LEFT)
+                if c.get('likes'):
+                    ctk.CTkLabel(head, text=f"❤ {c.get('likes')}",
+                                 font=UI_FONT(FS_SMALL - 1),
+                                 text_color=C['brand']).pack(side=tk.RIGHT)
+
+                c_body = (c.get('content') or '').strip()
+                if c_body:
+                    ctk.CTkLabel(col, text=c_body, font=UI_FONT(FS_SMALL),
+                                 text_color=C['text'], anchor="w", justify="left",
+                                 wraplength=max(280, wrap_w - 60)).pack(fill=tk.X)
+
+                meta_bits2 = " · ".join(
+                    str(x) for x in (c.get('time'), c.get('ip')) if x)
+                if meta_bits2:
+                    ctk.CTkLabel(col, text=meta_bits2, font=UI_FONT(FS_SMALL - 1),
+                                 text_color=C['text_faint'], anchor="w").pack(
+                        fill=tk.X, pady=(1, 0))
+
+                locs = list(c.get('local_images') or [])
+                if locs:
+                    img_row = ctk.CTkFrame(col, fg_color="transparent")
+                    img_row.pack(fill=tk.X, pady=(SP_XS, 0))
+                    for lp in locs[:6]:
+                        try:
+                            ph = rounded_thumb(lp)
+                            comment_photos.append(ph)
+                            lbl = ctk.CTkLabel(img_row, image=ph, text="")
+                            lbl.image = ph
+                            lbl.pack(side=tk.LEFT, padx=(0, SP_XS))
+                            lbl.bind("<Button-1>",
+                                     lambda e, p=lp: os.startfile(p) if os.path.isfile(p) else None)
+                        except Exception:
+                            continue
+
+                if ci < len(comments) - 1:
+                    ctk.CTkFrame(scroll, fg_color=C['border'], height=1).pack(
+                        fill=tk.X, pady=(SP_SM, SP_SM), padx=(40, 0))
+                else:
+                    ctk.CTkFrame(scroll, fg_color="transparent", height=SP_SM).pack(fill=tk.X)
+
+        orphan = [p for p in media['comment_images']
+                  if not any(p in (c.get('local_images') or []) for c in comments)]
+        if orphan:
+            ctk.CTkLabel(scroll, text=f"其它评论配图（{len(orphan)}）",
+                         font=UI_FONT(FS_SMALL, bold=True),
+                         text_color=C['text_sub'], anchor="w").pack(
+                fill=tk.X, pady=(SP_SM, SP_XS))
+            row = ctk.CTkFrame(scroll, fg_color="transparent")
+            row.pack(fill=tk.X)
+            for lp in orphan[:12]:
+                try:
+                    ph = rounded_thumb(lp, max_side=88)
+                    comment_photos.append(ph)
+                    lbl = ctk.CTkLabel(row, image=ph, text="")
+                    lbl.image = ph
+                    lbl.pack(side=tk.LEFT, padx=(0, SP_XS), pady=2)
+                    lbl.bind("<Button-1>",
+                             lambda e, p=lp: os.startfile(p) if os.path.isfile(p) else None)
+                except Exception:
+                    continue
+
+        win._comment_photos = comment_photos
+        win.after(80, show_slot)
+        win.protocol("WM_DELETE_WINDOW", _close_card)
+
     def _open_images_folder(self):
         """打开图片文件夹。
 
@@ -3824,7 +4618,7 @@ class CrawlerApp:
     def _check(self, parent, text, variable, **pack_kw):
         """统一勾选项。"""
         box = ctk.CTkCheckBox(parent, text=text, variable=variable, font=UI_FONT(),
-                              checkbox_width=20, checkbox_height=20)
+                              checkbox_width=22, checkbox_height=22)
         box.pack(**{'side': tk.LEFT, **pack_kw})
         return box
 
@@ -3840,7 +4634,7 @@ class CrawlerApp:
         for text, cmd in (("极速采集", self._preset_turbo), ("完整数据", self._preset_complete),
                           ("只下图片", self._preset_images), ("只下视频", self._preset_videos),
                           ("只要文本", self._preset_text)):
-            self._btn(preset_row, text, cmd, width=104, padx=(0, SP_SM))
+            self._btn(preset_row, text, cmd, width=120, padx=(0, SP_SM))
 
         # === 基础内容 ===
         basic = self._card(parent, "基础内容")
@@ -3894,12 +4688,12 @@ class CrawlerApp:
         # === 分析工具 ===
         tools = self._card(parent, "分析工具")
         row1 = self._row(tools)
-        self._btn(row1, "刷新统计", self._refresh_dashboard_from_db, width=104, padx=(0, SP_SM))
+        self._btn(row1, "刷新统计", self._refresh_dashboard_from_db, width=120, padx=(0, SP_SM))
         for text, cmd in (("生成统计图表", self._generate_charts),
                           ("生成词云", self._generate_wordcloud),
                           ("生成分析报告", self._generate_report),
                           ("合并所有数据", self._merge_data)):
-            self._btn(row1, text, cmd, width=116, padx=(0, SP_SM))
+            self._btn(row1, text, cmd, width=132, padx=(0, SP_SM))
 
         # 依赖缺失提示（可选依赖未装时按钮点了只弹框，先在此显式告知）
         missing = []
@@ -3930,17 +4724,18 @@ class CrawlerApp:
             ("video_notes", "视频笔记", "0"),
         ]
         for i, (key, label, default) in enumerate(stats_items):
-            tile = ctk.CTkFrame(stats_grid, fg_color=C['card_alt'], corner_radius=10,
+            tile = ctk.CTkFrame(stats_grid, fg_color=C['card_alt'], corner_radius=CARD_RADIUS,
                                 border_width=1, border_color=C['border'])
-            tile.grid(row=i // 4, column=i % 4, padx=(0 if i % 4 == 0 else SP_SM, 0),
-                      pady=(0 if i < 4 else SP_SM, 0), sticky="nsew")
+            tile.grid(row=i // 4, column=i % 4,
+                      padx=(0 if i % 4 == 0 else SP_MD, 0),
+                      pady=(0 if i < 4 else SP_MD, 0), sticky="nsew")
             self.dashboard_labels[key] = ctk.CTkLabel(
                 tile, text=default, font=UI_FONT(FS_METRIC, bold=True),
                 text_color=C['brand'], anchor="w")
-            self.dashboard_labels[key].pack(anchor="w", padx=SP_MD, pady=(SP_MD, 0))
+            self.dashboard_labels[key].pack(anchor="w", padx=SP_LG, pady=(SP_MD + 4, 0))
             ctk.CTkLabel(tile, text=label, font=UI_FONT(FS_SMALL),
                          text_color=C['text_sub'], anchor="w").pack(
-                anchor="w", padx=SP_MD, pady=(0, SP_MD))
+                anchor="w", padx=SP_LG, pady=(SP_XS, SP_MD + 4))
 
         for i in range(4):
             stats_grid.columnconfigure(i, weight=1, uniform="metric")
@@ -3950,7 +4745,7 @@ class CrawlerApp:
         columns = ("时间", "关键词", "笔记数", "图片数", "文件")
         self.history_tree = ttk.Treeview(history, columns=columns, show="headings", height=8)
 
-        widths = {"时间": 150, "关键词": 130, "笔记数": 90, "图片数": 90, "文件": 320}
+        widths = {"时间": 170, "关键词": 150, "笔记数": 100, "图片数": 100, "文件": 360}
         for col in columns:
             self.history_tree.heading(col, text=col)
             self.history_tree.column(col, width=widths[col],
@@ -4033,21 +4828,97 @@ class CrawlerApp:
         row5 = self._row(db)
         self._label(row5, "数据库路径", padx=(0, SP_SM))
         self.db_path_var = tk.StringVar(value="data/redbook.db")
-        ctk.CTkEntry(row5, textvariable=self.db_path_var, width=400, height=34,
+        ctk.CTkEntry(row5, textvariable=self.db_path_var, width=440, height=CTRL_H,
                      font=UI_FONT()).pack(side=tk.LEFT, padx=(0, SP_SM))
         self._btn(row5, "浏览", self._browse_db_path, width=80)
         self._label(row5, "改动后需重启生效", color=C['text_faint'], size=FS_SMALL,
                     padx=(SP_MD, 0))
 
     # === 事件处理 ===
-    def _on_mode_change(self):
-        """切换爬取模式"""
+    def _on_mode_seg_change(self, label: str):
+        """分段控件切换采集类型（中文标签 → 内部值）"""
+        mode = self._CRAWL_LABEL_TO_TYPE.get(label, "keyword")
+        self.crawl_type_var.set(mode)
+        self._on_mode_change()
+
+    def _on_speed_seg_change(self, label: str):
+        """分段控件切换采集速度"""
+        self.crawl_mode_var.set(self._CRAWL_LABEL_TO_MODE.get(label, "standard"))
+
+    def _sync_mode_segs(self):
+        """crawl_type / crawl_mode 变更后同步分段控件外观（恢复设置、预设时用）"""
+        try:
+            t = self.crawl_type_var.get()
+            label = self._CRAWL_TYPE_TO_LABEL.get(t, "关键词搜索")
+            self.crawl_type_label_var.set(label)
+            if hasattr(self, "crawl_type_seg"):
+                self.crawl_type_seg.set(label)
+                self._paint_seg(self.crawl_type_seg, label)
+        except Exception:
+            pass
+        try:
+            m = self.crawl_mode_var.get()
+            if m == "fast":
+                m = "standard"
+                self.crawl_mode_var.set(m)
+            label = self._CRAWL_MODE_TO_LABEL.get(m, "标准模式（完整数据）")
+            self.crawl_mode_label_var.set(label)
+            if hasattr(self, "crawl_mode_seg"):
+                self.crawl_mode_seg.set(label)
+                self._paint_seg(self.crawl_mode_seg, label)
+        except Exception:
+            pass
+
+    def _apply_mode_row_visibility(self):
+        """按采集模式只显示相关输入行，隐藏无关行以压缩主页高度。"""
         mode = self.crawl_type_var.get()
-        
-        # 禁用/启用相应输入框
-        self.keyword_entry.configure(state=tk.NORMAL if mode == "keyword" else tk.DISABLED)
-        self.blogger_entry.configure(state=tk.NORMAL if mode == "blogger" else tk.DISABLED)
-        self.hot_combo.configure(state="readonly" if mode == "hot" else tk.DISABLED)
+        for row in (getattr(self, "_kw_row", None),
+                    getattr(self, "_blogger_row", None),
+                    getattr(self, "_hot_row", None)):
+            if row is not None:
+                try:
+                    row.pack_forget()
+                except Exception:
+                    pass
+
+        # 插在「最多笔记」行之前，保证顺序：模式 → 输入 → 数量/速度
+        before = getattr(self, "_count_row", None)
+        pack_kw = dict(fill=tk.X, pady=(0, SP_XS))
+        if before is not None:
+            pack_kw["before"] = before
+
+        if mode == "keyword" and getattr(self, "_kw_row", None) is not None:
+            self._kw_row.pack(**pack_kw)
+            try:
+                self.keyword_entry.configure(state=tk.NORMAL)
+            except Exception:
+                pass
+        elif mode == "blogger" and getattr(self, "_blogger_row", None) is not None:
+            self._blogger_row.pack(**pack_kw)
+            try:
+                self.blogger_entry.configure(state=tk.NORMAL)
+            except Exception:
+                pass
+        elif mode == "hot" and getattr(self, "_hot_row", None) is not None:
+            self._hot_row.pack(**pack_kw)
+            try:
+                self.hot_combo.configure(state="readonly")
+            except Exception:
+                pass
+
+        try:
+            if mode != "keyword":
+                self.keyword_entry.configure(state=tk.DISABLED)
+            if mode != "blogger":
+                self.blogger_entry.configure(state=tk.DISABLED)
+            if mode != "hot":
+                self.hot_combo.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+
+    def _on_mode_change(self):
+        """切换爬取模式：显隐对应输入行 + 启用状态"""
+        self._apply_mode_row_visibility()
     
     def _check_cookie_status(self):
         """检查Cookie状态"""
@@ -4089,6 +4960,7 @@ class CrawlerApp:
     # === 预设 ===
     def _preset_turbo(self):
         self.crawl_mode_var.set("turbo")
+        self._sync_mode_segs()
         self.download_images_var.set(True)
         self.get_all_images_var.set(False)
         self.download_videos_var.set(False)
@@ -4098,6 +4970,7 @@ class CrawlerApp:
     
     def _preset_complete(self):
         self.crawl_mode_var.set("standard")
+        self._sync_mode_segs()
         self.download_images_var.set(True)
         self.get_all_images_var.set(True)
         self.download_videos_var.set(True)
@@ -4129,30 +5002,74 @@ class CrawlerApp:
         self.log("已应用只要文本预设", "SUCCESS")
     
     # === 日志 ===
+    def _ensure_log_panel_size(self):
+        """兼容旧调用：主页已改为 grid 自动分配日志高度，无需再调 sash。"""
+        return
+
     def log(self, message, level="INFO"):
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_queue.put((f"[{timestamp}] {message}\n", level))
         
-        if self.config.log_to_file:
+        if getattr(self, "config", None) and self.config.log_to_file:
             self.file_logger.log(message, level)
     
+    def _append_log_line(self, msg: str, level: str = "INFO"):
+        """主线程写入日志框（consumer / 直接调用都走这里）。"""
+        box = getattr(self, "log_text", None)
+        if box is None:
+            return
+        try:
+            # 优先写内部 tk.Text，避免 CTk 封装层 insert/tag 异常静默失败
+            inner = getattr(self, "_log_inner", None) or getattr(box, "_textbox", None)
+            tag = level if getattr(self, "_ctk_log_tags", False) else None
+            if inner is not None:
+                try:
+                    inner.configure(state="normal")
+                except Exception:
+                    pass
+                if tag:
+                    try:
+                        inner.insert(tk.END, msg, tag)
+                    except Exception:
+                        inner.insert(tk.END, msg)
+                else:
+                    inner.insert(tk.END, msg)
+                inner.see(tk.END)
+                try:
+                    inner.configure(state="disabled")
+                except Exception:
+                    pass
+            else:
+                box.configure(state="normal")
+                if tag:
+                    box.insert(tk.END, msg, tag)
+                else:
+                    box.insert(tk.END, msg)
+                box.see(tk.END)
+                box.configure(state="disabled")
+        except Exception:
+            # 窗口销毁或控件未就绪时忽略，避免刷栈
+            pass
+
     def _start_log_consumer(self):
         def consume():
             try:
-                while True:
+                # 批量排空，避免高频 after 堆积
+                n = 0
+                while n < 200:
                     msg, level = self.log_queue.get_nowait()
-                    self.log_text.configure(state="normal")
-                    # tag 着色让 SUCCESS/ERROR 一眼可辨；建 tag 失败时退回单色
-                    if getattr(self, '_ctk_log_tags', False):
-                        self.log_text.insert(tk.END, msg, level)
-                    else:
-                        self.log_text.insert(tk.END, msg)
-                    self.log_text.see(tk.END)
-                    self.log_text.configure(state="disabled")
+                    self._append_log_line(msg, level)
+                    n += 1
             except queue.Empty:
                 pass
-            self.root.after(100, consume)
-        self.root.after(100, consume)
+            try:
+                self.root.after(80, consume)
+            except Exception:
+                pass
+        try:
+            self.root.after(80, consume)
+        except Exception:
+            pass
     
     def _safe_after(self, func):
         """从工作线程安全地把回调派发到主线程。
@@ -4246,6 +5163,11 @@ class CrawlerApp:
                 return
         
         self._get_config()
+        # 切回「搜索爬取」页，保证用户能看到运行日志
+        try:
+            self.notebook.select(0)
+        except Exception:
+            pass
         self._run_crawl()
     
     def _stop_crawl(self):
@@ -4300,7 +5222,8 @@ class CrawlerApp:
             if self.crawl_mode_var.get() == "fast":
                 self.crawl_mode_var.set("standard")
             # 恢复 crawl_type 后必须手动联动控件状态：
-            # 直接 set() 单选变量不会触发 Radiobutton 的 command
+            # 直接 set() 变量不会触发分段控件 command
+            self._sync_mode_segs()
             self._on_mode_change()
 
             self.log("已恢复上次的设置", "SUCCESS")
@@ -4405,9 +5328,15 @@ class CrawlerApp:
         self.displayed_notes = []
         self.filtered_notes = []
 
-        # 确保数据源是"当前爬取"
+        # 确保数据源是"当前爬取"（同步分段控件外观）
         self.data_source_var.set("当前爬取")
-        
+        try:
+            if hasattr(self, "data_source_seg"):
+                self.data_source_seg.set("当前爬取")
+                self._paint_seg(self.data_source_seg, "当前爬取")
+        except Exception:
+            pass
+
         self._set_crawl_buttons(running=True)
 
         thread = threading.Thread(target=self._crawl_thread, daemon=True)
@@ -4423,6 +5352,126 @@ class CrawlerApp:
         """
         keyword_code = quote(quote(keyword.encode('utf-8')).encode('gb2312'))
         return f'https://www.xiaohongshu.com/search_result?keyword={keyword_code}&source=web_search_result_notes'
+
+    @staticmethod
+    def _is_note_detail_url(url: str) -> bool:
+        """是否笔记详情（弹窗/独立页）：/explore/{noteId}，排除主页推荐 /explore"""
+        if not url:
+            return False
+        return bool(re.search(r'/explore/[a-zA-Z0-9]{10,}', url))
+
+    def _is_on_entry_list_page(self, page, base_url: str) -> bool:
+        """当前是否仍在本轮爬取的「列表入口」页（搜索/博主/主页推荐）。
+
+        关键词模式必须停在 search_result；history.back 过冲会退到登录前
+        打开的主页 /explore，再继续爬就会变成主页推荐流——这是
+        「关键词检索却一直爬主页」的根因。
+        """
+        try:
+            url = page.url or ""
+        except Exception:
+            return False
+        if not url or 'website-login' in url:
+            return False
+        if self._is_note_detail_url(url):
+            return False
+
+        base = base_url or ""
+        if 'search_result' in base:
+            # 必须在搜索结果页；仅有 /explore 主页不算
+            if 'search_result' not in url:
+                return False
+            # 若入口带 keyword 参数，尽量校验仍是同一关键词（防跳到空搜）
+            try:
+                from urllib.parse import urlparse, parse_qs, unquote
+                bq = parse_qs(urlparse(base).query)
+                uq = parse_qs(urlparse(url).query)
+                want = (bq.get('keyword') or [''])[0]
+                got = (uq.get('keyword') or [''])[0]
+                if want and got:
+                    # 双重编码后 compare 用 unquote 两次尽量对齐
+                    def _norm(k):
+                        k = unquote(unquote(k))
+                        return k
+                    if _norm(want) and _norm(got) and _norm(want) != _norm(got):
+                        return False
+            except Exception:
+                pass
+            return True
+        if 'user/profile' in base:
+            return 'user/profile' in url
+        # 主页推荐 / 热门
+        if 'search_result' not in url and (
+                '/explore' in url or url.rstrip('/').endswith('xiaohongshu.com')):
+            return not self._is_note_detail_url(url)
+        return False
+
+    def _return_to_list_page(self, page, base_url: str, reason: str = "") -> bool:
+        """从笔记详情回到列表；若 history.back 掉到主页/错页则强制重进入口。
+
+        返回是否最终落在正确列表页。
+        """
+        if not base_url:
+            return False
+        try:
+            url = page.url or ""
+        except Exception:
+            url = ""
+
+        # 详情弹窗：先 back 一次
+        if self._is_note_detail_url(url):
+            try:
+                page.run_js("history.back()")
+                time.sleep(0.55)
+            except Exception:
+                try:
+                    page.actions.key_down('Escape').key_up('Escape')
+                    time.sleep(0.35)
+                except Exception:
+                    pass
+            try:
+                url = page.url or ""
+            except Exception:
+                url = ""
+            # 仍卡在详情：再 back 一次或硬跳
+            if self._is_note_detail_url(url):
+                try:
+                    page.run_js("history.back()")
+                    time.sleep(0.45)
+                except Exception:
+                    pass
+
+        if self._is_on_entry_list_page(page, base_url):
+            return True
+
+        # 过冲到主页 / 其它页：硬导航回入口（关键词场景关键）
+        tip = reason or "页面已离开入口列表"
+        try:
+            cur = page.url or ""
+        except Exception:
+            cur = ""
+        self.log(f"{tip}，重新进入列表页… (当前: {cur[:80]})", "WARNING")
+        try:
+            page.get(base_url)
+            time.sleep(1.6)
+            # 搜索页偶发登录遮罩
+            if not self._check_login(page):
+                try:
+                    close_btn = page.ele('css:.close-icon, [class*="close"]', timeout=0.4)
+                    if close_btn:
+                        close_btn.click()
+                        time.sleep(0.3)
+                except Exception:
+                    pass
+            if self._is_on_entry_list_page(page, base_url):
+                return True
+            # 再试一次
+            page.get(base_url)
+            time.sleep(1.2)
+            return self._is_on_entry_list_page(page, base_url)
+        except Exception as e:
+            self.log(f"重新进入列表页失败: {e}", "ERROR")
+            return False
 
     def _crawl_thread(self):
         """爬取主线程（优化版，增强错误恢复）"""
@@ -4591,6 +5640,23 @@ class CrawlerApp:
                             self._wait_for_login(page)
                             page.get(target_url)
                             time.sleep(1.5)
+
+                    # 登录/风控恢复后常被踢回主页：关键词模式必须确认仍在 search_result
+                    if not self._is_on_entry_list_page(page, target_url):
+                        self.log("入口页被重定向，强制回到目标列表…", "WARNING")
+                        try:
+                            cur = page.url or ""
+                        except Exception:
+                            cur = ""
+                        self.log(f"  当前URL: {cur[:100]}", "DEBUG")
+                        page.get(target_url)
+                        time.sleep(1.8)
+                        if not self._is_on_entry_list_page(page, target_url):
+                            self.log(
+                                "无法停留在目标列表页（可能被风控跳到主页），本关键词跳过",
+                                "ERROR")
+                            error_count += 1
+                            continue
                     
                     # 自动滚动加载笔记（直到达到目标数量或无法加载更多）
                     prev_count = 0
@@ -5005,40 +6071,38 @@ class CrawlerApp:
                 progress=progress
             )
             
-            # 连续失败时重新加载页面
+            # 连续失败时重新加载入口列表（关键词=搜索页，禁止落在主页）
             if consecutive_fails >= MAX_CONSECUTIVE_FAILS:
-                self.log("连续失败，重新加载页面", "WARNING")
+                self.log("连续失败，重新加载列表页", "WARNING")
+                if not self._return_to_list_page(page, base_url, "连续失败恢复"):
+                    break
                 try:
-                    page.get(base_url)
-                    time.sleep(2)
-                    # 滚动加载
                     for _ in range(5):
                         page.scroll.to_bottom()
                         time.sleep(0.5)
                 except Exception:
-                    break
+                    pass
                 consecutive_fails = 0
-            
+
             try:
-                # 确保在目标页面
-                current_url = page.url or ""
-                if '/explore/' in current_url and 'xsec_token' in current_url:
-                    # 在笔记详情弹窗页，返回
-                    try:
-                        page.run_js("history.back()")
-                        time.sleep(0.5)
-                    except Exception:
-                        pass
-                
+                # 每轮先确保在入口列表页（防 history.back 退回主页后继续爬推荐流）
+                if not self._is_on_entry_list_page(page, base_url):
+                    if not self._return_to_list_page(page, base_url, "不在入口列表"):
+                        consecutive_fails += 1
+                        continue
+
                 # 获取所有笔记元素
                 elements = page.eles("css:section.note-item", timeout=1)
                 if not elements:
                     self.log("未找到笔记元素，尝试滚动加载", "WARNING")
+                    # 若其实在主页误当搜索，上面守卫应已拦；此处再确认一次
+                    if not self._is_on_entry_list_page(page, base_url):
+                        self._return_to_list_page(page, base_url, "无笔记且页面偏离")
                     page.scroll.to_bottom()
                     time.sleep(1)
                     consecutive_fails += 1
                     continue
-                
+
                 # 从头遍历，找到第一个未爬取的笔记
                 found_note = False
                 for i, elem in enumerate(elements):
@@ -5046,25 +6110,26 @@ class CrawlerApp:
                     cover_link = elem.ele('css:a.cover', timeout=0.1)
                     if not cover_link:
                         continue  # 跳过没有封面的（推荐卡片）
-                    
+
                     # 检测推荐搜索卡片
                     if self._is_search_recommend_card(elem):
                         continue
-                    
+
                     # 获取笔记URL并提取笔记ID用于去重（去掉token等变化的参数）
                     note_href = cover_link.attr('href') or ""
-                    # 提取笔记ID（格式如 /explore/67fa8d98000000001d0052a6）
+                    # 提取笔记ID（/explore/id 或 /search_result/id）
                     note_id = ""
-                    if '/explore/' in note_href:
-                        try:
-                            note_id = note_href.split('/explore/')[1].split('?')[0]
-                        except:
-                            note_id = note_href
-                    else:
+                    for marker in ('/explore/', '/search_result/'):
+                        if marker in note_href:
+                            try:
+                                note_id = note_href.split(marker)[1].split('?')[0].split('/')[0]
+                            except Exception:
+                                note_id = note_href
+                            break
+                    if not note_id:
                         note_id = note_href
-                    
-                    # 去重键：note_id 优先，退回 href，再退回位置，确保
-                    # 空 note_id 的卡片也能被登记（否则会重复处理）
+
+                    # 去重键：note_id 优先，退回 href，再退回位置
                     dedup_key = note_id or note_href or f"__pos_{i}"
                     if dedup_key in crawled_urls:
                         continue  # 已爬取过或已放弃
@@ -5073,23 +6138,23 @@ class CrawlerApp:
                     found_note = True
                     note_attempts[dedup_key] = note_attempts.get(dedup_key, 0) + 1
                     give_up = note_attempts[dedup_key] >= MAX_NOTE_RETRY
-                    
+
                     # 获取卡片标题
                     try:
                         card_title = elem.ele('css:.title, .note-title', timeout=0.1)
                         card_title_text = (card_title.text if card_title else "")[:20]
                     except Exception:
                         card_title_text = ""
-                    
+
                     self.log(f"[{success+1}/{target_notes}] 位置{i+1}, 标题={card_title_text}", "INFO")
-                    
-                    # 点击笔记打开弹窗
+
+                    # 点击笔记打开弹窗（必须 a.cover）
                     elem.scroll.to_see()
                     time.sleep(0.1)
                     cover_link.click()
-                    
+
                     time.sleep(random.uniform(*self.config.click_delay))
-                    
+
                     # 等待弹窗内容加载
                     popup_loaded = False
                     for _ in range(10):
@@ -5100,10 +6165,9 @@ class CrawlerApp:
                         except Exception:
                             pass
                         time.sleep(0.2)
-                    
+
                     # 额外等待互动数据和图片轮播加载
                     if popup_loaded:
-                        # 等待互动数据
                         for _ in range(5):
                             try:
                                 if page.ele('css:.like-wrapper .count, .engage-bar .count', timeout=0.1):
@@ -5111,8 +6175,7 @@ class CrawlerApp:
                             except Exception:
                                 pass
                             time.sleep(0.2)
-                        
-                        # 等待图片轮播加载（关键！）
+
                         for _ in range(5):
                             try:
                                 if page.ele('css:.swiper-slide img, .carousel img, [class*="slider"] img', timeout=0.2):
@@ -5120,42 +6183,41 @@ class CrawlerApp:
                             except Exception:
                                 pass
                             time.sleep(0.3)
-                    
+
                     # 检查是否无法浏览
                     try:
                         unavailable = page.ele('xpath://div[contains(text(), "暂时无法浏览")]', timeout=0.2)
                         if unavailable:
                             self.log("笔记无法浏览，跳过", "WARNING")
-                            crawled_urls.add(dedup_key)  # 永久不可访问，不重试
-                            page.run_js("history.back()")
-                            time.sleep(0.3)
-                            break  # 退出内层循环，继续外层循环
+                            crawled_urls.add(dedup_key)
+                            self._return_to_list_page(page, base_url, "笔记不可浏览后返回")
+                            break
                     except Exception:
                         pass
-                    
+
                     # 确保URL已更新（验证当前笔记）
-                    current_url = page.url
+                    current_url = page.url or ""
                     if note_id and note_id not in current_url:
-                        self.log(f"  URL未更新，等待跳转...", "DEBUG")
+                        self.log("  URL未更新，等待跳转...", "DEBUG")
                         for _ in range(10):
                             time.sleep(0.3)
-                            current_url = page.url
+                            current_url = page.url or ""
                             if note_id in current_url:
                                 break
-                    
+
                     # 提取数据
-                    time.sleep(0.5)  # 增加等待时间确保图片加载
+                    time.sleep(0.5)
                     note_data = self._extract_full_note(page, success, images_dir, timestamp, keyword)
 
-                    # 应用主页面"筛选条件"（此前这些选项从未生效）
+                    # 应用主页面筛选条件
                     filtered_out = False
                     if note_data and not self._note_passes_filter(note_data):
                         self.log(f"  不满足筛选条件，跳过: {note_data.get('title','')[:20]}", "INFO")
                         note_data = None
-                        filtered_out = True  # 主动跳过，不计入连续失败
+                        filtered_out = True
 
                     if note_data and note_data.get('title'):
-                        crawled_urls.add(dedup_key)  # 成功，永久登记
+                        crawled_urls.add(dedup_key)
                         self.all_notes_data.append(note_data)
                         success += 1
                         images += note_data.get('image_count', 0)
@@ -5171,58 +6233,52 @@ class CrawlerApp:
                         likes = note_data.get('like_count', 0)
                         self.log(f"[{success}] {title}... ❤️{likes}", "SUCCESS")
                     elif filtered_out:
-                        crawled_urls.add(dedup_key)  # 主动跳过，不重试
+                        crawled_urls.add(dedup_key)
                     else:
-                        # 提取失败：达到重试上限才永久登记，否则留待下一轮重试
                         consecutive_fails += 1
                         if give_up:
                             crawled_urls.add(dedup_key)
-                            self.log(f"  提取失败已达重试上限，跳过", "WARNING")
+                            self.log("  提取失败已达重试上限，跳过", "WARNING")
                         else:
-                            self.log(f"  提取失败，稍后重试", "DEBUG")
-                    
-                    # 返回列表页
-                    try:
-                        page.run_js("history.back()")
-                        time.sleep(0.4)
-                    except Exception:
-                        page.actions.key_down('Escape').key_up('Escape')
-                        time.sleep(0.3)
-                    
-                    break  # 成功处理一个笔记，退出内层循环
-                
+                            self.log("  提取失败，稍后重试", "DEBUG")
+
+                    # 返回列表页（失败则硬跳搜索入口，避免落到主页）
+                    self._return_to_list_page(page, base_url, "单条处理完毕返回")
+                    break  # 处理一个笔记后退出内层，外层重新扫列表
+
                 # 如果没找到未爬取的笔记，尝试滚动加载更多
                 if not found_note:
+                    # 再次确认仍在入口页
+                    if not self._is_on_entry_list_page(page, base_url):
+                        self._return_to_list_page(page, base_url, "加载更多前页面偏离")
+                        continue
+
                     prev_count = len(elements)
                     self.log(f"当前页面 {prev_count} 个笔记已全部处理，尝试加载更多...", "INFO")
-                    
-                    # 多次滚动尝试加载更多
+
                     loaded_more = False
                     for scroll_try in range(3):
                         page.scroll.to_bottom()
                         time.sleep(1)
+                        if not self._is_on_entry_list_page(page, base_url):
+                            self._return_to_list_page(page, base_url, "滚动后页面偏离")
+                            break
                         new_elements = page.eles("css:section.note-item", timeout=0.5)
                         if len(new_elements) > prev_count:
                             self.log(f"加载了 {len(new_elements) - prev_count} 个新笔记", "INFO")
                             loaded_more = True
                             break
-                    
+
                     if not loaded_more:
                         self.log(f"页面无法加载更多笔记，共爬取 {success} 个", "WARNING")
-                        break  # 退出while循环
-                
+                        break
+
             except Exception as e:
                 consecutive_fails += 1
                 error_msg = str(e)[:50] if str(e) else "未知错误"
                 self.log(f"爬取失败: {error_msg}", "ERROR")
-                
-                # 尝试返回列表页
-                try:
-                    page.run_js("history.back()")
-                    time.sleep(0.5)
-                except Exception:
-                    pass
-        
+                self._return_to_list_page(page, base_url, "异常后返回列表")
+
         self.log(f"爬取完成：成功 {success} 个笔记", "SUCCESS")
         return success, images, videos
     
@@ -5681,121 +6737,34 @@ class CrawlerApp:
                 note_id = current_url.split('/explore/')[-1].split('?')[0]
             data['note_id'] = note_id
             
-            # 检测笔记类型并获取视频URL
+            # 检测笔记类型并收集视频 URL 候选（多源，下载时依次尝试）
             note_type = "图文"
             video_url = ""
+            video_candidates: List[str] = []
             try:
-                # 多次尝试检测视频元素（视频可能延迟加载）
-                v = None
-                for _ in range(3):
-                    v = page.ele('xpath://video', timeout=0.3)
-                    if v:
-                        break
-                    time.sleep(0.2)
-                
-                if v:
+                is_video_note = self._detect_is_video_note(page)
+                if is_video_note:
                     note_type = "视频"
-                    self.log(f"  检测到视频元素", "INFO")
-                    
-                    # 等待视频数据加载
-                    time.sleep(0.5)
-                    
-                    # 尝试从JavaScript获取视频URL（最可靠的方法）
-                    try:
-                        script = """
-                        return (() => {
-                            // 方法1: 从 __INITIAL_STATE__ 获取当前笔记的视频（使用URL中的noteId）
-                            try {
-                                if (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.note) {
-                                    // 从URL获取当前笔记ID（更可靠）
-                                    const urlMatch = window.location.href.match(/explore\\/([a-zA-Z0-9]+)/);
-                                    const noteId = urlMatch ? urlMatch[1] : window.__INITIAL_STATE__.note.currentNoteId;
-                                    const noteMap = window.__INITIAL_STATE__.note.noteDetailMap;
-                                    
-                                    if (noteMap && noteId && noteMap[noteId]) {
-                                        const currentNote = noteMap[noteId];
-                                        if (currentNote && currentNote.note && currentNote.note.video) {
-                                            const video = currentNote.note.video;
-                                            // 优先使用 consumer.originVideoKey
-                                            if (video.consumer && video.consumer.originVideoKey) {
-                                                return 'https://sns-video-bd.xhscdn.com/' + video.consumer.originVideoKey;
-                                            }
-                                            // 备用：直接的URL
-                                            if (video.url && !video.url.startsWith('blob:')) {
-                                                return video.url;
-                                            }
-                                            // 备用：media.stream
-                                            if (video.media && video.media.stream && video.media.stream.h264) {
-                                                const streams = video.media.stream.h264;
-                                                if (streams.length > 0 && streams[0].masterUrl) {
-                                                    return streams[0].masterUrl;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            } catch(e) { console.log('State error:', e); }
-                            
-                            // 方法2: 从页面script标签中提取（寻找当前页面的视频数据）
-                            const scripts = document.querySelectorAll('script');
-                            for (let s of scripts) {
-                                const text = s.textContent || '';
-                                if (text.length < 100) continue;
-                                
-                                // 模式1: originVideoKey
-                                let match = text.match(/"originVideoKey"\\s*:\\s*"([^"]+)"/);
-                                if (match && match[1].length > 10) {
-                                    return 'https://sns-video-bd.xhscdn.com/' + match[1];
-                                }
-                                
-                                // 模式2: masterUrl
-                                match = text.match(/"masterUrl"\\s*:\\s*"(https?:[^"]+)"/);
-                                if (match) return match[1].replace(/\\\\/g, '');
-                                
-                                // 模式3: 直接的视频URL
-                                match = text.match(/(https?:\\/\\/sns-video[^"'\\s]+\\.mp4[^"'\\s]*)/);
-                                if (match) return match[1];
-                                
-                                // 模式4: xhscdn视频URL
-                                match = text.match(/(https?:\\/\\/[^"'\\s]*xhscdn\\.com[^"'\\s]*\\/video[^"'\\s]*)/);
-                                if (match) return match[1];
-                            }
-                            
-                            // 方法3: 从video元素获取
-                            const video = document.querySelector('video');
-                            if (video) {
-                                if (video.src && !video.src.startsWith('blob:')) return video.src;
-                                const source = video.querySelector('source');
-                                if (source && source.src && !source.src.startsWith('blob:')) return source.src;
-                            }
-                            
-                            return '';
-                        })()
-                        """
-                        result = page.run_js(script)
-                        if result and not result.startswith('blob:') and len(result) > 20:
-                            video_url = result
-                            self.log(f"  视频URL获取成功: {video_url[:60]}...", "SUCCESS")
-                    except Exception as e:
-                        self.log(f"  JS获取视频URL失败: {e}", "WARNING")
-                    
-                    # 如果JS方法失败，尝试从video元素直接获取
-                    if not video_url or video_url.startswith('blob:'):
-                        try:
-                            video_url = v.attr('src') or ""
-                            if video_url and video_url.startswith('blob:'):
-                                video_url = ""
-                        except:
-                            pass
-                    
-                    if not video_url:
-                        self.log(f"  无法获取可下载的视频URL (可能是blob格式)", "WARNING")
-                        
+                    self.log("  检测到视频笔记", "INFO")
+                    # 点播放触发拉流，再从 performance/state 收集直链
+                    video_candidates = self._extract_video_url_candidates(page, trigger_play=True)
+                    if video_candidates:
+                        video_url = video_candidates[0]
+                        self.log(f"  视频候选 {len(video_candidates)} 个: {video_url[:70]}...", "SUCCESS")
+                    else:
+                        self.log("  视频笔记暂无直链（将保留封面，稍后仍尝试 performance 二次采集）", "WARNING")
+                        # 再等一会儿二次采集
+                        time.sleep(0.8)
+                        video_candidates = self._extract_video_url_candidates(page, trigger_play=False)
+                        if video_candidates:
+                            video_url = video_candidates[0]
+                            self.log(f"  二次采集到视频URL: {video_url[:70]}...", "SUCCESS")
             except Exception as e:
                 self.log(f"  视频检测异常: {e}", "WARNING")
-                
+
             data['note_type'] = note_type
             data['video_url'] = video_url
+            data['_video_candidates'] = video_candidates
             
             # 获取图片URL - 优先使用JavaScript从页面状态获取
             preview_images = []
@@ -5982,216 +6951,646 @@ class CrawlerApp:
                            else f"{images_dir}/note_{idx+1}_{timestamp}")
             data['local_dir'] = note_folder
 
-            # 批量下载图片（视频类型不下载封面图）
-            if self.config.download_images and data['image_urls'] and note_type != "视频":
+            # 批量下载图片：
+            # - 图文：全部下载
+            # - 视频：至少留 1 张封面，方便预览；视频 URL 失败时也能看到内容
+            if self.config.download_images and data['image_urls']:
                 folder = note_folder
+                urls = data['image_urls']
+                if note_type == "视频":
+                    urls = urls[:1]
+                    self.log("  视频笔记保留封面图", "INFO")
                 tasks = []
-                for i, url in enumerate(data['image_urls'], 1):
+                for i, url in enumerate(urls, 1):
                     ext = '.webp' if '.webp' in url else '.jpg'
                     tasks.append((url, f"{folder}/img_{i}{ext}"))
-                
+
                 if tasks:
                     results = self.downloader.download_batch(tasks, None, lambda: self.should_stop)
-                    # 存储绝对路径
                     data['local_images'] = [os.path.abspath(r) for r in results.values() if r]
                     data['image_count'] = len(data['local_images'])
-                    self.log(f"  下载成功 {data['image_count']}/{len(tasks)} 张图片", "SUCCESS" if data['image_count'] > 0 else "WARNING")
-            elif note_type == "视频":
-                self.log(f"  视频类型跳过图片下载", "INFO")
+                    self.log(
+                        f"  下载成功 {data['image_count']}/{len(tasks)} 张图片",
+                        "SUCCESS" if data['image_count'] > 0 else "WARNING")
             elif not data['image_urls']:
-                self.log(f"  未获取到图片URL", "WARNING")
-            
-            # 下载视频
-            if self.config.download_videos and video_url:
-                self.log(f"  开始下载视频...", "INFO")
+                self.log("  未获取到图片URL", "WARNING")
+
+            # 下载视频：多候选 URL + 多 CDN 前缀轮询
+            cands = list(data.get('_video_candidates') or [])
+            if video_url and video_url not in cands:
+                cands.insert(0, video_url)
+            data.pop('_video_candidates', None)
+
+            if self.config.download_videos and cands:
+                self.log(f"  开始下载视频（{len(cands)} 个候选）...", "INFO")
                 folder = note_folder
                 os.makedirs(folder, exist_ok=True)
                 video_path = f"{folder}/video.mp4"
-                result = self.downloader.download_file(video_url, video_path, lambda: self.should_stop, min_size=10240)
+                # 同步最新浏览器 Cookie，视频 CDN 常校验会话
+                try:
+                    self._sync_browser_cookies(page)
+                except Exception:
+                    pass
+                result = self.downloader.download_video_candidates(
+                    cands, video_path, stop_flag=lambda: self.should_stop)
                 if result:
                     data['local_video'] = result
+                    data['video_url'] = cands[0]
                     file_size = os.path.getsize(result) if os.path.exists(result) else 0
                     self.log(f"  视频下载成功: {file_size/1024/1024:.1f}MB", "SUCCESS")
                 else:
-                    self.log(f"  视频下载失败", "WARNING")
-            
-            # 评论爬取（优化版）
+                    err = getattr(self.downloader, '_last_error', '') or 'unknown'
+                    self.log(f"  视频下载失败（{err}）", "WARNING")
+            elif note_type == "视频" and not cands:
+                self.log("  视频笔记无可用下载地址", "WARNING")
+
+            # 评论：文字 + 图片完整打包
             if self.config.get_comments:
+                # 先滚到评论区，触发懒加载
+                try:
+                    page.run_js("""
+                        (() => {
+                          const el = document.querySelector(
+                            '.comments-container, .comments-el, .note-scroller, [class*="comments"], .list-container');
+                          if (el) { el.scrollTop = el.scrollHeight; }
+                          else { window.scrollBy(0, 400); }
+                        })()
+                    """)
+                    time.sleep(0.6)
+                except Exception:
+                    pass
+
                 comments = self._extract_comments(page)
                 data['comments'] = comments
                 if comments:
-                    self.log(f"  获取到 {len(comments)} 条评论", "INFO")
-                    
-                    # 下载评论图片到单独的 comments 文件夹
-                    comment_images_urls = []
-                    for comment in comments:
-                        if comment.get('images'):
-                            comment_images_urls.extend(comment.get('images', []))
-                    
-                    if comment_images_urls and self.config.download_images:
-                        # 使用与笔记图片相同的文件夹路径
+                    img_n = sum(len(c.get('images') or []) for c in comments)
+                    self.log(f"  获取到 {len(comments)} 条评论（含 {img_n} 张配图URL）", "INFO")
+
+                    # 只要开启下载图片，或评论里有图，就尝试落盘
+                    if self.config.download_images or img_n:
                         comments_dir = os.path.join(note_folder, 'comments')
-                        os.makedirs(comments_dir, exist_ok=True)
-                        
-                        # 批量下载评论图片（此前调用了不存在的 download_with_session，
-                        # AttributeError 被吞掉导致评论图片从未真正下载过）
                         comment_tasks = []
-                        for i, img_url in enumerate(comment_images_urls[:20]):  # 最多20张评论图片
-                            ext = '.jpg'
-                            if '.png' in img_url.lower():
-                                ext = '.png'
-                            elif '.webp' in img_url.lower():
-                                ext = '.webp'
-                            filepath = os.path.join(comments_dir, f"comment_img_{i+1}{ext}")
-                            comment_tasks.append((img_url, filepath))
+                        for ci, comment in enumerate(comments):
+                            urls = list(comment.get('images') or [])
+                            comment.setdefault('local_images', [])
+                            for ii, img_url in enumerate(urls[:6]):
+                                if not img_url or len(str(img_url)) < 20:
+                                    continue
+                                ext = '.jpg'
+                                low = str(img_url).lower()
+                                if '.png' in low:
+                                    ext = '.png'
+                                elif '.webp' in low:
+                                    ext = '.webp'
+                                filepath = os.path.join(
+                                    comments_dir, f"c{ci+1}_{ii+1}{ext}")
+                                comment_tasks.append((img_url, filepath, ci))
 
-                        results = self.downloader.download_batch(
-                            comment_tasks, stop_flag=lambda: self.should_stop)
-                        comment_img_count = sum(1 for r in results.values() if r)
+                        if comment_tasks:
+                            os.makedirs(comments_dir, exist_ok=True)
+                            batch = [(u, p) for u, p, _ in comment_tasks]
+                            results = self.downloader.download_batch(
+                                batch, stop_flag=lambda: self.should_stop)
+                            ok = 0
+                            for url, path, ci in comment_tasks:
+                                saved = results.get(url)
+                                if saved and os.path.isfile(str(saved)):
+                                    abs_p = os.path.abspath(str(saved))
+                                    comments[ci].setdefault('local_images', []).append(abs_p)
+                                    ok += 1
+                                elif path and os.path.isfile(path):
+                                    abs_p = os.path.abspath(path)
+                                    comments[ci].setdefault('local_images', []).append(abs_p)
+                                    ok += 1
+                            data['comments'] = comments
+                            data['comment_images_count'] = ok
+                            if ok:
+                                self.log(
+                                    f"  评论图片: {ok}/{len(comment_tasks)} 张已保存", "SUCCESS")
+                            else:
+                                self.log(
+                                    f"  评论图片下载失败 ({len(comment_tasks)} 张)", "WARNING")
+                else:
+                    self.log("  未获取到评论（可能未加载或被折叠）", "WARNING")
 
-                        if comment_img_count > 0:
-                            self.log(f"  评论图片: {comment_img_count}张 (保存到 comments 文件夹)", "INFO")
-                            data['comment_images_count'] = comment_img_count
-                        elif comment_tasks:
-                            self.log(f"  评论图片下载失败 ({len(comment_tasks)}张)", "WARNING")
-            
             return data
-            
+
         except Exception as e:
             self.log(f"提取数据失败: {e}", "ERROR")
             return None
-    
-    def _extract_single_comment(self, item, existing_contents: set) -> Optional[Dict]:
-        """提取单条评论的完整信息"""
-        exclude_words = {'关注', '点赞', '收藏', '分享', '复制', '举报', '回复', '查看', '展开', '赞', '条评论', '说点什么', '取消', '发送'}
-        
+
+    def _detect_is_video_note(self, page) -> bool:
+        """判断当前详情是否为视频笔记（避免把普通图文误判成视频）。"""
         try:
-            # 获取评论者名字
-            name_el = item.ele('css:.name, .user-name, .author-name, .nickname', timeout=0.1)
+            flag = page.run_js(r"""
+            return (() => {
+                try {
+                    const m = location.href.match(/explore\/([a-zA-Z0-9]+)/);
+                    const state = window.__INITIAL_STATE__ || {};
+                    const id = m ? m[1] : state.note?.currentNoteId;
+                    const note = state.note?.noteDetailMap?.[id]?.note;
+                    if (note) {
+                        if (note.type === 'video' || note.type === 'videos') return true;
+                        if (note.video || note.videoInfo) return true;
+                    }
+                } catch (e) {}
+                // 有 video 标签且非空宽高
+                const v = document.querySelector('video');
+                if (v && (v.src || v.currentSrc || v.querySelector('source'))) return true;
+                // xgplayer 容器
+                if (document.querySelector('.xgplayer, [class*="xgplayer"], .player-container video')) return true;
+                return false;
+            })()
+            """)
+            return bool(flag)
+        except Exception:
+            try:
+                return bool(page.ele('xpath://video', timeout=0.3))
+            except Exception:
+                return False
+
+    def _extract_video_url_candidates(self, page, trigger_play: bool = True) -> List[str]:
+        """从页面状态 / performance 网络 / script / video 标签收集视频直链。
+
+        返回 JSON 字符串再解析：DrissionPage 对 JS Array 回传不稳定。
+        """
+        if trigger_play:
+            try:
+                page.run_js(r"""
+                (() => {
+                    const sels = [
+                      'video', '.xgplayer-start', '.play-icon', '.play-btn',
+                      '[class*="play-icon"]', '[class*="xgplayer"] .xgplayer-icon-play',
+                      'button[aria-label*="播放"]'
+                    ];
+                    for (const s of sels) {
+                      const el = document.querySelector(s);
+                      if (!el) continue;
+                      try { el.click(); } catch (e) {}
+                      try { if (el.play) el.play(); } catch (e) {}
+                    }
+                    // 静音尝试播放，触发拉流
+                    document.querySelectorAll('video').forEach(v => {
+                      try { v.muted = true; v.play(); } catch (e) {}
+                    });
+                })()
+                """)
+                time.sleep(0.7)
+            except Exception:
+                pass
+
+        script = r"""
+        return (() => {
+            const urls = [];
+            const push = (u) => {
+                if (!u || typeof u !== 'string') return;
+                u = String(u).replace(/\\u002F/g, '/').replace(/\\\//g, '/').trim();
+                if (u.startsWith('//')) u = 'https:' + u;
+                if (u.startsWith('http://')) u = 'https://' + u.slice(7);
+                if (u.startsWith('blob:') || u.length < 24) return;
+                // 排除明显图片
+                if (/\.(jpg|jpeg|png|webp|gif)(\?|$)/i.test(u) && u.indexOf('/stream/') < 0) return;
+                if (urls.indexOf(u) < 0) urls.push(u);
+            };
+            const fromStream = (stream) => {
+                if (!stream || typeof stream !== 'object') return;
+                const keys = Object.keys(stream);
+                for (let i = 0; i < keys.length; i++) {
+                    const arr = stream[keys[i]];
+                    if (Array.isArray(arr)) {
+                        for (let j = 0; j < arr.length; j++) {
+                            const s = arr[j];
+                            if (!s) continue;
+                            push(s.masterUrl);
+                            push(s.backupUrl);
+                            push(s.url);
+                            if (Array.isArray(s.backupUrls)) {
+                                for (let k = 0; k < s.backupUrls.length; k++) push(s.backupUrls[k]);
+                            }
+                        }
+                    } else if (arr && typeof arr === 'object') {
+                        push(arr.masterUrl); push(arr.url);
+                    }
+                }
+                push(stream.masterUrl); push(stream.url);
+            };
+            const fromVideo = (video) => {
+                if (!video) return;
+                const key = (video.consumer && video.consumer.originVideoKey)
+                    || video.originVideoKey
+                    || (video.consumer && video.consumer.videoKey)
+                    || video.videoKey;
+                if (key && String(key).length > 6) {
+                    const hosts = [
+                        'https://sns-video-bd.xhscdn.com/',
+                        'https://sns-video-al.xhscdn.com/',
+                        'https://sns-video-qc.xhscdn.com/',
+                        'https://sns-video-v3.xhscdn.com/',
+                    ];
+                    for (let i = 0; i < hosts.length; i++) push(hosts[i] + key);
+                }
+                push(video.url); push(video.videoUrl);
+                if (video.consumer) push(video.consumer.url);
+                const media = video.media || video.videoMedia || {};
+                fromStream(media.stream || media);
+                if (video.stream) fromStream(video.stream);
+            };
+
+            // A) __INITIAL_STATE__
+            try {
+                const state = window.__INITIAL_STATE__ || {};
+                if (state.note) {
+                    const m = location.href.match(/explore\/([a-zA-Z0-9]+)/);
+                    const noteId = m ? m[1] : state.note.currentNoteId;
+                    const entry = state.note.noteDetailMap && state.note.noteDetailMap[noteId];
+                    const note = entry && (entry.note || entry);
+                    if (note) {
+                        fromVideo(note.video);
+                        fromVideo(note.videoInfo);
+                        fromVideo(note.videoData);
+                    }
+                    if (entry && entry.video) fromVideo(entry.video);
+                }
+            } catch (e) {}
+
+            // B) performance 资源（播放后最可靠）
+            try {
+                const entries = performance.getEntriesByType('resource') || [];
+                for (let i = 0; i < entries.length; i++) {
+                    const n = entries[i].name || '';
+                    if (!n) continue;
+                    if (n.indexOf('xhscdn') >= 0 && (
+                        n.indexOf('/stream/') >= 0 || n.indexOf('.mp4') >= 0
+                        || n.indexOf('video') >= 0 || n.indexOf('sns-video') >= 0
+                    )) {
+                        push(n);
+                    }
+                }
+            } catch (e) {}
+
+            // C) script 文本兜底
+            try {
+                const scripts = document.querySelectorAll('script');
+                for (let i = 0; i < scripts.length; i++) {
+                    const t = scripts[i].textContent || '';
+                    if (t.length < 80) continue;
+                    let m = t.match(/"originVideoKey"\s*:\s*"([^"]+)"/);
+                    if (m && m[1].length > 6) {
+                        push('https://sns-video-bd.xhscdn.com/' + m[1]);
+                        push('https://sns-video-v3.xhscdn.com/' + m[1]);
+                        push('https://sns-video-qc.xhscdn.com/' + m[1]);
+                    }
+                    const masterRe = /"masterUrl"\s*:\s*"(https?:[^"]+)"/g;
+                    let mm;
+                    while ((mm = masterRe.exec(t)) !== null) push(mm[1]);
+                    const streamRe = /(https?:\/\/[^"'\s]*xhscdn\.com[^"'\s]*\/stream[^"'\s]*)/g;
+                    let sm;
+                    while ((sm = streamRe.exec(t)) !== null) push(sm[1]);
+                }
+            } catch (e) {}
+
+            // D) video 标签
+            try {
+                const vs = document.querySelectorAll('video');
+                for (let i = 0; i < vs.length; i++) {
+                    const el = vs[i];
+                    push(el.currentSrc || el.src);
+                    const source = el.querySelector('source');
+                    if (source) push(source.src);
+                }
+            } catch (e) {}
+
+            return JSON.stringify(urls);
+        })()
+        """
+        out: List[str] = []
+        try:
+            result = page.run_js(script)
+            parsed = None
+            if isinstance(result, str):
+                try:
+                    parsed = json.loads(result)
+                except Exception:
+                    if result.startswith("http"):
+                        parsed = [result]
+            elif isinstance(result, list):
+                parsed = result
+            if isinstance(parsed, list):
+                for u in parsed:
+                    nu = self.downloader._normalize_url(str(u))
+                    if nu and nu not in out and not nu.startswith("blob:"):
+                        out.append(nu)
+        except Exception as e:
+            self.log(f"  收集视频候选失败: {e}", "WARNING")
+        return out
+
+    def _extract_single_comment(self, item, existing_contents: set) -> Optional[Dict]:
+        """提取单条评论（文字可短；纯图评论也保留）"""
+        exclude_words = {
+            '关注', '点赞', '收藏', '分享', '复制', '举报', '回复', '查看', '展开',
+            '赞', '条评论', '说点什么', '取消', '发送', '评论', '作者',
+        }
+
+        try:
+            name_el = item.ele(
+                'css:.name, .user-name, .author-name, .nickname, [class*="name"]',
+                timeout=0.1)
             name = (name_el.text if name_el else "").strip()
-            
-            # 获取评论内容
-            content_el = item.ele('css:.content, .comment-content, .note-text', timeout=0.1)
+
+            content_el = item.ele(
+                'css:.content, .comment-content, .note-text, [class*="content"]',
+                timeout=0.1)
             content = (content_el.text if content_el else "").strip()
-            
-            # 过滤无效评论
-            if not content or len(content) <= 3 or len(content) >= 500:
+
+            # 图片（允许纯图评论）
+            comment_images = []
+            try:
+                imgs = item.eles(
+                    'css:img.comment-img, .comment-image img, .comment-pic img, '
+                    '.comment-picture img, [class*="picture"] img, [class*="comment"] img, '
+                    'img[src*="xhscdn"], img[src*="sns-webpic"], img[src*="ci.xiaohongshu"]',
+                    timeout=0.15) or []
+                for img in imgs[:6]:
+                    src = (img.attr('src') or img.attr('data-src') or "").strip()
+                    if not src or len(src) < 30:
+                        continue
+                    low = src.lower()
+                    if any(x in low for x in (
+                            'avatar', 'emoji', 'icon', 'loading', 'head', 'logo')):
+                        continue
+                    if any(x in low for x in (
+                            'xhscdn', 'sns-webpic', 'sns-img', 'ci.xiaohongshu', 'sns-')):
+                        if src.startswith('//'):
+                            src = 'https:' + src
+                        if src.startswith('http://'):
+                            src = 'https://' + src[7:]
+                        comment_images.append(src)
+                comment_images = list(dict.fromkeys(comment_images))
+            except Exception:
+                pass
+
+            # 无效：既无有效文字又无图
+            if content:
+                if content in existing_contents:
+                    return None
+                if content in exclude_words or content.isdigit():
+                    content = ""
+                if len(content) >= 800:
+                    content = content[:800]
+            if not content and not comment_images:
                 return None
-            if content in existing_contents:
-                return None
-            if content in exclude_words or content.isdigit():
-                return None
-            
-            # 获取时间
-            time_el = item.ele('css:.date, .time, .info .date, .comment-time', timeout=0.1)
+
+            time_el = item.ele(
+                'css:.date, .time, .info .date, .comment-time, [class*="time"]',
+                timeout=0.1)
             time_text = (time_el.text if time_el else "").strip()
-            
-            # 获取IP地址/地区
+
             ip_text = ""
             try:
-                # 尝试多种选择器获取IP/地区
                 ip_el = item.ele('css:.ip, .location, .region, .area', timeout=0.1)
                 if ip_el:
                     ip_text = ip_el.text.strip()
-                else:
-                    # 从时间文本中提取地区（如 "3天前 浙江"）
-                    if time_text and " " in time_text:
-                        parts = time_text.split()
-                        if len(parts) >= 2:
-                            # 检查最后一部分是否像地区名
-                            last_part = parts[-1]
-                            if not any(c in last_part for c in ['前', '天', '小时', '分钟', '秒', '月', '年']):
-                                ip_text = last_part
-                                time_text = " ".join(parts[:-1])
+                elif time_text and " " in time_text:
+                    parts = time_text.split()
+                    if len(parts) >= 2:
+                        last_part = parts[-1]
+                        if not any(c in last_part for c in (
+                                '前', '天', '小时', '分钟', '秒', '月', '年', ':')):
+                            ip_text = last_part
+                            time_text = " ".join(parts[:-1])
             except Exception:
                 pass
-            
-            # 获取点赞数
+
             like_count = 0
             try:
-                like_el = item.ele('css:.like-count, .likes, .like-num, .zan-count, [class*="like"] span', timeout=0.1)
+                like_el = item.ele(
+                    'css:.like-count, .likes, .like-num, .zan-count, [class*="like"] span',
+                    timeout=0.1)
                 if like_el:
-                    like_text = like_el.text.strip()
-                    # 解析点赞数（可能是 "1.2万" 或 "1234"）
+                    like_text = (like_el.text or "").strip()
                     if like_text:
                         if '万' in like_text:
                             like_count = int(float(like_text.replace('万', '')) * 10000)
-                        elif like_text.isdigit():
-                            like_count = int(like_text)
+                        else:
+                            digits = re.sub(r'[^0-9]', '', like_text)
+                            if digits:
+                                like_count = int(digits)
             except Exception:
                 pass
-            
-            # 检测评论中是否有图片
-            has_image = False
-            comment_images = []
-            try:
-                imgs = item.eles('css:img.comment-img, .comment-image img, .comment-pic img', timeout=0.1)
-                if imgs:
-                    has_image = True
-                    for img in imgs[:3]:  # 最多3张图
-                        src = img.attr('src') or ""
-                        if src and 'avatar' not in src.lower() and len(src) > 30:
-                            comment_images.append(src)
-            except Exception:
-                pass
-            
+
+            # 纯图评论用占位文案，避免入库后被当成空
+            if not content and comment_images:
+                content = "[图片评论]"
+
             return {
                 'author': name or "匿名用户",
                 'content': content,
                 'time': time_text,
                 'ip': ip_text,
                 'likes': like_count,
-                'has_image': has_image,
-                'images': comment_images
+                'has_image': bool(comment_images),
+                'images': comment_images,
+                'local_images': [],
             }
         except Exception:
             return None
-    
+
     def _extract_comments(self, page) -> List[Dict]:
-        """提取评论内容（基于浏览器自动化分析的实际DOM结构）
-        返回包含评论者、内容、时间、IP、点赞数、图片标记的字典列表
-        """
-        comments = []
-        max_count = self.config.comments_count
-        existing_contents = set()
-        
+        """提取评论文字+配图：状态树优先，DOM 兜底，滚动加载更多。"""
+        comments: List[Dict] = []
+        max_count = max(1, int(self.config.comments_count or 10))
+        existing_contents: set = set()
+
+        def _norm_likes(v) -> int:
+            try:
+                if isinstance(v, (int, float)):
+                    return int(v)
+                s = str(v or '').strip()
+                if not s:
+                    return 0
+                if '万' in s:
+                    return int(float(s.replace('万', '')) * 10000)
+                digits = re.sub(r'[^0-9]', '', s)
+                return int(digits) if digits else 0
+            except Exception:
+                return 0
+
+        def _add(c: dict):
+            if len(comments) >= max_count:
+                return False
+            content = (c.get('content') or '').strip()
+            images = list(c.get('images') or [])[:6]
+            if not content and not images:
+                return True
+            key = content or ('|'.join(images[:2]))
+            if key in existing_contents:
+                return True
+            if content and content in {
+                    '关注', '点赞', '收藏', '分享', '回复', '说点什么', '评论'}:
+                if not images:
+                    return True
+                content = "[图片评论]"
+            existing_contents.add(key)
+            # 时间戳毫秒 → 可读
+            t = c.get('time') or ''
+            if isinstance(t, (int, float)) or (isinstance(t, str) and t.isdigit()):
+                try:
+                    ts = int(t)
+                    if ts > 1e12:
+                        ts //= 1000
+                    t = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M')
+                except Exception:
+                    t = str(t)
+            comments.append({
+                'author': c.get('author') or '匿名用户',
+                'content': content or ('[图片评论]' if images else ''),
+                'time': str(t or ''),
+                'ip': str(c.get('ip') or ''),
+                'likes': _norm_likes(c.get('likes')),
+                'has_image': bool(images),
+                'images': images,
+                'local_images': [],
+            })
+            return len(comments) < max_count
+
+        # 1) 深度扫描 __INITIAL_STATE__
         try:
-            # 获取所有评论项
-            comment_items = page.eles('css:.comment-item, .parent-comment, .comment-inner', timeout=0.5)
-            
-            for item in comment_items:
+            state_comments = page.run_js(r"""
+            return (() => {
+                const out = [];
+                const seen = new Set();
+                const pushPic = (pics, p) => {
+                    if (!p) return;
+                    if (typeof p === 'string') {
+                        let u = p;
+                        if (u.startsWith('//')) u = 'https:' + u;
+                        if (u.length > 30) pics.push(u);
+                        return;
+                    }
+                    const cands = [
+                        p.url, p.urlDefault, p.original, p.picUrl,
+                        p?.infoList?.[0]?.url, p?.infoList?.[0]?.urlDefault,
+                    ];
+                    for (const u0 of cands) {
+                        if (u0 && String(u0).length > 30) {
+                            let u = String(u0);
+                            if (u.startsWith('//')) u = 'https:' + u;
+                            pics.push(u);
+                            break;
+                        }
+                    }
+                };
+                const take = (c) => {
+                    if (!c || typeof c !== 'object') return;
+                    const content = (c.content || c.note || c.commentContent || '').trim();
+                    const pics = [];
+                    for (const arr of [c.pictures, c.images, c.imageList, c.picList, c.pictureList]) {
+                        if (Array.isArray(arr)) arr.forEach(p => pushPic(pics, p));
+                    }
+                    if (!content && pics.length === 0) return;
+                    const key = content + '|' + (pics[0] || '');
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    out.push({
+                        author: c.userInfo?.nickname || c.user?.nickname || c.nickname
+                            || c.userName || '匿名',
+                        content,
+                        time: c.createTime || c.time || c.timestamp || '',
+                        ip: c.ipLocation || c.ip || c.ip_location || '',
+                        likes: c.likeCount || c.likedCount || c.likes || 0,
+                        has_image: pics.length > 0,
+                        images: [...new Set(pics)].slice(0, 6),
+                    });
+                };
+                const walk = (node, depth) => {
+                    if (!node || depth > 8) return;
+                    if (Array.isArray(node)) {
+                        // 评论数组特征：元素含 content/userInfo
+                        if (node.length && node[0] && typeof node[0] === 'object'
+                            && (node[0].content !== undefined || node[0].userInfo
+                                || node[0].pictures || node[0].commentId || node[0].id)) {
+                            node.forEach(take);
+                        } else {
+                            node.forEach(x => walk(x, depth + 1));
+                        }
+                        return;
+                    }
+                    if (typeof node === 'object') {
+                        if (node.content !== undefined && (node.userInfo || node.user || node.pictures)) {
+                            take(node);
+                        }
+                        for (const k of Object.keys(node)) {
+                            // 常见评论挂载点
+                            if (/comment/i.test(k) || k === 'list' || k === 'comments') {
+                                walk(node[k], depth + 1);
+                            } else if (depth < 4) {
+                                walk(node[k], depth + 1);
+                            }
+                        }
+                    }
+                };
+                try {
+                    const state = window.__INITIAL_STATE__ || {};
+                    const m = location.href.match(/explore\/([a-zA-Z0-9]+)/);
+                    const id = m ? m[1] : state.note?.currentNoteId;
+                    const entry = state.note?.noteDetailMap?.[id];
+                    if (entry) walk(entry, 0);
+                    if (state.comment) walk(state.comment, 0);
+                    if (state.note) walk(state.note, 0);
+                } catch (e) {}
+                return out.slice(0, 40);
+            })()
+            """) or []
+            if isinstance(state_comments, list):
+                for c in state_comments:
+                    if isinstance(c, dict) and not _add(c):
+                        break
+        except Exception as e:
+            self.log(f"  状态树评论提取失败: {e}", "DEBUG")
+
+        # 2) DOM + 滚动加载
+        try:
+            for scroll_i in range(4):
                 if len(comments) >= max_count:
                     break
-                
-                comment = self._extract_single_comment(item, existing_contents)
-                if comment:
-                    comments.append(comment)
-                    existing_contents.add(comment['content'])
-            
-            # 如果还没有足够的评论，尝试滚动评论区加载更多
-            if len(comments) < max_count:
+                comment_items = page.eles(
+                    'css:.comment-item, .parent-comment, .comment-inner, '
+                    '.list-container .comment-item, [class*="comment-item"], '
+                    '[class*="CommentItem"]',
+                    timeout=0.5) or []
+                for item in comment_items:
+                    if len(comments) >= max_count:
+                        break
+                    c = self._extract_single_comment(item, existing_contents)
+                    if c:
+                        _add(c)
+
+                # 滚动评论容器加载更多
                 try:
-                    comments_container = page.ele('css:.comments-container, .comments-el, .note-scroller', timeout=0.3)
-                    if comments_container:
-                        comments_container.scroll.to_bottom()
-                        time.sleep(0.3)
-                        
-                        # 再次获取新加载的评论
-                        new_items = page.eles('css:.comment-item, .comment-inner', timeout=0.3)
-                        for item in new_items:
-                            if len(comments) >= max_count:
-                                break
-                            comment = self._extract_single_comment(item, existing_contents)
-                            if comment:
-                                comments.append(comment)
-                                existing_contents.add(comment['content'])
+                    page.run_js("""
+                        (() => {
+                          const sels = ['.comments-container','.comments-el','.note-scroller',
+                            '.list-container','[class*="comments"]','[class*="comment-list"]'];
+                          for (const s of sels) {
+                            const el = document.querySelector(s);
+                            if (el && el.scrollHeight > el.clientHeight + 20) {
+                              el.scrollTop = el.scrollHeight;
+                              return true;
+                            }
+                          }
+                          window.scrollBy(0, 500);
+                          return false;
+                        })()
+                    """)
+                    time.sleep(0.45)
                 except Exception:
-                    pass
-                    
+                    break
+                if scroll_i == 0 and not comment_items and not comments:
+                    time.sleep(0.4)
         except Exception:
             pass
-        
-        return comments
+
+        return comments[:max_count]
     
     def _filter_live_images(self, image_urls: list) -> list:
         """过滤Live图（动态图片），只保留一张静态版本
