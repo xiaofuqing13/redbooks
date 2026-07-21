@@ -244,6 +244,10 @@ class CrawlerConfig:
     max_likes: int = 999999
     note_type_filter: str = "全部"
     date_filter: str = "全部"
+    # 跨运行去重：跳过数据库里已有的笔记（按 note_id），重复采集同一
+    # 主题时不再重复打开详情页/下载媒体。默认关闭——重爬覆盖旧数据
+    # 是既有语义（INSERT OR REPLACE），开启与否交给用户。
+    skip_existing: bool = False
     
     # 导出选项
     export_format: str = "xlsx"
@@ -297,6 +301,7 @@ class CrawlerConfig:
                 'max_likes': self.max_likes,
                 'note_type_filter': self.note_type_filter,
                 'date_filter': self.date_filter,
+                'skip_existing': self.skip_existing,
                 'export_format': self.export_format,
                 'export_to_db': self.export_to_db,
                 # 高级设置（此前缺失，导致整页高级设置退出即丢）
@@ -531,13 +536,29 @@ class DatabaseManager:
             conn.close()
     
     def get_existing_note_ids(self, keyword):
-        """获取已存在的笔记ID（用于增量更新）"""
+        """获取某关键词下已存在的笔记ID（历史遗留：keyword 列多为空串，
+        按关键词过滤基本查不到东西，跨运行去重请用 get_all_note_ids）"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute('SELECT note_id FROM notes WHERE keyword = ?', (keyword,))
         ids = set(row[0] for row in cursor.fetchall())
         conn.close()
         return ids
+
+    def get_all_note_ids(self) -> set:
+        """全库笔记ID集合，供"跳过已爬取"用。
+
+        不按 keyword 过滤：现存数据的 keyword 列大多是空串（主页推荐/
+        博主抓取不写该列），按关键词筛会漏掉几乎全部已有记录。
+        全库 note_id 均为短字符串，十万条量级也只占几 MB，直接整表载入。
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute('SELECT note_id FROM notes WHERE note_id IS NOT NULL')
+            return set(row[0] for row in cursor.fetchall() if row[0])
+        finally:
+            conn.close()
 
 
 class MediaDownloader:
@@ -1593,7 +1614,12 @@ class CrawlerApp:
         self._label(filter_row, "时间", padx=(0, SP_XS))
         self.date_filter_var = tk.StringVar(value="全部")
         self._combo(filter_row, self.date_filter_var, ["全部", "今天", "本周", "本月"],
-                    width=100)
+                    width=100, padx=(0, SP_MD))
+
+        # 跨运行去重开关：默认关。开着时重复采集同一主题，库里已有的
+        # 笔记直接跳过，不再重复打开详情页/下载媒体
+        self.skip_existing_var = tk.BooleanVar(value=False)
+        self._check(filter_row, "跳过已爬取", self.skip_existing_var)
 
         btn_frame = self._row(refine, pady=(SP_XS, 0))
         self.start_btn = ctk.CTkButton(
@@ -3991,10 +4017,19 @@ class CrawlerApp:
         if not note:
             return
         try:
-            from PIL import Image, ImageTk
+            from PIL import Image, ImageTk, ImageFilter, ImageEnhance, ImageDraw
         except ImportError:
             messagebox.showerror("错误", "需要 Pillow：pip install Pillow")
             return
+
+        def _round_img(im, radius=14):
+            """给 PIL 图片加圆角（返回带 alpha 的 RGBA）"""
+            im = im.convert("RGBA")
+            mask = Image.new("L", im.size, 0)
+            ImageDraw.Draw(mask).rounded_rectangle(
+                (0, 0, im.width - 1, im.height - 1), radius=radius, fill=255)
+            im.putalpha(mask)
+            return im
 
         old = getattr(self, '_note_card_win', None)
         if old is not None:
@@ -4101,81 +4136,85 @@ class CrawlerApp:
         body.grid_columnconfigure(1, weight=4, uniform="card")
         body.grid_rowconfigure(0, weight=1)
 
-        # 左：媒体
-        left = ctk.CTkFrame(body, fg_color=C['viewer_bg'], corner_radius=CARD_RADIUS)
+        # 左：媒体（小红书式——图片用自身模糊放大版填充留白，
+        # 而非黑边；悬浮圆形翻页箭头 + 底部圆点指示）
+        left = ctk.CTkFrame(body, fg_color=C['card'], corner_radius=CARD_RADIUS)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, SP_SM))
-        canvas = tk.Canvas(left, bg=C['viewer_bg'], highlightthickness=0)
-        canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(8, 0))
-        nav = ctk.CTkFrame(left, fg_color="transparent", height=44)
-        nav.pack(fill=tk.X, padx=8, pady=(4, 8))
-        # 翻页控件整体居中：‹  页码  ›（此前两个按钮都 side=RIGHT，
-        # 后包的 › 排在 ‹ 左边，方向看起来是反的）
-        nav_inner = ctk.CTkFrame(nav, fg_color="transparent")
-        nav_inner.pack(anchor="center")
+        left.grid_propagate(False)
+        canvas = tk.Canvas(left, bg=C['card'], highlightthickness=0, bd=0)
+        canvas.pack(fill=tk.BOTH, expand=True)
         idx_var = tk.IntVar(value=0)
-        photo_hold = [None]
-        nav_btns = {}
-
-        def _sync_nav(i):
-            """刷新页码文本与按钮禁用态（首页禁‹、末页禁›、单页全禁）"""
-            lbl = nav_btns.get('label')
-            if lbl is not None:
-                if not slots:
-                    lbl.configure(text="0 / 0")
-                else:
-                    kind = slots[i][0]
-                    lbl.configure(text=f"{i + 1} / {len(slots)}"
-                                       + ("  ·  视频" if kind == 'video' else ""))
-            if nav_btns.get('prev') is not None:
-                nav_btns['prev'].configure(
-                    state="normal" if slots and i > 0 else "disabled")
-            if nav_btns.get('next') is not None:
-                nav_btns['next'].configure(
-                    state="normal" if slots and i < len(slots) - 1 else "disabled")
+        photo_hold = []  # 同时持有 bg + fg 的 PhotoImage 引用，防 GC
 
         def show_slot(i=None):
+            canvas.delete("all")
+            photo_hold.clear()
+            cw = canvas.winfo_width()
+            ch = canvas.winfo_height()
+            if cw <= 1:
+                cw = 520
+            if ch <= 1:
+                ch = 640
             if not slots:
-                canvas.delete("all")
-                cw = max(canvas.winfo_width(), 200)
-                ch = max(canvas.winfo_height(), 200)
-                canvas.create_text(cw // 2, ch // 2, text="暂无媒体", fill="#888",
-                                   font=UI_FONT(FS_TITLE))
-                _sync_nav(0)
+                canvas.create_text(cw // 2, ch // 2, text="暂无媒体",
+                                   fill=C['text_faint'], font=UI_FONT(FS_TITLE))
+                _sync_arrows(0)
                 return
             if i is None:
                 i = idx_var.get()
             i = max(0, min(i, len(slots) - 1))
             idx_var.set(i)
             kind, path = slots[i]
-            _sync_nav(i)
-            canvas.delete("all")
-            cw = canvas.winfo_width() or 480
-            ch = canvas.winfo_height() or 520
-            if cw <= 1:
-                cw = 480
-            if ch <= 1:
-                ch = 520
+            src = path if kind == 'image' else (images[0] if images else None)
             try:
-                if kind == 'video':
-                    cover = images[0] if images else None
-                    if cover and os.path.isfile(cover):
-                        img = Image.open(cover)
-                        img.thumbnail((cw - 8, ch - 8), Image.Resampling.LANCZOS)
-                        photo_hold[0] = ImageTk.PhotoImage(img)
-                        canvas.create_image(cw // 2, ch // 2, image=photo_hold[0])
-                    canvas.create_polygon(
-                        cw//2-12, ch//2-18, cw//2-12, ch//2+18, cw//2+18, ch//2,
-                        fill="white", tags="play")
-                    canvas.create_text(cw//2, ch//2+48, text="点击播放视频",
-                                      fill="#ccc", font=UI_FONT(FS_SMALL), tags="play")
+                if src and os.path.isfile(src):
+                    base = Image.open(src).convert("RGB")
+                    bw, bh = base.size
+                    # 背景：放大到覆盖整块画布 → 居中裁剪 → 高斯模糊 + 压暗
+                    scale = max(cw / bw, ch / bh)
+                    bg = base.resize((max(1, int(bw * scale)), max(1, int(bh * scale))),
+                                     Image.Resampling.LANCZOS)
+                    lft = max(0, (bg.width - cw) // 2)
+                    top = max(0, (bg.height - ch) // 2)
+                    bg = bg.crop((lft, top, lft + cw, top + ch))
+                    bg = bg.filter(ImageFilter.GaussianBlur(30))
+                    bg = ImageEnhance.Brightness(bg).enhance(0.78)
+                    bgph = ImageTk.PhotoImage(bg)
+                    photo_hold.append(bgph)
+                    canvas.create_image(cw // 2, ch // 2, image=bgph)
+                    # 前景：等比缩到 fit（留边），加圆角
+                    fg = base.copy()
+                    fg.thumbnail((cw - 48, ch - 64), Image.Resampling.LANCZOS)
+                    fgph = ImageTk.PhotoImage(_round_img(fg, 14))
+                    photo_hold.append(fgph)
+                    canvas.create_image(cw // 2, ch // 2, image=fgph)
                 else:
-                    img = Image.open(path)
-                    img.thumbnail((cw - 8, ch - 8), Image.Resampling.LANCZOS)
-                    photo_hold[0] = ImageTk.PhotoImage(img)
-                    canvas.create_image(cw // 2, ch // 2, image=photo_hold[0])
-            except Exception as e:
-                canvas.create_text(cw // 2, ch // 2, text=f"加载失败\n{e}",
-                                   fill="#aaa", font=UI_FONT(FS_SMALL))
+                    canvas.create_text(cw // 2, ch // 2, text="无封面",
+                                       fill=C['text_faint'], font=UI_FONT(FS_TITLE))
+            except Exception:
+                canvas.create_text(cw // 2, ch // 2, text="图片加载失败",
+                                   fill=C['text_faint'], font=UI_FONT(FS_SMALL))
+            # 视频：中心半透明圆 + 播放三角
+            if kind == 'video':
+                r = 36
+                canvas.create_oval(cw // 2 - r, ch // 2 - r, cw // 2 + r, ch // 2 + r,
+                                   fill="#000000", outline="", stipple="gray50")
+                canvas.create_polygon(cw // 2 - 11, ch // 2 - 17, cw // 2 - 11, ch // 2 + 17,
+                                      cw // 2 + 19, ch // 2, fill="white")
+            # 底部圆点指示（多图才显示；当前点用品牌色拉长）
+            if len(slots) > 1:
+                gap = 15
+                x0 = cw // 2 - (len(slots) - 1) * gap // 2
+                y = ch - 20
+                for k in range(len(slots)):
+                    x = x0 + k * gap
+                    if k == i:
+                        canvas.create_oval(x - 6, y - 3, x + 6, y + 3,
+                                           fill=C['brand'], outline="")
+                    else:
+                        canvas.create_oval(x - 3, y - 3, x + 3, y + 3,
+                                           fill="#FFFFFF", outline="#C9C9C9")
+            _sync_arrows(i)
 
         def prev_slot():
             if slots:
@@ -4195,51 +4234,85 @@ class CrawlerApp:
                 except OSError as ex:
                     messagebox.showerror("错误", f"无法播放: {ex}", parent=win)
 
+        # 悬浮圆形翻页箭头（白底灰字，叠在图片左右边缘）
+        arrow_prev = ctk.CTkButton(
+            left, text="‹", width=40, height=40, corner_radius=20, command=prev_slot,
+            font=UI_FONT(FS_TITLE, bold=True), fg_color="#FFFFFF", hover_color="#F0F0F0",
+            text_color=C['text'], text_color_disabled=C['text_faint'])
+        arrow_next = ctk.CTkButton(
+            left, text="›", width=40, height=40, corner_radius=20, command=next_slot,
+            font=UI_FONT(FS_TITLE, bold=True), fg_color="#FFFFFF", hover_color="#F0F0F0",
+            text_color=C['text'], text_color_disabled=C['text_faint'])
+
+        def _sync_arrows(i):
+            if len(slots) <= 1:
+                arrow_prev.place_forget()
+                arrow_next.place_forget()
+                return
+            arrow_prev.place(relx=0.0, rely=0.5, x=14, anchor="w")
+            arrow_next.place(relx=1.0, rely=0.5, x=-14, anchor="e")
+            arrow_prev.configure(state="normal" if i > 0 else "disabled")
+            arrow_next.configure(state="normal" if i < len(slots) - 1 else "disabled")
+
         canvas.bind("<Button-1>", on_canvas_click)
         canvas.bind("<Configure>", lambda e: show_slot())
-        # ‹ 页码 › 正序居中；按钮状态由 _sync_nav 维护
-        nav_btns['prev'] = ctk.CTkButton(
-            nav_inner, text="‹", width=38, height=30, corner_radius=15,
-            command=prev_slot, font=UI_FONT(FS_TITLE),
-            fg_color=C['viewer_btn'], hover_color=C['viewer_btn_h'],
-            text_color=C['viewer_text'], text_color_disabled='#5A5A5A')
-        nav_btns['prev'].pack(side=tk.LEFT)
-        nav_btns['label'] = ctk.CTkLabel(nav_inner, text="", width=110,
-                                         font=UI_FONT(FS_SMALL),
-                                         text_color=C['viewer_text'])
-        nav_btns['label'].pack(side=tk.LEFT, padx=SP_SM)
-        nav_btns['next'] = ctk.CTkButton(
-            nav_inner, text="›", width=38, height=30, corner_radius=15,
-            command=next_slot, font=UI_FONT(FS_TITLE),
-            fg_color=C['viewer_btn'], hover_color=C['viewer_btn_h'],
-            text_color=C['viewer_text'], text_color_disabled='#5A5A5A')
-        nav_btns['next'].pack(side=tk.LEFT)
         # 键盘操作：←/→ 翻页，Esc 关闭
         win.bind("<Left>", lambda e: prev_slot())
         win.bind("<Right>", lambda e: next_slot())
         win.bind("<Escape>", lambda e: _close_card())
 
-        # 右：信息 + 评论
+        # 右：信息 + 评论。顶部作者条固定，底部互动栏固定，中间评论可滚动
         right = ctk.CTkFrame(body, fg_color=C['card'], corner_radius=CARD_RADIUS,
                              border_width=1, border_color=C['border'])
         right.grid(row=0, column=1, sticky="nsew")
-        scroll = ctk.CTkScrollableFrame(right, fg_color="transparent")
-        scroll.pack(fill=tk.BOTH, expand=True, padx=SP_MD, pady=SP_MD)
         wrap_w = max(320, win_w // 2 - 80)
 
-        author_row = ctk.CTkFrame(scroll, fg_color="transparent")
-        author_row.pack(fill=tk.X, pady=(0, SP_SM))
+        # —— 顶部：作者条（头像 + 昵称 + 关注按钮），下带分隔线 ——
+        author_row = ctk.CTkFrame(right, fg_color="transparent", height=56)
+        author_row.pack(fill=tk.X, padx=SP_MD, pady=(SP_MD, SP_SM))
+        author_row.pack_propagate(False)
+        av_bg0, av_fg0 = (AVATAR_PALETTE[sum(ord(c) for c in (author or '作'))
+                                         % len(AVATAR_PALETTE)])
         ctk.CTkLabel(author_row, text=(author[:1] if author else "作"),
-                     width=36, height=36, corner_radius=18,
-                     fg_color=C['brand_soft'], text_color=C['brand'],
-                     font=UI_FONT(bold=True)).pack(side=tk.LEFT, padx=(0, SP_SM))
-        ctk.CTkLabel(author_row, text=f"@{author}", font=UI_FONT(bold=True),
-                     text_color=C['text'], anchor="w").pack(
-            side=tk.LEFT, fill=tk.X, expand=True)
+                     width=40, height=40, corner_radius=20,
+                     fg_color=av_bg0, text_color=av_fg0,
+                     font=UI_FONT(FS_TITLE, bold=True)).pack(side=tk.LEFT, padx=(0, SP_SM))
+        name_col = ctk.CTkFrame(author_row, fg_color="transparent")
+        name_col.pack(side=tk.LEFT, fill=tk.X, expand=True, anchor="w")
+        ctk.CTkLabel(name_col, text=author, font=UI_FONT(FS_BASE, bold=True),
+                     text_color=C['text'], anchor="w").pack(fill=tk.X)
         meta_bits = " · ".join(x for x in (pub, ipr) if x)
         if meta_bits:
-            ctk.CTkLabel(author_row, text=meta_bits, font=UI_FONT(FS_SMALL - 1),
-                         text_color=C['text_faint']).pack(side=tk.RIGHT)
+            ctk.CTkLabel(name_col, text=meta_bits, font=UI_FONT(FS_SMALL - 1),
+                         text_color=C['text_faint'], anchor="w").pack(fill=tk.X)
+        # 关注按钮：纯视觉对齐小红书（本地数据无法真正关注，点击提示）
+        ctk.CTkButton(author_row, text="关注", width=64, height=30, corner_radius=15,
+                      fg_color=C['brand'], hover_color=C['brand_hover'],
+                      text_color=C['text_on_brand'], font=UI_FONT(FS_SMALL, bold=True),
+                      command=lambda: messagebox.showinfo(
+                          "提示", "本地离线数据，仅供浏览", parent=win)).pack(side=tk.RIGHT)
+        ctk.CTkFrame(right, fg_color=C['border'], height=1).pack(fill=tk.X, padx=SP_MD)
+
+        # —— 底部：互动栏（点赞/收藏/评论 图标+数字），固定不滚动 ——
+        engage = ctk.CTkFrame(right, fg_color=C['card'], height=52)
+        engage.pack(side=tk.BOTTOM, fill=tk.X)
+        engage.pack_propagate(False)
+        ctk.CTkFrame(right, fg_color=C['border'], height=1).pack(side=tk.BOTTOM, fill=tk.X)
+        eng_inner = ctk.CTkFrame(engage, fg_color="transparent")
+        eng_inner.pack(anchor="center", pady=SP_SM)
+        for icon, num, col in (("♥", likes, C['brand']),
+                               ("★", collects, C['warning']),
+                               ("💬", n_comments, C['text_sub'])):
+            cell = ctk.CTkFrame(eng_inner, fg_color="transparent")
+            cell.pack(side=tk.LEFT, padx=SP_MD)
+            ctk.CTkLabel(cell, text=icon, font=UI_FONT(FS_TITLE),
+                         text_color=col).pack(side=tk.LEFT, padx=(0, 4))
+            ctk.CTkLabel(cell, text=self._fmt_count(num), font=UI_FONT(FS_SMALL),
+                         text_color=C['text_sub']).pack(side=tk.LEFT)
+
+        # —— 中间：可滚动内容（正文/标签/操作/评论）——
+        scroll = ctk.CTkScrollableFrame(right, fg_color="transparent")
+        scroll.pack(fill=tk.BOTH, expand=True, padx=SP_MD, pady=(SP_SM, 0))
 
         ctk.CTkLabel(scroll, text=title, font=UI_FONT(FS_TITLE, bold=True),
                      text_color=C['text'], anchor="w", justify="left",
@@ -4253,35 +4326,30 @@ class CrawlerApp:
                          text_color=C['info'], anchor="w", justify="left",
                          wraplength=wrap_w).pack(fill=tk.X, pady=(0, SP_SM))
 
-        stats = ctk.CTkFrame(scroll, fg_color=C['card_alt'], corner_radius=CTRL_RADIUS)
-        stats.pack(fill=tk.X, pady=(0, SP_MD))
-        for txt, col in ((f"❤  {likes}", C['brand']),
-                         (f"⭐  {collects}", C['warning']),
-                         (f"💬  {n_comments}", C['info'])):
-            ctk.CTkLabel(stats, text=txt, font=UI_FONT(bold=True),
-                         text_color=col, padx=14, pady=8).pack(side=tk.LEFT)
-
+        # 操作按钮（本应用工具，非小红书原生；压成一排次要小按钮）
         act = ctk.CTkFrame(scroll, fg_color="transparent")
-        act.pack(fill=tk.X, pady=(0, SP_MD))
-        ctk.CTkButton(act, text="打开原文", width=90, height=30,
-                      command=self._open_note_link,
-                      font=UI_FONT(FS_SMALL)).pack(side=tk.LEFT, padx=(0, SP_XS))
-        ctk.CTkButton(act, text="打开文件夹", width=100, height=30,
-                      fg_color=C['card_alt'], hover_color=C['brand_soft'],
-                      text_color=C['text'], border_width=1, border_color=C['border'],
-                      command=self._open_images_folder,
-                      font=UI_FONT(FS_SMALL)).pack(side=tk.LEFT, padx=(0, SP_XS))
+        act.pack(fill=tk.X, pady=(SP_XS, SP_MD))
+        act_btns = [("打开原文", self._open_note_link, True),
+                    ("打开文件夹", self._open_images_folder, False)]
         if video:
-            ctk.CTkButton(
-                act, text="播放视频", width=90, height=30,
-                fg_color=C['card_alt'], hover_color=C['brand_soft'],
-                text_color=C['text'], border_width=1, border_color=C['border'],
-                command=lambda p=video: os.startfile(p) if os.path.isfile(p) else None,
-                font=UI_FONT(FS_SMALL)).pack(side=tk.LEFT)
+            act_btns.append(("播放视频",
+                             lambda p=video: os.startfile(p) if os.path.isfile(p) else None,
+                             False))
+        for txt, cmd, primary in act_btns:
+            if primary:
+                ctk.CTkButton(act, text=txt, width=88, height=28, corner_radius=14,
+                              command=cmd, font=UI_FONT(FS_SMALL)).pack(
+                    side=tk.LEFT, padx=(0, SP_XS))
+            else:
+                ctk.CTkButton(act, text=txt, width=94, height=28, corner_radius=14,
+                              fg_color=C['card_alt'], hover_color=C['brand_soft'],
+                              text_color=C['text_sub'], border_width=1,
+                              border_color=C['border'], command=cmd,
+                              font=UI_FONT(FS_SMALL)).pack(side=tk.LEFT, padx=(0, SP_XS))
 
-        ctk.CTkLabel(scroll, text=f"共 {len(comments)} 条评论",
-                     font=UI_FONT(FS_BASE, bold=True),
-                     text_color=C['text'], anchor="w").pack(fill=tk.X, pady=(SP_SM, SP_SM))
+        ctk.CTkLabel(scroll, text=f"共 {n_comments} 条评论  ·  已抓取 {len(comments)} 条",
+                     font=UI_FONT(FS_SMALL), text_color=C['text_sub'],
+                     anchor="w").pack(fill=tk.X, pady=(SP_SM, SP_SM))
         ctk.CTkFrame(scroll, fg_color=C['border'], height=1).pack(fill=tk.X, pady=(0, SP_SM))
 
         comment_photos = []
@@ -5193,6 +5261,7 @@ class CrawlerApp:
             self.min_likes_var.set(str(self.config.min_likes))
             self.max_likes_var.set(str(self.config.max_likes))
             self.note_type_var.set(self.config.note_type_filter)
+            self.skip_existing_var.set(self.config.skip_existing)
             
             # 内容选项
             self.get_content_var.set(self.config.get_content)
@@ -5263,6 +5332,7 @@ class CrawlerApp:
         self.config.min_likes = self._safe_int(self.min_likes_var, 0)
         self.config.max_likes = self._safe_int(self.max_likes_var, 999999)
         self.config.note_type_filter = self.note_type_var.get()
+        self.config.skip_existing = self.skip_existing_var.get()
 
         # 内容选项
         self.config.get_content = self.get_content_var.get()
@@ -6018,6 +6088,19 @@ class CrawlerApp:
         # 失败时返回默认顺序
         return list(range(len(page.eles("css:section.note-item", timeout=0.5))))
     
+    def _load_preexisting_ids(self) -> set:
+        """去重开启时载入全库 note_id；关闭或失败返回空集（等价于不去重）。"""
+        if not self.config.skip_existing:
+            return set()
+        try:
+            ids = self.db_mgr.get_all_note_ids()
+            if ids:
+                self.log(f"去重已启用：数据库已有 {len(ids)} 条笔记，遇到重复将跳过", "INFO")
+            return ids
+        except Exception as e:
+            self.log(f"加载去重清单失败，本轮不去重: {e}", "WARNING")
+            return set()
+
     def _standard_crawl(self, page, note_elements, keyword: str, start_time: float) -> Tuple[int, int, int]:
         """标准模式爬取（按DOM顺序，稳定可靠）"""
         success = 0
@@ -6039,6 +6122,11 @@ class CrawlerApp:
         # 达到上限才永久登记进 crawled_urls，避免"点一次失败即永久跳过"少爬
         note_attempts = {}
         MAX_NOTE_RETRY = 2
+
+        # 跨运行去重：候选筛选阶段直接跳过库里已有的 note_id，
+        # 省掉整套"点开详情→等加载→下载媒体"的 ~6 秒/条
+        preexisting_ids = self._load_preexisting_ids()
+        skipped_existing = 0
 
         # 保存页面URL用于恢复：优先使用本轮实际入口（含博主主页等类型）
         base_url = getattr(self, '_current_entry_url', None)
@@ -6133,6 +6221,15 @@ class CrawlerApp:
                     dedup_key = note_id or note_href or f"__pos_{i}"
                     if dedup_key in crawled_urls:
                         continue  # 已爬取过或已放弃
+
+                    # 跨运行去重：库里已有则跳过（仅首次遇到时记日志，
+                    # 之后每轮重扫列表都会再遇到，不能刷屏）
+                    if note_id and note_id in preexisting_ids:
+                        if dedup_key not in note_attempts:
+                            note_attempts[dedup_key] = 0
+                            skipped_existing += 1
+                            self.log(f"  跳过已爬取: {note_id}", "DEBUG")
+                        continue
 
                     # 找到了未爬取的笔记
                     found_note = True
@@ -6279,9 +6376,12 @@ class CrawlerApp:
                 self.log(f"爬取失败: {error_msg}", "ERROR")
                 self._return_to_list_page(page, base_url, "异常后返回列表")
 
-        self.log(f"爬取完成：成功 {success} 个笔记", "SUCCESS")
+        done_msg = f"爬取完成：成功 {success} 个笔记"
+        if skipped_existing:
+            done_msg += f"（去重跳过 {skipped_existing} 条已有笔记）"
+        self.log(done_msg, "SUCCESS")
         return success, images, videos
-    
+
     def _fast_crawl(self, page, note_elements, keyword, start_time):
         """极速模式爬取"""
         from datetime import datetime
@@ -6293,9 +6393,11 @@ class CrawlerApp:
         images_dir = f"images/{folder_name}_{time_str}"
         self.current_crawl_dir = images_dir  # 保存当前爬取目录
         total = len(note_elements)
-        
+
         download_tasks = []
-        
+        preexisting_ids = self._load_preexisting_ids()
+        skipped_existing = 0
+
         for idx in range(total):
             if self.should_stop:
                 break
@@ -6352,6 +6454,13 @@ class CrawlerApp:
                 except:
                     pass
                 
+                # 跨运行去重：从链接提取 note_id，库里已有则整条跳过
+                if preexisting_ids and note_link:
+                    m = re.search(r'/explore/([a-zA-Z0-9]+)', note_link)
+                    if m and m.group(1) in preexisting_ids:
+                        skipped_existing += 1
+                        continue
+
                 # 极速模式仅有列表页字段，无互动数据 ⇒ 点赞/类型筛选不适用
                 # （筛选仅标准模式生效）。note_folder 同时写入 local_dir 供预览精确定位
                 note_folder = f"{images_dir}/note_{idx+1}_{timestamp}"
@@ -6399,7 +6508,9 @@ class CrawlerApp:
                     records[rec_idx]['local_images'] = [abs_path]
         
         self.all_notes_data.extend(records)
-        
+
+        if skipped_existing:
+            self.log(f"去重跳过 {skipped_existing} 条已有笔记", "INFO")
         img_count = sum(1 for r in records if r.get('local_images'))
         return len(records), img_count, 0
     
@@ -7815,6 +7926,17 @@ class CrawlerApp:
             if tail and not any(c.isdigit() for c in tail) and ":" not in tail:
                 return head.strip(), tail.strip()
         return text, ""
+
+    @staticmethod
+    def _fmt_count(n) -> str:
+        """数字按小红书习惯缩写：>=10000 显示 x.x万"""
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            return "0"
+        if n >= 10000:
+            return f"{n / 10000:.1f}".rstrip('0').rstrip('.') + "万"
+        return str(n)
 
     def _parse_num(self, text) -> int:
         """解析数字（支持万/k单位）"""
