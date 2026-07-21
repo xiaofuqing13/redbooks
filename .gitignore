@@ -28,7 +28,14 @@ data/*.csv
 data/*.json
 data/*.db
 data/*.log
+data/*.docx
+data/*.png
 data/charts/
+data/browser_profile/
+
+# 非代码产物（防止误提交可执行文件/宏文件，见 CLAUDE.md 安全提示）
+~$*
+*.xlsm
 
 # 下载的图片（太大了）
 images/

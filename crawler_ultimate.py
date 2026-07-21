@@ -37,8 +37,41 @@ import requests
 from DrissionPage import ChromiumPage, ChromiumOptions
 
 # 版本信息
-VERSION = "5.1"
+VERSION = "5.3"
 APP_NAME = f"小红书爬虫终极版 v{VERSION}"
+
+# 导出文件（xlsx/csv）的列名中译映射。
+# ⚠️ 写盘用中文列头，但所有回读代码按英文键取列 —— 回读任何导出文件
+# 前必须先经 normalize_df_columns() 反向归一化，否则统计恒为 0、
+# 去重永不生效（曾是三处静默失效的根因）。
+EXPORT_COLUMN_MAPPING = {
+    'keyword': '搜索关键词',
+    'title': '标题',
+    'author': '作者',
+    'content': '正文内容',
+    'tags': '标签',
+    'publish_time': '发布时间',
+    'ip_region': 'IP地区',
+    'like_count': '点赞数',
+    'collect_count': '收藏数',
+    'comment_count': '评论数',
+    'comments': '评论内容',
+    'note_type': '笔记类型',
+    'note_link': '笔记链接',
+    'note_id': '笔记ID',
+    'video_url': '视频链接',
+    'image_urls': '图片链接',
+    'image_count': '图片数量',
+    'local_images': '本地图片路径',
+    'local_video': '本地视频路径',
+    'local_dir': '本地目录',
+}
+EXPORT_COLUMN_MAPPING_REV = {v: k for k, v in EXPORT_COLUMN_MAPPING.items()}
+
+
+def normalize_df_columns(df):
+    """把导出文件的中文列头归一化回英文键（英文列头原样保留，幂等）"""
+    return df.rename(columns=EXPORT_COLUMN_MAPPING_REV)
 
 # 可选依赖
 try:
@@ -151,6 +184,12 @@ class CrawlerConfig:
                 'date_filter': self.date_filter,
                 'export_format': self.export_format,
                 'export_to_db': self.export_to_db,
+                # 高级设置（此前缺失，导致整页高级设置退出即丢）
+                'save_cookies': self.save_cookies,
+                'log_to_file': self.log_to_file,
+                'click_delay': list(self.click_delay),
+                'scroll_delay': list(self.scroll_delay),
+                'db_path': self.db_path,
                 'window_x': self.window_x,
                 'window_y': self.window_y,
                 'window_width': self.window_width,
@@ -174,6 +213,9 @@ class CrawlerConfig:
             # 更新配置
             for key, value in config_dict.items():
                 if hasattr(self, key):
+                    # JSON 无元组类型，延迟区间需转回 tuple
+                    if key in ('click_delay', 'scroll_delay') and isinstance(value, list):
+                        value = tuple(value)
                     setattr(self, key, value)
             print(f"[配置] 已加载上次设置 (max_notes={self.max_notes}, keyword={self.keyword})")
             return True
@@ -315,25 +357,35 @@ class DatabaseManager:
                 video_url TEXT,
                 comments TEXT,
                 keyword TEXT,
-                crawl_time TEXT
+                crawl_time TEXT,
+                local_dir TEXT
             )
         ''')
-        
+
+        # 迁移：为已有数据库补上 local_dir 列。
+        # 该列存储笔记媒体目录的相对路径，是图片预览定位的唯一可靠依据；
+        # 缺少它时代码只能靠 note_id 子串扫描 + crawl_time ±30 分钟模糊
+        # 匹配，会把别的笔记的图片显示到当前行上。
+        cursor.execute("PRAGMA table_info(notes)")
+        existing_cols = {row[1] for row in cursor.fetchall()}
+        if 'local_dir' not in existing_cols:
+            cursor.execute('ALTER TABLE notes ADD COLUMN local_dir TEXT')
+
         conn.commit()
         conn.close()
-    
+
     def insert_note(self, note_data):
         """插入笔记"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        
+
         try:
             cursor.execute('''
-                INSERT OR REPLACE INTO notes 
+                INSERT OR REPLACE INTO notes
                 (note_id, title, author, content, tags, publish_time, ip_region,
                  like_count, collect_count, comment_count, note_type, note_link,
-                 image_urls, video_url, comments, keyword, crawl_time)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 image_urls, video_url, comments, keyword, crawl_time, local_dir)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 note_data.get('note_id', ''),
                 note_data.get('title', ''),
@@ -351,11 +403,14 @@ class DatabaseManager:
                 note_data.get('video_url', ''),
                 json.dumps(note_data.get('comments', []), ensure_ascii=False),
                 note_data.get('keyword', ''),
-                datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                note_data.get('local_dir', '')
             ))
             conn.commit()
             return True
         except Exception as e:
+            # 入库失败此前完全静默，导致数据丢失无法察觉
+            print(f"[DB] 写入笔记失败 note_id={note_data.get('note_id','')}: {e}")
             return False
         finally:
             conn.close()
@@ -386,19 +441,25 @@ class MediaDownloader:
         self.timeout = timeout
         self._session = None
         self._stats = {'success': 0, 'failed': 0, 'bytes': 0}
-    
+        # 下载 worker 并发访问 Session 懒加载与统计计数，必须加锁：
+        # 无锁的 += 是读-改-写竞态，统计会偏低；懒加载竞态会丢 Cookie
+        self._lock = threading.Lock()
+
     @property
     def session(self) -> requests.Session:
-        """懒加载Session，复用连接"""
+        """懒加载Session，复用连接（加锁防止并发重复创建）"""
         if self._session is None:
-            self._session = requests.Session()
-            self._session.headers.update({
-                'User-Agent': random.choice(self.USER_AGENTS),
-                'Referer': 'https://www.xiaohongshu.com/',
-                'Accept': 'image/webp,image/apng,image/*,video/*,*/*;q=0.8',
-                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'Origin': 'https://www.xiaohongshu.com',
-            })
+            with self._lock:
+                if self._session is None:
+                    s = requests.Session()
+                    s.headers.update({
+                        'User-Agent': random.choice(self.USER_AGENTS),
+                        'Referer': 'https://www.xiaohongshu.com/',
+                        'Accept': 'image/webp,image/apng,image/*,video/*,*/*;q=0.8',
+                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                        'Origin': 'https://www.xiaohongshu.com',
+                    })
+                    self._session = s
         return self._session
     
     def set_cookies(self, cookies):
@@ -452,23 +513,27 @@ class MediaDownloader:
                             f.write(chunk)
                             total_size += len(chunk)
                 
-                # 检查文件大小
+                # 检查文件大小（过小视为失败，计入统计）
                 if total_size < min_size:
                     os.remove(local_path)
+                    with self._lock:
+                        self._stats['failed'] += 1
                     return None
-                
-                self._stats['success'] += 1
-                self._stats['bytes'] += total_size
+
+                with self._lock:
+                    self._stats['success'] += 1
+                    self._stats['bytes'] += total_size
                 return local_path
-                
+
             except requests.Timeout:
                 if attempt < self.retry_times - 1:
                     time.sleep(0.2 * (attempt + 1))
             except Exception:
                 if attempt < self.retry_times - 1:
                     time.sleep(0.1)
-        
-        self._stats['failed'] += 1
+
+        with self._lock:
+            self._stats['failed'] += 1
         return None
     
     def download_batch(self, tasks: List[Tuple[str, str]], 
@@ -514,11 +579,13 @@ class MediaDownloader:
     
     def get_stats(self) -> Dict[str, int]:
         """获取下载统计"""
-        return self._stats.copy()
-    
+        with self._lock:
+            return self._stats.copy()
+
     def reset_stats(self):
         """重置统计"""
-        self._stats = {'success': 0, 'failed': 0, 'bytes': 0}
+        with self._lock:
+            self._stats = {'success': 0, 'failed': 0, 'bytes': 0}
     
     def close(self):
         """关闭Session"""
@@ -702,11 +769,21 @@ class CrawlerApp:
         # 加载上次的配置
         self.config.load_from_file()
         
-        # 窗口大小固定1000x700，位置根据保存恢复
+        # 恢复上次窗口大小与位置（尺寸此前被保存却从不使用）
         win_x = self.config.window_x if self.config.window_x >= 0 else 100
         win_y = self.config.window_y if self.config.window_y >= 0 else 100
-        
-        self.root.geometry(f"1000x700+{win_x}+{win_y}")
+        win_w = self.config.window_width if self.config.window_width >= 900 else 1100
+        win_h = self.config.window_height if self.config.window_height >= 650 else 720
+        # 防止越界（比如从大屏切换到小屏后恢复）
+        try:
+            win_w = min(win_w, self.root.winfo_screenwidth())
+            win_h = min(win_h, self.root.winfo_screenheight() - 40)
+            win_x = max(0, min(win_x, self.root.winfo_screenwidth() - 200))
+            win_y = max(0, min(win_y, self.root.winfo_screenheight() - 200))
+        except tk.TclError:
+            pass
+
+        self.root.geometry(f"{win_w}x{win_h}+{win_x}+{win_y}")
         
         self.downloader = MediaDownloader()
         self.cookie_mgr = CookieManager(self.config.cookies_file)
@@ -944,8 +1021,9 @@ class CrawlerApp:
         speed_row = ttk.Frame(speed_frame)
         speed_row.pack(fill=tk.X)
         
-        for text, value in [("标准模式", "standard"), ("快速模式", "fast"), ("极速模式", "turbo")]:
-            tk.Radiobutton(speed_row, text=text, variable=self.crawl_mode_var, 
+        # "快速模式"已移除：引擎中 fast 与 standard 完全等价，属误导性死选项
+        for text, value in [("标准模式（完整数据）", "standard"), ("极速模式（仅列表信息）", "turbo")]:
+            tk.Radiobutton(speed_row, text=text, variable=self.crawl_mode_var,
                           value=value, font=('Microsoft YaHei UI', 14),
                           bg='#f0f0f0', activebackground='#f0f0f0').pack(side=tk.LEFT, padx=(0, 20))
         
@@ -1040,6 +1118,17 @@ class CrawlerApp:
                                            text_color="#333333", border_width=1,
                                            border_color="#ddd")
             self.log_text.pack(fill=tk.BOTH, expand=True)
+            # CTkTextbox 也支持 tag 着色（委托给内部 tkinter.Text）；
+            # 此前 CTk 分支日志为单色，SUCCESS/ERROR 无法一眼区分
+            try:
+                self.log_text.tag_config("INFO", foreground="#333333")
+                self.log_text.tag_config("SUCCESS", foreground="#2e7d32")
+                self.log_text.tag_config("WARNING", foreground="#ef6c00")
+                self.log_text.tag_config("ERROR", foreground="#c62828")
+                self.log_text.tag_config("DEBUG", foreground="#6a1b9a")
+                self._ctk_log_tags = True
+            except Exception:
+                self._ctk_log_tags = False
             self.log_text.configure(state="disabled")
         else:
             self.log_text = scrolledtext.ScrolledText(log_frame, height=10, state=tk.DISABLED,
@@ -1089,9 +1178,9 @@ class CrawlerApp:
         self.crawl_batch_combo.pack(side=tk.LEFT, padx=(0, 5))
         self.crawl_batch_combo.bind("<<ComboboxSelected>>", self._on_batch_select)
         
-        ttk.Button(filter_frame, text="刷新", command=self._refresh_crawl_batches, width=5).pack(side=tk.LEFT, padx=2)
-        ttk.Button(filter_frame, text="删除", command=self._delete_batch_folder, width=5).pack(side=tk.LEFT, padx=2)
-        ttk.Button(filter_frame, text="打开", command=self._open_batch_folder, width=5).pack(side=tk.LEFT, padx=2)
+        ttk.Button(filter_frame, text="刷新批次", command=self._refresh_crawl_batches, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(filter_frame, text="删除批次", command=self._delete_batch_folder, width=8).pack(side=tk.LEFT, padx=2)
+        ttk.Button(filter_frame, text="打开目录", command=self._open_batch_folder, width=8).pack(side=tk.LEFT, padx=2)
         
         # 分隔
         ttk.Separator(filter_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=10)
@@ -1134,8 +1223,7 @@ class CrawlerApp:
         self.stats_likes_label = ttk.Label(stats_frame, text="总点赞: 0", foreground="#E91E63", font=('Microsoft YaHei UI', 14))
         self.stats_likes_label.pack(side=tk.LEFT, padx=(0, 15))
         
-        # 导出按钮
-        ttk.Button(stats_frame, text="导出Excel", command=self._quick_export_excel, width=10).pack(side=tk.RIGHT, padx=5)
+        # 复制按钮（"导出Excel"与工具栏第一行重复，已去重）
         ttk.Button(stats_frame, text="复制全部", command=self._copy_all_data, width=8).pack(side=tk.RIGHT, padx=5)
         
         # === 主区域：左边表格，右边详情 ===
@@ -1162,13 +1250,15 @@ class CrawlerApp:
         for col in columns:
             self.result_tree.heading(col, text=col, command=lambda c=col: self._sort_by_column(c))
         
-        self.result_tree.column("序号", width=40, anchor="center")
-        self.result_tree.column("类型", width=50, anchor="center")
-        self.result_tree.column("标题", width=220, anchor="w")
-        self.result_tree.column("作者", width=90, anchor="w")
-        self.result_tree.column("点赞", width=60, anchor="e")
-        self.result_tree.column("收藏", width=60, anchor="e")
-        self.result_tree.column("评论", width=60, anchor="e")
+        # 列宽：14 号字体下 40px 连表头都显示不全；标题列可伸展，
+        # 数字列右对齐固定宽
+        self.result_tree.column("序号", width=56, minwidth=48, anchor="center", stretch=False)
+        self.result_tree.column("类型", width=64, minwidth=56, anchor="center", stretch=False)
+        self.result_tree.column("标题", width=300, minwidth=180, anchor="w", stretch=True)
+        self.result_tree.column("作者", width=110, minwidth=80, anchor="w", stretch=False)
+        self.result_tree.column("点赞", width=76, minwidth=64, anchor="e", stretch=False)
+        self.result_tree.column("收藏", width=76, minwidth=64, anchor="e", stretch=False)
+        self.result_tree.column("评论", width=76, minwidth=64, anchor="e", stretch=False)
         
         # 滚动条
         scrollbar_y = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.result_tree.yview)
@@ -1259,7 +1349,8 @@ class CrawlerApp:
         self.sort_column = None  # 排序列
         self.sort_reverse = False  # 排序方向
         self.filtered_notes = []  # 筛选后的数据
-        
+        self.displayed_notes = []  # 当前表格实际显示的序列（行号→数据的权威映射）
+
         # 绑定事件
         self.result_tree.bind("<<TreeviewSelect>>", self._on_result_select)
         self.result_tree.bind("<Double-Button-1>", self._on_result_double_click)
@@ -1298,8 +1389,15 @@ class CrawlerApp:
                     batches.append(f"{folder} ({count}张)")
         
         self.crawl_batch_combo['values'] = batches
-        if batches:
+        # 保留用户当前选择（若该批次仍存在）；否则回到"全部"。
+        # 注意 combobox.set() 不触发 <<ComboboxSelected>>，需手动联动表格
+        current = self.crawl_batch_var.get()
+        if current in batches:
+            self.crawl_batch_combo.set(current)
+        elif batches:
             self.crawl_batch_combo.current(0)
+            if current and current != "全部":
+                self._on_batch_select()  # 之前选中的批次已被删除，回退到汇总视图
     
     def _on_batch_select(self, event=None):
         """选择爬取批次"""
@@ -1315,9 +1413,16 @@ class CrawlerApp:
         """筛选结果"""
         search_text = self.search_var.get().strip().lower()
         type_filter = self.type_filter_var.get()
-        
-        # 获取数据源
-        if self.data_source_var.get() == "历史数据库":
+
+        # 获取数据源。批次明细模式下也允许筛选（笔记 dict 同样有
+        # title/author 字段）；批次汇总模式（文件夹列表）无可筛字段，
+        # 此前会静默清空表格，现在直接提示
+        if self.current_batch_folder and self.batch_notes_data:
+            source_notes = self.batch_notes_data
+        elif self.batch_notes_data and not self.current_batch_folder:
+            self.log("批次汇总视图不支持筛选，请先选择具体批次", "WARNING")
+            return
+        elif self.data_source_var.get() == "历史数据库":
             source_notes = getattr(self, 'history_notes_data', [])
         else:
             source_notes = self.all_notes_data
@@ -1353,15 +1458,23 @@ class CrawlerApp:
         self.filtered_notes = []
         self._on_data_source_change()
     
-    def _refresh_table_with_notes(self, notes):
-        """用指定数据刷新表格"""
+    def _refresh_table_with_notes(self, notes, count_label=None):
+        """用指定数据刷新表格（全仓唯一的结果表渲染入口）
+
+        所有模式都应经由此方法渲染，以保证列语义、斑马纹、类型着色和
+        统计口径一致。notes 同时会被登记为当前显示序列，供选中/预览按
+        行号反查——排序后必须传入排序结果，否则行号与数据会错位。
+        """
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
-        
+
+        # 登记当前显示序列：行号 → 数据 的唯一依据
+        self.displayed_notes = list(notes)
+
         total_likes = 0
         image_count = 0
         video_count = 0
-        
+
         for i, note in enumerate(notes):
             note_type = "视频" if note.get('note_type') == "视频" else "图文"
             like_count = note.get('like_count', 0) or 0
@@ -1378,25 +1491,31 @@ class CrawlerApp:
                 image_count += 1
             
             try:
-                total_likes += int(like_count) if str(like_count).isdigit() else 0
-            except:
+                total_likes += int(like_count)
+            except (TypeError, ValueError):
                 pass
-            
+
             self.result_tree.insert("", tk.END, values=(
-                i + 1, note_type, 
+                i + 1, note_type,
                 (note.get('title', '') or '')[:28],
                 (note.get('author', '') or '')[:12],
                 like_count, collect_count, comment_count
             ), tags=tags)
-        
+
         # 更新统计
-        self.result_count_label.config(text=f"总计: {len(notes)} 条")
+        self.result_count_label.config(text=count_label or f"总计: {len(notes)} 条")
         self.stats_image_label.config(text=f"图文: {image_count}")
         self.stats_video_label.config(text=f"视频: {video_count}")
         self.stats_likes_label.config(text=f"总点赞: {total_likes:,}")
     
     def _sort_by_column(self, col):
         """点击表头排序"""
+        # 批次视图（汇总/明细）不支持表头排序：其后备列表结构不同，
+        # 排序会打穿视图并使 displayed_notes 与 batch 数据错位
+        if self.current_batch_folder or self.batch_notes_data:
+            self.log("批次视图暂不支持排序", "INFO")
+            return
+
         # 获取当前数据
         if self.filtered_notes:
             notes = self.filtered_notes
@@ -1404,7 +1523,7 @@ class CrawlerApp:
             notes = getattr(self, 'history_notes_data', [])
         else:
             notes = self.all_notes_data
-        
+
         if not notes:
             return
         
@@ -1430,9 +1549,13 @@ class CrawlerApp:
         if key_func:
             try:
                 notes_sorted = sorted(notes, key=key_func, reverse=self.sort_reverse)
-                self._refresh_table_with_notes(notes_sorted)
-            except:
-                pass
+            except (TypeError, ValueError) as e:
+                self.log(f"排序失败: {e}", "WARNING")
+                return
+            # 必须把排序结果写回后备列表：选中/预览/删除都按行号反查，
+            # 否则排序后点任意一行都会取到错位的数据
+            self.filtered_notes = notes_sorted
+            self._refresh_table_with_notes(notes_sorted)
     
     def _show_tree_context_menu(self, event):
         """显示右键菜单"""
@@ -1506,7 +1629,9 @@ class CrawlerApp:
             
             df = pd.DataFrame(data)
             filename = f"导出数据_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            filepath = os.path.join("images", filename)
+            # 数据文件归 data/ 目录；此前误写进 images/（媒体目录）
+            os.makedirs("data", exist_ok=True)
+            filepath = os.path.join("data", filename)
             df.to_excel(filepath, index=False)
             messagebox.showinfo("成功", f"已导出到: {filepath}")
         except Exception as e:
@@ -1538,26 +1663,23 @@ class CrawlerApp:
             self.preview_page -= 1
             self._render_preview_page()
     
+    def _preview_max_page(self) -> int:
+        """预览总页数：视频缩略图占用第一页的一个槽位，必须计入"""
+        total = len(self.preview_image_paths)
+        if self.current_video_path:
+            total += 1
+        return max(1, (total + self.preview_page_size - 1) // self.preview_page_size)
+
     def _next_preview_page(self):
         """下一页预览"""
-        total = len(self.preview_image_paths)
-        max_page = max(1, (total + self.preview_page_size - 1) // self.preview_page_size)
-        if self.preview_page < max_page - 1:
+        if self.preview_page < self._preview_max_page() - 1:
             self.preview_page += 1
             self._render_preview_page()
     
-    def _open_image_viewer(self):
-        """打开图片查看器"""
-        if not self.preview_image_paths:
-            return
-        
-        try:
-            # 打开第一张图片
-            if self.preview_image_paths:
-                os.startfile(self.preview_image_paths[0])
-        except Exception as e:
-            messagebox.showerror("错误", f"打开失败: {e}")
-    
+    # 注：此处原有一个无参版 _open_image_viewer（仅 os.startfile 第一张图），
+    # 与 2600+ 行的完整查看器同名互相覆盖，已删除；统一使用带
+    # start_index 参数的完整实现（默认参数兼容无参调用点）。
+
     def _load_batch_images(self, folder_name):
         """加载指定批次的图片，并从数据库获取笔记详情"""
         import glob
@@ -1715,6 +1837,9 @@ class CrawlerApp:
                 comment_count if comment_count else "-"
             ), tags=tags)
         
+        # 登记显示序列（行位置 → 数据），与表格渲染顺序严格一致
+        self.displayed_notes = list(note_folders)
+
         # 更新统计
         self.result_count_label.config(text=f"共 {len(note_folders)} 个笔记")
         self.stats_image_label.config(text=f"图文: {image_count}")
@@ -1775,6 +1900,7 @@ class CrawlerApp:
             ))
         
         self.batch_notes_data = folders
+        self.displayed_notes = list(folders)
         self.result_count_label.config(text=f"共 {len(folders)} 个爬取批次")
     
     def _delete_batch_folder(self):
@@ -1828,11 +1954,18 @@ class CrawlerApp:
     def _on_data_source_change(self, event=None):
         """切换数据源"""
         source = self.data_source_var.get()
-        
+
         # 清空批次相关数据，避免影响其他视图
         self.batch_notes_data = []
         self.current_batch_folder = None
-        
+        # 批次下拉框必须同步回"全部"：否则它仍显示某个文件夹名，
+        # 而表格已切到数据库内容，_on_result_select 会走错分支
+        try:
+            if self.crawl_batch_var.get() != "全部":
+                self.crawl_batch_var.set("全部")
+        except Exception:
+            pass
+
         if source == "历史数据库":
             self._load_history_data()
         else:
@@ -1952,9 +2085,16 @@ class CrawlerApp:
                 # 尝试找到本地图片文件夹
                 note_id = note.get('note_id', '')
                 folder_path = None
-                
+
+                # 方法0（首选）: 数据库记录的 local_dir，精确无歧义
+                stored_dir = note.get('local_dir') or ''
+                if stored_dir:
+                    abs_stored = os.path.abspath(stored_dir)
+                    if os.path.isdir(abs_stored):
+                        folder_path = abs_stored
+
                 # 方法1: 通过note_id匹配（新格式）
-                if note_id and note_id in note_id_to_folder:
+                if not folder_path and note_id and note_id in note_id_to_folder:
                     folder_path = note_id_to_folder[note_id]
                 
                 # 方法2: 通过crawl_time找批次，再搜索note_id（旧格式）
@@ -1990,43 +2130,29 @@ class CrawlerApp:
                 
                 self.history_notes_data.append(note)
             
-            # 填充表格
-            for i, note in enumerate(self.history_notes_data):
-                note_type = "视频" if note.get('note_type') == "视频" else "图文"
-                self.result_tree.insert("", tk.END, values=(
-                    i + 1,
-                    note_type,
-                    note.get('title', '')[:25],
-                    note.get('author', '')[:10],
-                    note.get('like_count', 0),
-                    note.get('collect_count', 0),
-                    note.get('comment_count', 0)
-                ))
-            
-            self.result_count_label.config(text=f"共 {len(self.history_notes_data)} 条历史记录")
-            
+            # 统一走唯一渲染入口，保证斑马纹/类型着色/统计口径一致
+            # 非批次视图必须清空批次状态（排序/删除守卫依赖此信号）
+            self.batch_notes_data = []
+            self.current_batch_folder = None
+            self.filtered_notes = []
+            self._refresh_table_with_notes(
+                self.history_notes_data,
+                count_label=f"共 {len(self.history_notes_data)} 条历史记录")
+
         except Exception as e:
             messagebox.showerror("错误", f"加载历史数据失败: {e}")
     
     def _show_current_data(self):
         """显示当前爬取的数据"""
-        from datetime import datetime
-        for item in self.result_tree.get_children():
-            self.result_tree.delete(item)
-        
-        for i, note in enumerate(self.all_notes_data):
-            note_type = "视频" if note.get('note_type') == "视频" else "图文"
-            self.result_tree.insert("", tk.END, values=(
-                i + 1,
-                note_type,
-                note.get('title', '')[:25],
-                note.get('author', '')[:8],
-                note.get('like_count', 0),
-                note.get('keyword', '')[:6],
-                datetime.now().strftime("%m-%d %H:%M")
-            ))
-        
-        self.result_count_label.config(text=f"共 {len(self.all_notes_data)} 条记录")
+        # 此前这里把 keyword/时间 塞进"收藏""评论"两列，导致刷新后
+        # 列含义与爬取过程中实时追加的行不一致；现统一走唯一渲染入口
+        # 非批次视图必须清空批次状态，否则排序/删除的批次守卫会误触发
+        self.batch_notes_data = []
+        self.current_batch_folder = None
+        self.filtered_notes = []
+        self._refresh_table_with_notes(
+            self.all_notes_data,
+            count_label=f"共 {len(self.all_notes_data)} 条记录")
     
     def _refresh_results(self):
         """刷新结果"""
@@ -2037,27 +2163,56 @@ class CrawlerApp:
         try:
             if self.data_source_var.get() != "当前爬取":
                 return
-            
+            # 用户在爬取过程中做了排序/筛选（filtered_notes 激活）时，
+            # 不能盲目追加：表格是排序后的序列，末尾插未排序行会让
+            # displayed_notes 与行号错位。此时只更新统计，新笔记待
+            # 重新排序/重置筛选时一并显示。
+            if self.filtered_notes:
+                self._update_result_stats_from_notes(self.all_notes_data)
+                return
+
             note_type = "视频" if note_data.get('note_type') == "视频" else "图文"
             like_count = note_data.get('like_count', 0)
             collect_count = note_data.get('collect_count', 0)
             comment_count = note_data.get('comment_count', 0)
-            
+
+            # 与 _refresh_table_with_notes 保持一致的斑马纹+类型着色
+            row_tags = ('oddrow',) if index % 2 else ('evenrow',)
+            row_tags += ('video',) if note_type == "视频" else ('image',)
+
             self.result_tree.insert("", tk.END, values=(
                 index + 1,
                 note_type,
-                note_data.get('title', '')[:25],
-                note_data.get('author', '')[:10],
+                note_data.get('title', '')[:28],
+                note_data.get('author', '')[:12],
                 like_count,
                 collect_count,
                 comment_count
-            ))
-            
+            ), tags=row_tags)
+
+            # 保持行号→数据映射同步，使爬取过程中即可正确点选
+            self.displayed_notes = list(self.all_notes_data)
+
             count = len(self.result_tree.get_children())
             self.result_count_label.config(text=f"共 {count} 条记录")
+            self._update_result_stats_from_notes(self.all_notes_data)
             self.result_tree.see(self.result_tree.get_children()[-1])
-        except Exception:
-            pass
+        except Exception as e:
+            self.log(f"添加结果行失败: {e}", "WARNING")
+
+    def _update_result_stats_from_notes(self, notes):
+        """按笔记列表刷新统计卡片"""
+        image_count = sum(1 for n in notes if n.get('note_type') != "视频")
+        video_count = sum(1 for n in notes if n.get('note_type') == "视频")
+        total_likes = 0
+        for n in notes:
+            try:
+                total_likes += int(n.get('like_count', 0) or 0)
+            except (TypeError, ValueError):
+                pass
+        self.stats_image_label.config(text=f"图文: {image_count}")
+        self.stats_video_label.config(text=f"视频: {video_count}")
+        self.stats_likes_label.config(text=f"总点赞: {total_likes:,}")
     
     def _on_result_select(self, event):
         """点击表格行显示详情"""
@@ -2069,26 +2224,22 @@ class CrawlerApp:
             item = self.result_tree.item(selected[0])
             values = item['values']
             
-            # 检查是否是批次视图（文件夹模式）
-            data_source = self.data_source_var.get()
+            # 视图判别只看批次状态本身：batch_notes_data / current_batch_folder
+            # 在所有切换点（数据源切换、批次选择、爬取启动）都被一致清理，
+            # 旧版按 data_source 二次猜测的补丁逻辑会误杀合法的批次视图
             batch_notes = getattr(self, 'batch_notes_data', [])
             batch_folder = getattr(self, 'current_batch_folder', None)
             
-            # 检查用户是否明确选择了一个爬取批次（不是"全部"）
-            selected_batch = getattr(self, 'crawl_batch_var', None)
-            batch_selected = selected_batch and selected_batch.get() and selected_batch.get() != "全部"
-            
-            # 只有在没有明确选择批次的情况下，才根据数据源清空批次逻辑
-            if not batch_selected:
-                if data_source != "当前爬取" or (not batch_folder and self.all_notes_data):
-                    batch_notes = []
-                    batch_folder = None
-            
+            # 行位置是行→数据的唯一可靠键：批次明细的"序号"列显示的是
+            # 文件夹编号（可能有空洞），筛选/排序后更与列表位置无关
+            row_pos = self.result_tree.index(selected[0])
+
             if batch_folder and batch_notes:
-                # 批次内的笔记视图
-                idx = int(values[0])
-                for note in batch_notes:
-                    if note.get('idx') == idx:
+                # 批次内的笔记视图（displayed_notes 已含筛选后的顺序）
+                shown = self.displayed_notes if self.displayed_notes else batch_notes
+                for note in ([shown[row_pos]] if 0 <= row_pos < len(shown) else []):
+                    idx = note.get('idx', row_pos + 1)
+                    if True:
                         self.current_selected_note = note
                         
                         # 获取数据库中的详细信息
@@ -2144,8 +2295,8 @@ class CrawlerApp:
                 return
             
             elif batch_notes and not batch_folder:
-                # 全部批次视图
-                index = int(values[0]) - 1
+                # 全部批次视图（行位置直接对应 batch_notes 顺序）
+                index = row_pos
                 if 0 <= index < len(batch_notes):
                     folder = batch_notes[index]
                     self.current_selected_note = {'folder_path': folder['path'], 'keyword': folder['name'].split("_")[0]}
@@ -2180,16 +2331,20 @@ class CrawlerApp:
                     return
             
             # 原有逻辑：数据库或当前爬取
-            index = int(values[0]) - 1
-            
-            # 使用筛选后的数据（如果有）
-            if self.filtered_notes:
-                notes = self.filtered_notes
-            elif self.data_source_var.get() == "历史数据库":
-                notes = getattr(self, 'history_notes_data', [])
-            else:
-                notes = self.all_notes_data
-            
+            index = row_pos
+
+            # displayed_notes 由 _refresh_table_with_notes 在每次渲染时登记，
+            # 是行位置→数据的唯一权威映射（已含排序/筛选结果）；
+            # 其余分支仅作为兜底，防止极早期调用时尚未渲染
+            notes = getattr(self, 'displayed_notes', None)
+            if not notes:
+                if self.filtered_notes:
+                    notes = self.filtered_notes
+                elif self.data_source_var.get() == "历史数据库":
+                    notes = getattr(self, 'history_notes_data', [])
+                else:
+                    notes = self.all_notes_data
+
             if 0 <= index < len(notes):
                 note = notes[index]
                 self.current_selected_note = note
@@ -2207,8 +2362,19 @@ class CrawlerApp:
                 detail += f"发布时间: {note.get('publish_time', '')}\n"
                 if note.get('ip_region'):
                     detail += f"IP地区: {note.get('ip_region', '')}\n"
-                detail += f"标签: {note.get('tags', '')}\n"
-                detail += f"关键词: {note.get('keyword', '')}\n"
+                # tags 在 DB 里是 JSON 字符串，直接显示会带 ["…"] 括号引号
+                tags_val = note.get('tags', '')
+                if isinstance(tags_val, str) and tags_val.startswith('['):
+                    try:
+                        tags_val = json.loads(tags_val)
+                    except (ValueError, TypeError):
+                        pass
+                if isinstance(tags_val, list):
+                    tags_val = '、'.join(str(t) for t in tags_val)
+                if tags_val:
+                    detail += f"标签: {tags_val}\n"
+                if note.get('keyword'):
+                    detail += f"关键词: {note.get('keyword', '')}\n"
                 detail += f"\n--- 内容 ---\n{note.get('content', '')}\n"
                 
                 # 评论 - 醒目显示
@@ -2321,7 +2487,17 @@ class CrawlerApp:
             local_images = []
             batch_dir = note.get('batch_dir', '')
             note_id = note.get('note_id', '')
-            
+
+            # 方法0（首选）: 数据库中记录的 local_dir，精确且无歧义。
+            # 新爬取的数据都有此字段；仅历史遗留数据才会落到下面的模糊回退
+            local_dir = note.get('local_dir', '')
+            if local_dir:
+                abs_dir = os.path.abspath(local_dir)
+                if os.path.isdir(abs_dir):
+                    for ext in ('*.jpg', '*.png', '*.webp'):
+                        local_images.extend(
+                            os.path.abspath(p) for p in glob.glob(os.path.join(abs_dir, ext)))
+
             # 方法1: 使用batch_dir + 序号查找
             idx = None
             try:
@@ -2329,10 +2505,10 @@ class CrawlerApp:
                 if selected:
                     item = self.result_tree.item(selected[0])
                     idx = int(item['values'][0])
-            except:
+            except (ValueError, IndexError, tk.TclError):
                 pass
-            
-            if batch_dir and idx:
+
+            if not local_images and batch_dir and idx:
                 abs_batch = os.path.abspath(batch_dir)
                 pattern = f"{abs_batch}/note_{idx}_*/*.*"
                 local_images = [os.path.abspath(f) for f in glob.glob(pattern) 
@@ -2354,7 +2530,15 @@ class CrawlerApp:
                         break
             
             # 方法3: 根据crawl_time找批次，用序号匹配（旧格式文件夹）
-            if not local_images and os.path.exists("images"):
+            # 门禁：仅当既无 local_dir 记录、又非视频笔记时才允许模糊匹配。
+            # 视频笔记本可能没有任何图片，模糊匹配必然把别的笔记的图
+            # 显示出来（曾是"视频行显示别人拖鞋图"的直接原因）；
+            # 行号 idx 在排序/筛选后与磁盘序号也不再对应
+            # 仅当 local_dir 确实不指向有效目录时才允许模糊回退；
+            # 视频笔记始终禁用模糊（可能本就无图，乱配会张冠李戴）
+            local_dir_valid = bool(local_dir) and os.path.isdir(os.path.abspath(local_dir))
+            allow_fuzzy = (not local_dir_valid) and note.get('note_type') != '视频'
+            if not local_images and allow_fuzzy and os.path.exists("images"):
                 crawl_time_str = note.get('crawl_time', '')
                 if crawl_time_str and idx:
                     try:
@@ -2485,10 +2669,10 @@ class CrawlerApp:
         
         # 获取评论图片数量
         comment_count = len(getattr(self, 'preview_comment_images', []))
-        
+
         # 更新分页标签
         if total > 0 or has_video or comment_count > 0:
-            max_page = max(1, (total + self.preview_page_size - 1) // self.preview_page_size)
+            max_page = self._preview_max_page()
             media_info = f"{total}张图片"
             if has_video:
                 media_info += " + 视频"
@@ -2524,43 +2708,51 @@ class CrawlerApp:
                     pass
             
             # 显示笔记图片
+            # tag 记录的是"全局索引"（start+i），点击命中直接读 tag，
+            # 不再做坐标除法（曾因步长写错导致点 A 开 B）
             for i, img_path in enumerate(page_images):
                 try:
                     img = Image.open(img_path)
                     img.thumbnail((thumb_size, thumb_size))
                     photo = ImageTk.PhotoImage(img)
                     self.preview_images.append(photo)
-                    self.preview_canvas.create_image(x_offset, 10, anchor="nw", image=photo, tags=f"img_{i}")
+                    self.preview_canvas.create_image(
+                        x_offset, 10, anchor="nw", image=photo,
+                        tags=("preview_item", f"img_{start + i}"))
                     x_offset += thumb_size + 10
-                except:
+                except Exception:
                     continue
-            
+
             # 如果是最后一页且有评论图片，显示评论图片（带蓝色边框标记）
             comment_images = getattr(self, 'preview_comment_images', [])
-            total_pages = max(1, (total + self.preview_page_size - 1) // self.preview_page_size)
-            is_last_page = (self.preview_page >= total_pages - 1)
-            
-            if is_last_page and comment_images and x_offset < 700:
+            is_last_page = (self.preview_page >= self._preview_max_page() - 1)
+
+            canvas_w = self.preview_canvas.winfo_width()
+            if canvas_w <= 1:  # 尚未完成布局时的兜底
+                canvas_w = 700
+            if is_last_page and comment_images and x_offset < canvas_w:
                 # 添加分隔线
                 self.preview_canvas.create_line(x_offset + 5, 10, x_offset + 5, thumb_size + 10, fill="#2196F3", width=2)
                 x_offset += 15
-                
+
                 # 显示评论图片（最多显示剩余空间能容纳的数量）
-                remaining_slots = (700 - x_offset) // (thumb_size + 10)
+                remaining_slots = max(0, (canvas_w - x_offset) // (thumb_size + 10))
                 for i, img_path in enumerate(comment_images[:remaining_slots]):
                     try:
                         img = Image.open(img_path)
                         img.thumbnail((thumb_size - 6, thumb_size - 6))
-                        
+
                         # 创建带蓝色边框的图片
                         bordered = Image.new('RGB', (thumb_size, thumb_size), color=(33, 150, 243))  # 蓝色边框
                         bordered.paste(img, (3, 3))
-                        
+
                         photo = ImageTk.PhotoImage(bordered)
                         self.preview_images.append(photo)
-                        self.preview_canvas.create_image(x_offset, 10, anchor="nw", image=photo, tags=f"comment_img_{i}")
+                        self.preview_canvas.create_image(
+                            x_offset, 10, anchor="nw", image=photo,
+                            tags=("preview_item", f"comment_img_{i}"))
                         x_offset += thumb_size + 10
-                    except:
+                    except Exception:
                         continue
             
             # 绑定点击事件
@@ -2574,25 +2766,24 @@ class CrawlerApp:
             self.preview_canvas.create_text(200, 90, text=f"加载预览失败: {e}", fill="#888")
     
     def _on_preview_click(self, event):
-        """点击预览图打开查看器"""
-        if not self.preview_image_paths:
-            return
-        
-        # 计算点击的是哪张图片
-        x = event.x
-        img_index = x // 140
-        if 0 <= img_index < len(self.preview_image_paths):
-            self._open_image_viewer(img_index)
-    
+        """点击预览图（旧绑定入口，统一走 tag 命中检测）"""
+        self._on_preview_click_with_video(event)
+
     def _on_preview_click_with_video(self, event):
-        """点击预览图或视频缩略图"""
-        x = event.x
-        slot_index = x // 140
-        
-        # 如果有视频，第一个位置是视频
-        if self.current_video_path:
-            if slot_index == 0:
-                # 点击了视频缩略图，播放视频
+        """点击预览区：通过 Canvas tag 精确命中被点的元素。
+
+        渲染时每个缩略图都带有全局索引 tag（img_{全局索引} /
+        comment_img_{i} / video_thumb），因此无论分页、有无视频占位、
+        缩略图尺寸如何变化，命中判定始终准确。
+        （旧实现按 x//140 做坐标除法，而实际步长是 250，点 A 开 B。）
+        """
+        hit = self.preview_canvas.find_withtag('current')
+        if not hit:
+            return
+        tags = self.preview_canvas.gettags(hit[0])
+
+        for tag in tags:
+            if tag == 'video_thumb':
                 try:
                     abs_path = os.path.abspath(self.current_video_path)
                     if os.path.exists(abs_path):
@@ -2602,15 +2793,23 @@ class CrawlerApp:
                 except Exception as e:
                     messagebox.showerror("错误", f"无法播放视频: {e}")
                 return
-            else:
-                # 点击了图片，调整索引（减1因为第一个是视频）
-                img_index = slot_index - 1
-                if 0 <= img_index < len(self.preview_image_paths):
-                    self._open_image_viewer(img_index)
-        else:
-            # 没有视频，直接按图片索引处理
-            if 0 <= slot_index < len(self.preview_image_paths):
-                self._open_image_viewer(slot_index)
+            if tag.startswith('comment_img_'):
+                try:
+                    idx = int(tag[len('comment_img_'):])
+                    comment_images = getattr(self, 'preview_comment_images', [])
+                    if 0 <= idx < len(comment_images):
+                        os.startfile(os.path.abspath(comment_images[idx]))
+                except (ValueError, OSError) as e:
+                    self.log(f"打开评论图片失败: {e}", "WARNING")
+                return
+            if tag.startswith('img_'):
+                try:
+                    idx = int(tag[len('img_'):])
+                except ValueError:
+                    continue
+                if 0 <= idx < len(self.preview_image_paths):
+                    self._open_image_viewer(idx)
+                return
     
     def _open_image_viewer(self, start_index=0):
         """打开图片查看器"""
@@ -2897,7 +3096,7 @@ class CrawlerApp:
         """清空当前结果"""
         if self.data_source_var.get() == "当前爬取":
             self.all_notes_data = []
-        
+
         for item in self.result_tree.get_children():
             self.result_tree.delete(item)
         self.result_count_label.config(text="共 0 条记录")
@@ -2906,100 +3105,98 @@ class CrawlerApp:
         self.detail_text.config(state=tk.DISABLED)
         self.preview_canvas.delete("all")
         self.current_selected_note = None
-    
+        # 重置所有后备序列，避免残留映射导致后续点选/删除错位
+        self.displayed_notes = []
+        self.filtered_notes = []
+        self.batch_notes_data = []
+        self.current_batch_folder = None
+
+    def _delete_note_media(self, note):
+        """删除单条笔记的本地媒体目录/文件，优先用 local_dir 精确定位"""
+        import shutil
+        local_dir = note.get('local_dir', '')
+        if local_dir and os.path.isdir(os.path.abspath(local_dir)):
+            try:
+                shutil.rmtree(os.path.abspath(local_dir))
+                return
+            except OSError as e:
+                self.log(f"删除目录失败 {local_dir}: {e}", "WARNING")
+        # 回退：从已知图片路径推断所在文件夹
+        local_images = note.get('local_images', [])
+        if isinstance(local_images, str):
+            local_images = [p.strip() for p in local_images.split('|') if p.strip()]
+        for img_path in local_images:
+            folder = os.path.dirname(img_path) if img_path else ''
+            if folder and os.path.isdir(folder):
+                try:
+                    shutil.rmtree(folder)
+                    return
+                except OSError:
+                    pass
+        local_video = note.get('local_video', '')
+        if local_video and os.path.exists(local_video):
+            try:
+                os.remove(local_video)
+            except OSError:
+                pass
+
     def _delete_selected(self):
-        """删除选中的记录"""
+        """删除选中的记录（数据库行 + 本地媒体）"""
         selected = self.result_tree.selection()
         if not selected:
             messagebox.showinfo("提示", "请先选择要删除的记录")
             return
-        
-        # 确认删除
+
+        # 批次视图下"选中项"是文件夹/批次笔记，不应走 DB 删除逻辑
+        if self.current_batch_folder or (self.batch_notes_data and not self.filtered_notes):
+            messagebox.showinfo("提示", "批次视图请使用上方【删除批次】按钮，或切换到"
+                                        "\"历史数据库/当前爬取\"数据源后再删除单条")
+            return
+
         count = len(selected)
         if not messagebox.askyesno("确认删除", f"确定要删除选中的 {count} 条记录吗？\n\n这将同时删除：\n• 数据库中的记录\n• 对应的本地图片/视频文件"):
             return
-        
-        deleted_count = 0
-        
+
+        # 关键：先按行位置从 displayed_notes 收集目标笔记，再统一删除。
+        # 删行会改变 index()，必须在删任何行之前把目标全部取出，
+        # 且用 displayed_notes（已含排序/筛选后的真实顺序）而非原始列表。
+        notes_map = getattr(self, 'displayed_notes', None) or self.all_notes_data
+        targets = []
         for item_id in selected:
-            try:
-                item = self.result_tree.item(item_id)
-                index = int(item['values'][0]) - 1
-                
-                # 获取笔记数据
-                if self.data_source_var.get() == "历史数据库":
-                    notes = getattr(self, 'history_notes_data', [])
-                else:
-                    notes = self.all_notes_data
-                
-                if 0 <= index < len(notes):
-                    note = notes[index]
-                    
-                    # 1. 从数据库删除
-                    note_id = note.get('note_id', '')
-                    note_link = note.get('note_link', '')
-                    if note_id or note_link:
-                        try:
-                            conn = sqlite3.connect(self.config.db_path)
-                            cursor = conn.cursor()
-                            if note_id:
-                                cursor.execute("DELETE FROM notes WHERE note_id = ?", (note_id,))
-                            elif note_link:
-                                cursor.execute("DELETE FROM notes WHERE note_link = ?", (note_link,))
-                            conn.commit()
-                            conn.close()
-                        except Exception:
-                            pass
-                    
-                    # 2. 删除本地文件
-                    local_images = note.get('local_images', [])
-                    if local_images:
-                        if isinstance(local_images, str):
-                            local_images = local_images.split(' | ')
-                        for img_path in local_images:
-                            if img_path and os.path.exists(img_path):
-                                try:
-                                    # 删除图片所在文件夹
-                                    folder = os.path.dirname(img_path)
-                                    if folder and os.path.exists(folder):
-                                        import shutil
-                                        shutil.rmtree(folder)
-                                        break  # 文件夹已删除，不需要继续
-                                except Exception:
-                                    pass
-                    
-                    # 删除视频文件
-                    local_video = note.get('local_video', '')
-                    if local_video and os.path.exists(local_video):
-                        try:
-                            os.remove(local_video)
-                        except Exception:
-                            pass
-                    
-                    deleted_count += 1
-                
-                # 从表格删除
-                self.result_tree.delete(item_id)
-                
-            except Exception as e:
-                print(f"删除失败: {e}")
-                continue
-        
-        # 更新数据列表
+            pos = self.result_tree.index(item_id)
+            if 0 <= pos < len(notes_map):
+                targets.append(notes_map[pos])
+
+        deleted_count = 0
+        for note in targets:
+            note_id = note.get('note_id', '')
+            note_link = note.get('note_link', '')
+            if note_id or note_link:
+                try:
+                    conn = sqlite3.connect(self.config.db_path)
+                    cursor = conn.cursor()
+                    if note_id:
+                        cursor.execute("DELETE FROM notes WHERE note_id = ?", (note_id,))
+                    elif note_link:
+                        cursor.execute("DELETE FROM notes WHERE note_link = ?", (note_link,))
+                    conn.commit()
+                    conn.close()
+                except Exception as e:
+                    self.log(f"数据库删除失败: {e}", "WARNING")
+            self._delete_note_media(note)
+            deleted_count += 1
+
+        # 从各后备列表中按对象身份移除，再走唯一入口重渲染（保持映射同步）
+        target_ids = {id(n) for n in targets}
+        self.all_notes_data = [n for n in self.all_notes_data if id(n) not in target_ids]
         if self.data_source_var.get() == "历史数据库":
-            self._load_history_data()  # 重新加载
+            # 历史模式重新查库最稳妥（DB 已删，local_dir 也随之失效）
+            self._load_history_data()
         else:
-            # 从当前数据中移除已删除的项
-            remaining_indices = set()
-            for item_id in self.result_tree.get_children():
-                item = self.result_tree.item(item_id)
-                remaining_indices.add(int(item['values'][0]) - 1)
-            self.all_notes_data = [n for i, n in enumerate(self.all_notes_data) if i in remaining_indices]
-        
-        # 更新统计
-        count = len(self.result_tree.get_children())
-        self.result_count_label.config(text=f"共 {count} 条记录")
-        
+            self.filtered_notes = [n for n in self.filtered_notes if id(n) not in target_ids] if self.filtered_notes else []
+            # 筛选/排序视图下删除后应停留在该视图，而不是跳回全量列表
+            self._refresh_table_with_notes(self.filtered_notes or self.all_notes_data)
+
         messagebox.showinfo("完成", f"已删除 {deleted_count} 条记录")
     
     def _export_results(self):
@@ -3115,11 +3312,21 @@ class CrawlerApp:
         
         row1 = ttk.Frame(tools_frame)
         row1.pack(fill=tk.X, pady=5)
-        
-        ttk.Button(row1, text="生成统计图表", command=self._generate_charts, width=16).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(row1, text="生成词云", command=self._generate_wordcloud, width=16).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(row1, text="生成分析报告", command=self._generate_report, width=16).pack(side=tk.LEFT, padx=(0, 10))
-        ttk.Button(row1, text="合并所有数据", command=self._merge_data, width=16).pack(side=tk.LEFT)
+
+        ttk.Button(row1, text="刷新统计", command=self._refresh_dashboard_from_db, width=12).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(row1, text="生成统计图表", command=self._generate_charts, width=14).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(row1, text="生成词云", command=self._generate_wordcloud, width=12).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(row1, text="生成分析报告", command=self._generate_report, width=14).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(row1, text="合并所有数据", command=self._merge_data, width=14).pack(side=tk.LEFT)
+
+        # 依赖缺失提示（可选依赖未装时按钮点了只弹框，先在此显式告知）
+        missing = []
+        if not HAS_MATPLOTLIB: missing.append("matplotlib(图表)")
+        if not HAS_WORDCLOUD: missing.append("wordcloud+jieba(词云)")
+        if not HAS_DOCX: missing.append("python-docx(报告)")
+        if missing:
+            ttk.Label(tools_frame, text="⚠ 未安装：" + "、".join(missing) + "  相关功能不可用",
+                      foreground="#ef6c00").pack(anchor="w", pady=(6, 0))
         
         # === 统计仪表盘 ===
         dashboard_frame = ttk.LabelFrame(parent, text="统计仪表盘", padding="10")
@@ -3171,10 +3378,23 @@ class CrawlerApp:
         
         self.history_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        
-        # 刷新历史
+
+        # 刷新历史 + 用数据库现有数据初始化仪表盘（此前恒为 0）
         self._refresh_history()
-    
+        self._refresh_dashboard_from_db()
+
+    def _refresh_dashboard_from_db(self):
+        """用数据库全部笔记刷新统计仪表盘"""
+        records = self._load_notes_from_db()
+        if not records:
+            return
+        try:
+            df = pd.DataFrame(records)
+            stats = DataAnalyzer.generate_stats(df)
+            self._update_dashboard(stats)
+        except Exception as e:
+            self.log(f"刷新统计失败: {e}", "WARNING")
+
     def _create_settings_page(self, parent):
         """创建设置页面"""
         # === Cookie管理 ===
@@ -3357,9 +3577,12 @@ class CrawlerApp:
                 while True:
                     msg, level = self.log_queue.get_nowait()
                     if HAS_CTK and isinstance(self.log_text, ctk.CTkTextbox):
-                        # CustomTkinter方式
+                        # CustomTkinter方式（支持 tag 时带级别着色）
                         self.log_text.configure(state="normal")
-                        self.log_text.insert(tk.END, msg)
+                        if getattr(self, '_ctk_log_tags', False):
+                            self.log_text.insert(tk.END, msg, level)
+                        else:
+                            self.log_text.insert(tk.END, msg)
                         self.log_text.see(tk.END)
                         self.log_text.configure(state="disabled")
                     else:
@@ -3373,7 +3596,30 @@ class CrawlerApp:
             self.root.after(100, consume)
         self.root.after(100, consume)
     
+    def _safe_after(self, func):
+        """从工作线程安全地把回调派发到主线程。
+
+        窗口关闭/销毁后 root.after 会抛 RuntimeError/TclError
+        （"main thread is not in main loop"）；此处统一吞掉，
+        使"爬取中途关窗"不再刷栈。
+        """
+        try:
+            self.root.after(0, func)
+        except (tk.TclError, RuntimeError):
+            pass
+
     def _update_ui(self, **kwargs):
+        """线程安全的状态更新：非主线程调用时统一派发到主线程执行。
+
+        tkinter 控件只能在主线程操作；爬取线程直接调用本方法曾是
+        偶发 Tcl 错误的隐患，现在统一经 root.after(0, ...) 派发。
+        """
+        if threading.current_thread() is threading.main_thread():
+            self._apply_ui_update(**kwargs)
+        else:
+            self._safe_after(lambda: self._apply_ui_update(**kwargs))
+
+    def _apply_ui_update(self, **kwargs):
         if "status" in kwargs:
             self.status_var.set(kwargs["status"])
         if "notes" in kwargs:
@@ -3429,7 +3675,8 @@ class CrawlerApp:
         self.should_stop = True
         self.log("正在停止...", "WARNING")
         self._update_ui(status="正在停止...")
-        self.root.update()
+        # update_idletasks 只刷新渲染，不重入事件回调（root.update 会）
+        self.root.update_idletasks()
     
     def _restore_gui_settings(self):
         """从配置恢复GUI设置"""
@@ -3462,78 +3709,98 @@ class CrawlerApp:
             # 导出选项
             self.export_format_var.set(self.config.export_format)
             self.export_db_var.set(self.config.export_to_db)
-            
+
+            # 高级设置（配套新增的持久化字段）
+            self.save_cookies_var.set(self.config.save_cookies)
+            self.log_to_file_var.set(self.config.log_to_file)
+            self.click_min_var.set(str(self.config.click_delay[0]))
+            self.click_max_var.set(str(self.config.click_delay[1]))
+            self.scroll_min_var.set(str(self.config.scroll_delay[0]))
+            self.scroll_max_var.set(str(self.config.scroll_delay[1]))
+            self.db_path_var.set(self.config.db_path)
+
+            # 兼容旧配置：fast 模式已并入 standard（引擎从未区分二者）
+            if self.crawl_mode_var.get() == "fast":
+                self.crawl_mode_var.set("standard")
+            # 恢复 crawl_type 后必须手动联动控件状态：
+            # 直接 set() 单选变量不会触发 Radiobutton 的 command
+            self._on_mode_change()
+
             self.log("已恢复上次的设置", "SUCCESS")
         except Exception as e:
             self.log(f"恢复设置失败: {e}", "WARNING")
     
-    def _save_gui_settings(self):
-        """保存GUI设置到配置"""
+    @staticmethod
+    def _safe_int(var, default):
+        """从 tk 变量安全取整数；单个字段非法不影响其它字段"""
         try:
-            # 基础设置
-            self.config.keyword = self.keyword_var.get().strip()
-            self.config.scroll_times = int(self.scroll_var.get() or 10)
-            self.config.max_notes = int(self.max_notes_var.get() or 30)
-            self.config.parallel_downloads = int(self.parallel_var.get() or 10)
-            self.config.crawl_mode = self.crawl_mode_var.get()
-            self.config.crawl_type = self.crawl_type_var.get()
-            self.config.blogger_url = self.blogger_url_var.get().strip()
-            
-            # 筛选条件
-            self.config.min_likes = int(self.min_likes_var.get() or 0)
-            self.config.max_likes = int(self.max_likes_var.get() or 999999)
-            self.config.note_type_filter = self.note_type_var.get()
-            
-            # 内容选项
-            self.config.get_content = self.get_content_var.get()
-            self.config.get_tags = self.get_tags_var.get()
-            self.config.get_publish_time = self.get_time_var.get()
-            self.config.get_interactions = self.get_interactions_var.get()
-            self.config.download_images = self.download_images_var.get()
-            self.config.get_all_images = self.get_all_images_var.get()
-            self.config.download_videos = self.download_videos_var.get()
-            self.config.get_comments = self.get_comments_var.get()
-            self.config.comments_count = int(self.comments_count_var.get() or 10)
-            
-            # 导出选项
-            self.config.export_format = self.export_format_var.get()
-            self.config.export_to_db = self.export_db_var.get()
-        except Exception:
-            pass
-    
-    def _get_config(self):
-        """获取配置"""
+            return int(str(var.get()).strip() or default)
+        except (ValueError, tk.TclError):
+            return default
+
+    @staticmethod
+    def _safe_float(var, default):
+        try:
+            return float(str(var.get()).strip() or default)
+        except (ValueError, tk.TclError):
+            return default
+
+    def _save_gui_settings(self):
+        """保存GUI设置到配置。
+
+        每个字段独立安全解析：此前整体包在 except:pass 里，
+        任何一个输入框内容非法都会导致全部设置静默丢失。
+        """
         self.config.keyword = self.keyword_var.get().strip()
+        self.config.scroll_times = self._safe_int(self.scroll_var, 10)
+        self.config.max_notes = self._safe_int(self.max_notes_var, 30)
+        self.config.parallel_downloads = self._safe_int(self.parallel_var, 10)
+        self.config.crawl_mode = self.crawl_mode_var.get()
         self.config.crawl_type = self.crawl_type_var.get()
         self.config.blogger_url = self.blogger_url_var.get().strip()
-        self.config.scroll_times = int(self.scroll_var.get())
-        self.config.max_notes = int(self.max_notes_var.get())
-        self.config.parallel_downloads = int(self.parallel_var.get())
-        self.config.crawl_mode = self.crawl_mode_var.get()
-        
-        self.config.download_images = self.download_images_var.get()
-        self.config.download_videos = self.download_videos_var.get()
-        self.config.get_all_images = self.get_all_images_var.get()
+
+        # 筛选条件
+        self.config.min_likes = self._safe_int(self.min_likes_var, 0)
+        self.config.max_likes = self._safe_int(self.max_likes_var, 999999)
+        self.config.note_type_filter = self.note_type_var.get()
+
+        # 内容选项
         self.config.get_content = self.get_content_var.get()
         self.config.get_tags = self.get_tags_var.get()
         self.config.get_publish_time = self.get_time_var.get()
-        self.config.get_comments = self.get_comments_var.get()
-        self.config.comments_count = int(self.comments_count_var.get())
         self.config.get_interactions = self.get_interactions_var.get()
-        
-        self.config.min_likes = int(self.min_likes_var.get() or 0)
-        self.config.max_likes = int(self.max_likes_var.get() or 999999)
-        self.config.note_type_filter = self.note_type_var.get()
-        
+        self.config.download_images = self.download_images_var.get()
+        self.config.get_all_images = self.get_all_images_var.get()
+        self.config.download_videos = self.download_videos_var.get()
+        self.config.get_comments = self.get_comments_var.get()
+        self.config.comments_count = self._safe_int(self.comments_count_var, 20)
+
+        # 导出选项
         self.config.export_format = self.export_format_var.get()
         self.config.export_to_db = self.export_db_var.get()
+
+        # 高级设置（此前从不持久化，整页设置退出即丢）
         self.config.save_cookies = self.save_cookies_var.get()
         self.config.log_to_file = self.log_to_file_var.get()
-        
-        self.config.click_delay = (float(self.click_min_var.get()), float(self.click_max_var.get()))
-        self.config.scroll_delay = (float(self.scroll_min_var.get()), float(self.scroll_max_var.get()))
-        
+        self.config.click_delay = (self._safe_float(self.click_min_var, 0.2),
+                                   self._safe_float(self.click_max_var, 0.4))
+        self.config.scroll_delay = (self._safe_float(self.scroll_min_var, 0.3),
+                                    self._safe_float(self.scroll_max_var, 0.5))
+        db_path = self.db_path_var.get().strip()
+        if db_path:
+            self.config.db_path = db_path
+    
+    def _get_config(self):
+        """爬取启动前收集配置。
+
+        与 _save_gui_settings 曾是两份 90% 重复、又各有遗漏的映射
+        （新增设置项经常只改其一导致半失效），现在合并为单一来源。
+        """
+        self._save_gui_settings()
         self.downloader.max_workers = self.config.parallel_downloads
+        # 每次爬取启动即持久化：此前配置只在正常点 X 关闭时保存，
+        # 崩溃/强杀会丢失全部设置
+        self.config.save_to_file()
     
     def _run_crawl(self):
         self.is_running = True
@@ -3557,10 +3824,12 @@ class CrawlerApp:
         self.detail_text.delete(1.0, tk.END)
         self.detail_text.config(state=tk.DISABLED)
         
-        # 清空批次数据
+        # 清空批次数据与显示序列
         self.batch_notes_data = []
         self.current_batch_folder = None
-        
+        self.displayed_notes = []
+        self.filtered_notes = []
+
         # 确保数据源是"当前爬取"
         self.data_source_var.set("当前爬取")
         
@@ -3570,6 +3839,17 @@ class CrawlerApp:
         thread = threading.Thread(target=self._crawl_thread, daemon=True)
         thread.start()
     
+    @staticmethod
+    def _build_search_url(keyword: str) -> str:
+        """构造搜索页 URL。
+
+        注意：这里是历史遗留的双重百分号编码（quote 两次，gb2312 一步对
+        纯 ASCII 实为空操作）。线上搜索对此编码可正常返回结果，
+        未经实测前请勿"顺手修正"为单次编码。
+        """
+        keyword_code = quote(quote(keyword.encode('utf-8')).encode('gb2312'))
+        return f'https://www.xiaohongshu.com/search_result?keyword={keyword_code}&source=web_search_result_notes'
+
     def _crawl_thread(self):
         """爬取主线程（优化版，增强错误恢复）"""
         start_time = time.time()
@@ -3582,10 +3862,15 @@ class CrawlerApp:
         
         try:
             # 处理多关键词（空关键词表示爬取主页）
-            keywords = [k.strip() for k in self.config.keyword.split(',') if k.strip()]
-            if not keywords:
-                keywords = [""]  # 空字符串表示主页
-            
+            # 仅关键词搜索才按逗号分多词循环；博主主页/热门榜单是单一入口，
+            # 否则会用残留在关键词框里的旧值把同一页面重复爬多趟
+            if self.config.crawl_type in ("hot", "blogger"):
+                keywords = [""]
+            else:
+                keywords = [k.strip() for k in self.config.keyword.split(',') if k.strip()]
+                if not keywords:
+                    keywords = [""]  # 空字符串表示主页
+
             for kw_idx, keyword in enumerate(keywords):
                 if self.should_stop:
                     self.log("用户停止爬取", "WARNING")
@@ -3601,38 +3886,72 @@ class CrawlerApp:
                 # 复用浏览器实例（保持登录状态）
                 if page is None:
                     if self.browser_page is not None:
-                        # 复用已有的浏览器
+                        # 复用已有的浏览器；若实例已死（被手动关闭/崩溃）则自动重建
                         page = self.browser_page
                         self.log("复用已打开的浏览器", "INFO")
-                        
-                        # 检查登录状态
-                        page.get('https://www.xiaohongshu.com')
-                        time.sleep(1.5)
-                        if not self._check_login(page):
-                            self.log("需要重新登录", "WARNING")
-                            self._wait_for_login(page)
-                    else:
-                        # 首次启动浏览器
+                        try:
+                            page.get('https://www.xiaohongshu.com')
+                            time.sleep(1.5)
+                        except Exception as e:
+                            self.log(f"浏览器实例已失效，重新启动 ({e})", "WARNING")
+                            try:
+                                page.quit()
+                            except Exception:
+                                pass
+                            self.browser_page = None
+                            page = None
+                        else:
+                            risk = self._check_risk_page(page)
+                            if risk:
+                                self.log(f"访问被小红书拦截：{risk}", "ERROR")
+                                self.log("请更换网络环境（如切换 IP/关闭代理）后重试", "ERROR")
+                                self.should_stop = True
+                                break
+                            if not self._check_login(page):
+                                self.log("需要重新登录", "WARNING")
+                                self._wait_for_login(page)
+                                if self.should_stop:
+                                    break
+                            # 复用分支也必须同步 Cookie：上一轮结束时
+                            # downloader.close() 已丢弃 Session 及其 Cookie
+                            self._sync_browser_cookies(page)
+
+                    if page is None:
+                        # 首次启动浏览器（或复用失败后重建）
                         try:
                             user_data_dir = os.path.abspath("data/browser_profile")
                             os.makedirs(user_data_dir, exist_ok=True)
-                            
+
                             co = ChromiumOptions()
                             co.set_user_data_path(user_data_dir)
                             co.set_argument('--no-first-run')
                             co.set_argument('--no-default-browser-check')
-                            
+
                             page = ChromiumPage(co)
                             self.browser_page = page  # 保存实例以便复用
                             self.log("浏览器启动成功", "SUCCESS")
                         except Exception as e:
                             self.log(f"浏览器启动失败: {e}", "ERROR")
                             return
-                        
+
                         # 访问小红书并检查登录状态
                         page.get('https://www.xiaohongshu.com')
                         time.sleep(2)
-                        
+
+                        # 若存在已保存的 Cookie 且当前未登录，先尝试注入恢复会话
+                        if not self._check_login(page) and self.cookie_mgr.exists():
+                            self.log("尝试使用已保存的 Cookie 恢复登录...", "INFO")
+                            if self.cookie_mgr.load(page):
+                                page.get('https://www.xiaohongshu.com')
+                                time.sleep(1.5)
+
+                        risk = self._check_risk_page(page)
+                        if risk:
+                            # 风控/IP 拦截：等待登录也没用，直接明确告知并停止
+                            self.log(f"访问被小红书拦截：{risk}", "ERROR")
+                            self.log("请更换网络环境（如切换 IP/关闭代理）后重试", "ERROR")
+                            self.should_stop = True
+                            break
                         if self._check_login(page):
                             self.log("登录状态有效", "SUCCESS")
                             # 获取Cookie传递给下载器
@@ -3640,6 +3959,8 @@ class CrawlerApp:
                         else:
                             self.log("需要登录", "WARNING")
                             self._wait_for_login(page)
+                            if self.should_stop:
+                                break
                             # 登录后获取Cookie
                             self._sync_browser_cookies(page)
                 
@@ -3647,10 +3968,20 @@ class CrawlerApp:
                     break
                 
                 try:
-                    # 访问页面（空关键词=主页，有关键词=搜索页）
-                    if keyword:
-                        keyword_code = quote(quote(keyword.encode('utf-8')).encode('gb2312'))
-                        target_url = f'https://www.xiaohongshu.com/search_result?keyword={keyword_code}&source=web_search_result_notes'
+                    # 按爬取类型决定入口页面（此前引擎忽略 crawl_type，
+                    # 博主主页/热门榜单只是摆设，现在真正接线）
+                    crawl_type = self.config.crawl_type
+                    if crawl_type == "blogger" and self.config.blogger_url:
+                        target_url = self.config.blogger_url.strip()
+                        self.log(f"访问博主主页...", "INFO")
+                        self._update_ui(status="爬取博主主页")
+                    elif crawl_type == "hot":
+                        # 热门榜单 = 主页推荐流，忽略关键词框内容
+                        target_url = 'https://www.xiaohongshu.com/explore'
+                        self.log(f"访问主页推荐...", "INFO")
+                        self._update_ui(status="爬取主页")
+                    elif keyword:
+                        target_url = self._build_search_url(keyword)
                         self.log(f"访问搜索页面...", "INFO")
                         self._update_ui(status=f"搜索: {keyword}")
                     else:
@@ -3658,9 +3989,18 @@ class CrawlerApp:
                         self.log(f"访问主页推荐...", "INFO")
                         self._update_ui(status="爬取主页")
                     
+                    self._current_entry_url = target_url  # 供 _standard_crawl 恢复页面用
                     page.get(target_url)
                     time.sleep(1.5)
-                    
+
+                    # 导航后也可能才触发风控（如 IP 风险），先明确判定再谈登录
+                    risk = self._check_risk_page(page)
+                    if risk:
+                        self.log(f"访问被小红书拦截：{risk}", "ERROR")
+                        self.log("请更换网络环境（如切换 IP/关闭代理）后重试", "ERROR")
+                        self.should_stop = True
+                        break
+
                     # 再次检查登录状态（搜索页可能弹出登录框）
                     if not self._check_login(page):
                         self.log("搜索页需要登录", "WARNING")
@@ -3779,7 +4119,7 @@ class CrawlerApp:
                     # 更新仪表盘
                     df = pd.DataFrame(self.all_notes_data)
                     stats = DataAnalyzer.generate_stats(df)
-                    self.root.after(0, lambda s=stats: self._update_dashboard(s))
+                    self._safe_after(lambda s=stats: self._update_dashboard(s))
                 except Exception as e:
                     self.log(f"保存数据失败: {e}", "ERROR")
             
@@ -3788,7 +4128,7 @@ class CrawlerApp:
                 try:
                     if self.cookie_mgr.save(page):
                         self.log("Cookie已保存，下次可自动登录", "SUCCESS")
-                        self.root.after(0, self._check_cookie_status)
+                        self._safe_after(self._check_cookie_status)
                 except Exception:
                     pass
             
@@ -3810,7 +4150,7 @@ class CrawlerApp:
                 self.log(f"下载统计: 成功 {dl_stats['success']}, 失败 {dl_stats['failed']}, 总计 {mb:.1f}MB", "INFO")
             
             self.log(f"爬取{status}！笔记: {total_notes}, 图片: {total_images}, 视频: {total_videos}", "SUCCESS")
-            self.root.after(0, self._refresh_history)
+            self._safe_after(self._refresh_history)
             
         except InterruptedError:
             self.log("爬取已取消", "WARNING")
@@ -3827,8 +4167,8 @@ class CrawlerApp:
             self.downloader.reset_stats()
             
             self.is_running = False
-            self.root.after(0, lambda: self.start_btn.configure(state=tk.NORMAL))
-            self.root.after(0, lambda: self.stop_btn.configure(state=tk.DISABLED))
+            self._safe_after(lambda: self.start_btn.configure(state=tk.NORMAL))
+            self._safe_after(lambda: self.stop_btn.configure(state=tk.DISABLED))
     
     def _sync_browser_cookies(self, page):
         """将浏览器Cookie同步到下载器"""
@@ -3840,12 +4180,40 @@ class CrawlerApp:
         except Exception as e:
             self.log(f"  同步Cookie失败: {e}", "WARNING")
     
+    def _check_risk_page(self, page) -> str:
+        """检测风控/错误页，返回可读原因（无则返回空串）。
+
+        典型：IP 风险时服务器 302 到 website-login/error?error_code=300012
+        &error_msg=IP存在风险…。此前这类页面被当成"未登录"，用户会
+        永远卡在登录框，得不到真实原因。
+        """
+        try:
+            url = page.url or ""
+        except Exception:
+            return ""
+        # 仅匹配明确的登录错误页，避免误伤恰好带 error_code 参数的正常 URL
+        if 'website-login/error' in url:
+            from urllib.parse import urlparse, parse_qs, unquote
+            try:
+                qs = parse_qs(urlparse(url).query)
+                msg = unquote(qs.get('error_msg', [''])[0])
+                code = qs.get('error_code', [''])[0]
+                return f"{msg}（error_code={code}）" if msg else f"访问被拦截（error_code={code}）"
+            except Exception:
+                return "访问被拦截（登录错误页）"
+        return ""
+
     def _check_login(self, page) -> bool:
         """检查是否已登录（优先检测登录弹窗）"""
         try:
+            # ===== 第0优先级：风控/错误页 =====
+            # 命中则明确不算登录，由调用方据此给出可读提示而非死等登录
+            if self._check_risk_page(page):
+                return False
+
             # ===== 第一优先级：检查是否有登录弹窗（未登录标志）=====
             # 登录弹窗存在时，底层页面元素仍可能存在，所以必须先检查弹窗
-            
+
             # 检查二维码登录弹窗
             qrcode = page.ele('xpath://img[contains(@src, "qrcode")]', timeout=0.3)
             if qrcode:
@@ -3926,8 +4294,13 @@ class CrawlerApp:
                 cancelled[0] = True
                 self.should_stop = True
             login_event.set()
-        
-        self.root.after(0, show_dialog)
+
+        try:
+            self.root.after(0, show_dialog)
+        except (tk.TclError, RuntimeError):
+            # 窗口已关闭，无法弹登录框，视为取消
+            self.should_stop = True
+            return
         login_event.wait()
         
         if cancelled[0]:
@@ -3939,7 +4312,7 @@ class CrawlerApp:
                 time.sleep(1)  # 等待Cookie完全写入
                 if self.cookie_mgr.save(page):
                     self.log("Cookie已保存，下次可自动登录", "SUCCESS")
-                    self.root.after(0, self._check_cookie_status)
+                    self._safe_after(self._check_cookie_status)
             except Exception as e:
                 self.log(f"Cookie保存失败: {e}", "WARNING")
     
@@ -4021,13 +4394,18 @@ class CrawlerApp:
         
         # 已爬取的笔记URL去重
         crawled_urls = set()
-        
-        # 保存页面URL用于恢复
-        if keyword:
-            keyword_code = quote(quote(keyword.encode('utf-8')).encode('gb2312'))
-            base_url = f'https://www.xiaohongshu.com/search_result?keyword={keyword_code}&source=web_search_result_notes'
-        else:
-            base_url = 'https://www.xiaohongshu.com/explore'
+        # 每条笔记的尝试次数：允许瞬时失败（弹窗未加载/网络抖动）重试，
+        # 达到上限才永久登记进 crawled_urls，避免"点一次失败即永久跳过"少爬
+        note_attempts = {}
+        MAX_NOTE_RETRY = 2
+
+        # 保存页面URL用于恢复：优先使用本轮实际入口（含博主主页等类型）
+        base_url = getattr(self, '_current_entry_url', None)
+        if not base_url:
+            if keyword:
+                base_url = self._build_search_url(keyword)
+            else:
+                base_url = 'https://www.xiaohongshu.com/explore'
         
         # 按顺序爬取（每次从头遍历找未爬取的笔记，更稳定）
         target_notes = self.config.max_notes
@@ -4110,11 +4488,16 @@ class CrawlerApp:
                     else:
                         note_id = note_href
                     
-                    if note_id in crawled_urls:
-                        continue  # 已爬取过
-                    
+                    # 去重键：note_id 优先，退回 href，再退回位置，确保
+                    # 空 note_id 的卡片也能被登记（否则会重复处理）
+                    dedup_key = note_id or note_href or f"__pos_{i}"
+                    if dedup_key in crawled_urls:
+                        continue  # 已爬取过或已放弃
+
                     # 找到了未爬取的笔记
                     found_note = True
+                    note_attempts[dedup_key] = note_attempts.get(dedup_key, 0) + 1
+                    give_up = note_attempts[dedup_key] >= MAX_NOTE_RETRY
                     
                     # 获取卡片标题
                     try:
@@ -4168,7 +4551,7 @@ class CrawlerApp:
                         unavailable = page.ele('xpath://div[contains(text(), "暂时无法浏览")]', timeout=0.2)
                         if unavailable:
                             self.log("笔记无法浏览，跳过", "WARNING")
-                            crawled_urls.add(note_id)
+                            crawled_urls.add(dedup_key)  # 永久不可访问，不重试
                             page.run_js("history.back()")
                             time.sleep(0.3)
                             break  # 退出内层循环，继续外层循环
@@ -4188,25 +4571,40 @@ class CrawlerApp:
                     # 提取数据
                     time.sleep(0.5)  # 增加等待时间确保图片加载
                     note_data = self._extract_full_note(page, success, images_dir, timestamp, keyword)
-                    crawled_urls.add(note_id)
-                    
+
+                    # 应用主页面"筛选条件"（此前这些选项从未生效）
+                    filtered_out = False
+                    if note_data and not self._note_passes_filter(note_data):
+                        self.log(f"  不满足筛选条件，跳过: {note_data.get('title','')[:20]}", "INFO")
+                        note_data = None
+                        filtered_out = True  # 主动跳过，不计入连续失败
+
                     if note_data and note_data.get('title'):
+                        crawled_urls.add(dedup_key)  # 成功，永久登记
                         self.all_notes_data.append(note_data)
                         success += 1
                         images += note_data.get('image_count', 0)
                         videos += 1 if note_data.get('video_url') else 0
                         consecutive_fails = 0
-                        
-                        self.root.after(0, lambda d=note_data, n=success: self._add_result_to_table(d, n-1))
-                        
+
+                        self._safe_after(lambda d=note_data, n=success: self._add_result_to_table(d, n-1))
+
                         if self.config.export_to_db:
                             self.db_mgr.insert_note(note_data)
-                        
+
                         title = note_data.get('title', '')[:25]
                         likes = note_data.get('like_count', 0)
                         self.log(f"[{success}] {title}... ❤️{likes}", "SUCCESS")
+                    elif filtered_out:
+                        crawled_urls.add(dedup_key)  # 主动跳过，不重试
                     else:
+                        # 提取失败：达到重试上限才永久登记，否则留待下一轮重试
                         consecutive_fails += 1
+                        if give_up:
+                            crawled_urls.add(dedup_key)
+                            self.log(f"  提取失败已达重试上限，跳过", "WARNING")
+                        else:
+                            self.log(f"  提取失败，稍后重试", "DEBUG")
                     
                     # 返回列表页
                     try:
@@ -4323,6 +4721,9 @@ class CrawlerApp:
                 except:
                     pass
                 
+                # 极速模式仅有列表页字段，无互动数据 ⇒ 点赞/类型筛选不适用
+                # （筛选仅标准模式生效）。note_folder 同时写入 local_dir 供预览精确定位
+                note_folder = f"{images_dir}/note_{idx+1}_{timestamp}"
                 record = {
                     'title': title[:100],
                     'author': author or "未知",
@@ -4332,14 +4733,14 @@ class CrawlerApp:
                     'image_urls': [img_url] if img_url else [],
                     'image_count': 1 if img_url else 0,
                     'batch_dir': images_dir,  # 保存批次目录
+                    'local_dir': note_folder,
                 }
-                
+
                 if img_url and self.config.download_images:
                     # 过滤表情包
                     if not self._is_emoji_image(img_url):
-                        folder = f"{images_dir}/note_{idx+1}_{timestamp}"
                         ext = '.webp' if '.webp' in img_url else '.jpg'
-                        path = f"{folder}/img_1{ext}"
+                        path = f"{note_folder}/img_1{ext}"
                         download_tasks.append((img_url, path, len(records)))
                 
                 records.append(record)
@@ -4390,27 +4791,20 @@ class CrawlerApp:
             if '/explore/' in current_url:
                 url_note_id = current_url.split('/explore/')[-1].split('?')[0].split('/')[0]
             
-            # 方法1: 使用JavaScript直接获取当前弹窗的标题（最可靠）
+            # 方法1: JavaScript获取标题。
+            # 顺序必须是 __INITIAL_STATE__ 优先、弹窗DOM兜底（核心不变量#1）。
+            # 曾因DOM优先 + [class*="title"] 宽泛匹配，把弹窗里"猜你想搜"
+            # 推荐组件的文本当成了笔记标题。
             try:
                 js_title = page.run_js("""
                     return (() => {
-                        // 优先从弹窗容器获取标题
-                        const modal = document.querySelector('.note-detail-mask, [class*="noteContainer"], .note-container');
-                        if (modal) {
-                            const titleEl = modal.querySelector('.title, [class*="title"]');
-                            if (titleEl && titleEl.textContent.trim().length > 2) {
-                                return titleEl.textContent.trim();
-                            }
-                        }
-                        
-                        // 从 __INITIAL_STATE__ 获取当前笔记的标题
+                        // 1) __INITIAL_STATE__ + URL推导的noteId（最可靠）
                         try {
                             const state = window.__INITIAL_STATE__;
                             if (state && state.note) {
-                                // 从URL获取当前笔记ID
                                 const urlMatch = window.location.href.match(/explore\\/([a-zA-Z0-9]+)/);
                                 const noteId = urlMatch ? urlMatch[1] : state.note.currentNoteId;
-                                
+
                                 if (noteId && state.note.noteDetailMap && state.note.noteDetailMap[noteId]) {
                                     const noteData = state.note.noteDetailMap[noteId];
                                     if (noteData.note && noteData.note.title) {
@@ -4419,7 +4813,16 @@ class CrawlerApp:
                                 }
                             }
                         } catch(e) {}
-                        
+
+                        // 2) 弹窗DOM兜底：只取笔记内容区的精确标题节点，
+                        //    不用 [class*="title"]（会命中"猜你想搜"等UI组件）
+                        const modal = document.querySelector('.note-detail-mask, [class*="noteContainer"], .note-container');
+                        if (modal) {
+                            const titleEl = modal.querySelector('.note-content .title, #detail-title');
+                            if (titleEl && titleEl.textContent.trim().length > 2) {
+                                return titleEl.textContent.trim();
+                            }
+                        }
                         return '';
                     })()
                 """)
@@ -4428,6 +4831,12 @@ class CrawlerApp:
                     self.log(f"[DEBUG] JS获取标题: {title[:30]}", "INFO")
             except Exception as e:
                 self.log(f"[DEBUG] JS获取标题失败: {e}", "WARNING")
+
+            # 已知的页面UI组件文本，绝不可能是笔记标题；命中即视为无效
+            UI_TEXT_BLACKLIST = {"猜你想搜", "相关搜索", "大家都在搜", "你可能感兴趣", "热门搜索"}
+            if title.strip() in UI_TEXT_BLACKLIST:
+                self.log(f"[DEBUG] 标题命中UI组件黑名单({title.strip()})，废弃", "WARNING")
+                title = ""
             
             # 方法2: CSS选择器备用（更精确的选择器）
             if not title:
@@ -4440,7 +4849,8 @@ class CrawlerApp:
                 for sel in title_selectors:
                     try:
                         e = page.ele(sel, timeout=FAST_TIMEOUT)
-                        if e and e.text and len(e.text.strip()) > 2:
+                        if (e and e.text and len(e.text.strip()) > 2
+                                and e.text.strip() not in UI_TEXT_BLACKLIST):
                             title = e.text.strip()
                             self.log(f"[DEBUG] CSS找到标题: {title[:30]}", "INFO")
                             break
@@ -4548,23 +4958,14 @@ class CrawlerApp:
                     tags = re.findall(r'#([^\s#]+)', content)
                     data['tags'] = list(set(tags))[:20]
             
-            # 发布时间和IP地区 - 使用.date (格式如 "01-24 江西")
+            # 发布时间和IP地区 - 使用.date
+            # 实际格式多样："01-24 江西" / "4天前 辽宁" / "编辑于 4天前 四川"
+            # / "今天 12:30 上海" / "2025-12-04"。
+            # 必须从右侧切分：地区永远是最后一段且不含数字/冒号；
+            # 首切("split(' ',1)")遇到"编辑于"前缀会把时间挤进地区字段。
             if self.config.get_publish_time:
-                pub_time = ""
-                ip_region = ""
-                try:
-                    e = page.ele('css:.date', timeout=FAST_TIMEOUT)
-                    if e:
-                        full_text = (e.text or "").strip()
-                        # 分离时间和地区
-                        if " " in full_text:
-                            parts = full_text.split(" ", 1)
-                            pub_time = parts[0]
-                            ip_region = parts[1] if len(parts) > 1 else ""
-                        else:
-                            pub_time = full_text
-                except Exception:
-                    pass
+                pub_time, ip_region = self._parse_date_region(
+                    self._ele_text(page, 'css:.date', FAST_TIMEOUT))
                 data['publish_time'] = pub_time
                 data['ip_region'] = ip_region
             
@@ -5000,10 +5401,15 @@ class CrawlerApp:
             data['image_urls'] = filtered_images[:20]  # 最多保存20张
             self.log(f"  共获取到 {len(data['image_urls'])} 张图片URL", "INFO")
             
+            # 本笔记的媒体目录：图片/视频/评论图三处共用同一路径，
+            # 并写入 data['local_dir'] 落库，供预览精确定位
+            note_folder = (f"{images_dir}/note_{idx+1}_{note_id}" if note_id
+                           else f"{images_dir}/note_{idx+1}_{timestamp}")
+            data['local_dir'] = note_folder
+
             # 批量下载图片（视频类型不下载封面图）
             if self.config.download_images and data['image_urls'] and note_type != "视频":
-                # 使用note_id命名文件夹，便于后续匹配数据库
-                folder = f"{images_dir}/note_{idx+1}_{note_id}" if note_id else f"{images_dir}/note_{idx+1}_{timestamp}"
+                folder = note_folder
                 tasks = []
                 for i, url in enumerate(data['image_urls'], 1):
                     ext = '.webp' if '.webp' in url else '.jpg'
@@ -5023,7 +5429,7 @@ class CrawlerApp:
             # 下载视频
             if self.config.download_videos and video_url:
                 self.log(f"  开始下载视频...", "INFO")
-                folder = f"{images_dir}/note_{idx+1}_{note_id}" if note_id else f"{images_dir}/note_{idx+1}_{timestamp}"
+                folder = note_folder
                 os.makedirs(folder, exist_ok=True)
                 video_path = f"{folder}/video.mp4"
                 result = self.downloader.download_file(video_url, video_path, lambda: self.should_stop, min_size=10240)
@@ -5049,30 +5455,30 @@ class CrawlerApp:
                     
                     if comment_images_urls and self.config.download_images:
                         # 使用与笔记图片相同的文件夹路径
-                        note_save_folder = f"{images_dir}/note_{idx+1}_{note_id}" if note_id else f"{images_dir}/note_{idx+1}_{timestamp}"
-                        comments_dir = os.path.join(note_save_folder, 'comments')
+                        comments_dir = os.path.join(note_folder, 'comments')
                         os.makedirs(comments_dir, exist_ok=True)
                         
-                        comment_img_count = 0
+                        # 批量下载评论图片（此前调用了不存在的 download_with_session，
+                        # AttributeError 被吞掉导致评论图片从未真正下载过）
+                        comment_tasks = []
                         for i, img_url in enumerate(comment_images_urls[:20]):  # 最多20张评论图片
-                            try:
-                                ext = '.jpg'
-                                if '.png' in img_url.lower():
-                                    ext = '.png'
-                                elif '.webp' in img_url.lower():
-                                    ext = '.webp'
-                                
-                                filename = f"comment_img_{i+1}{ext}"
-                                filepath = os.path.join(comments_dir, filename)
-                                
-                                if self.downloader.download_with_session(img_url, filepath, page):
-                                    comment_img_count += 1
-                            except Exception:
-                                pass
-                        
+                            ext = '.jpg'
+                            if '.png' in img_url.lower():
+                                ext = '.png'
+                            elif '.webp' in img_url.lower():
+                                ext = '.webp'
+                            filepath = os.path.join(comments_dir, f"comment_img_{i+1}{ext}")
+                            comment_tasks.append((img_url, filepath))
+
+                        results = self.downloader.download_batch(
+                            comment_tasks, stop_flag=lambda: self.should_stop)
+                        comment_img_count = sum(1 for r in results.values() if r)
+
                         if comment_img_count > 0:
                             self.log(f"  评论图片: {comment_img_count}张 (保存到 comments 文件夹)", "INFO")
                             data['comment_images_count'] = comment_img_count
+                        elif comment_tasks:
+                            self.log(f"  评论图片下载失败 ({len(comment_tasks)}张)", "WARNING")
             
             return data
             
@@ -5302,10 +5708,13 @@ class CrawlerApp:
         
         import re
         
-        # 1. URL关键词检测 - 扩展关键词列表
+        # 1. URL关键词检测
+        # 注意：'spectrum' 不是表情特征！实测 12% 的真实笔记图片位于
+        # sns-webpic-qc.xhscdn.com/.../spectrum/ 路径下（Live图静态版），
+        # 曾因此被误删，切勿加回
         emoji_keywords = [
             'emoji', 'sticker', 'emote', 'emoticon', 'expression',
-            'spectrum', 'meme', 'gif', 'animated', 
+            'meme', 'gif', 'animated',
             '/e/', '/em/', '/stk/', '/stick/'
         ]
         for kw in emoji_keywords:
@@ -5331,20 +5740,20 @@ class CrawlerApp:
                 except:
                     pass
         
-        # 3. 检测表情包CDN特征
+        # 3. 检测表情包CDN特征（spectrum 相关模式已移除，见上方注释）
         emoji_cdn_patterns = [
             'fe-static',
             '/emoji/',
-            'spectrum.xhscdn',
             'sticker.xhscdn',
-            'ci.xiaohongshu.com/spectrum',
         ]
         for pattern in emoji_cdn_patterns:
             if pattern in url_lower:
                 return True
-        
+
         # 4. 检测非常短的图片URL（通常是内联表情）
-        if len(url) < 100:
+        # 实测合法笔记图片URL均 >= 150 字符；阈值从100收紧到60，
+        # 避免误杀短链接的真实图片
+        if len(url) < 60:
             return True
         
         # 5. 检测URL中没有常规图片路径特征（正常笔记图片通常有特定路径）
@@ -5389,6 +5798,50 @@ class CrawlerApp:
             pass
         return False
     
+    def _note_passes_filter(self, note_data: Dict) -> bool:
+        """主页面"筛选条件"（点赞区间 / 笔记类型）是否放行该笔记"""
+        try:
+            likes = int(note_data.get('like_count', 0) or 0)
+        except (TypeError, ValueError):
+            likes = 0
+        if likes < self.config.min_likes or likes > self.config.max_likes:
+            return False
+        type_filter = self.config.note_type_filter
+        if type_filter and type_filter != "全部":
+            if note_data.get('note_type', '图文') != type_filter:
+                return False
+        return True
+
+    @staticmethod
+    def _ele_text(page, selector: str, timeout: float) -> str:
+        """安全读取元素文本，找不到返回空串"""
+        try:
+            e = page.ele(selector, timeout=timeout)
+            return (e.text or "").strip() if e else ""
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _parse_date_region(full_text: str) -> Tuple[str, str]:
+        """把 .date 文本拆成 (发布时间, IP地区)。
+
+        样例："01-24 江西" / "4天前 辽宁" / "编辑于 4天前 四川" /
+        "今天 12:30 上海" / "2025-12-04"（无地区）。
+        规则：剥掉"编辑于/发布于"前缀后，从右取最后一段作为地区，
+        但该段含数字或冒号时视为时间的一部分（如 "今天 12:30"）。
+        """
+        text = (full_text or "").strip()
+        for prefix in ("编辑于", "发布于"):
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+        if not text:
+            return "", ""
+        if " " in text:
+            head, tail = text.rsplit(" ", 1)
+            if tail and not any(c.isdigit() for c in tail) and ":" not in tail:
+                return head.strip(), tail.strip()
+        return text, ""
+
     def _parse_num(self, text) -> int:
         """解析数字（支持万/k单位）"""
         if not text:
@@ -5462,31 +5915,8 @@ class CrawlerApp:
         # 转换为DataFrame
         df = pd.DataFrame(processed_data)
         
-        # 英文列名到中文列名的映射
-        column_mapping = {
-            'keyword': '搜索关键词',
-            'title': '标题',
-            'author': '作者',
-            'content': '正文内容',
-            'tags': '标签',
-            'publish_time': '发布时间',
-            'ip_region': 'IP地区',
-            'like_count': '点赞数',
-            'collect_count': '收藏数',
-            'comment_count': '评论数',
-            'comments': '评论内容',
-            'note_type': '笔记类型',
-            'note_link': '笔记链接',
-            'note_id': '笔记ID',
-            'video_url': '视频链接',
-            'image_urls': '图片链接',
-            'image_count': '图片数量',
-            'local_images': '本地图片路径',
-            'local_video': '本地视频路径',
-        }
-        
-        # 重命名列
-        df = df.rename(columns=column_mapping)
+        # 重命名列（映射定义见模块级 EXPORT_COLUMN_MAPPING）
+        df = df.rename(columns=EXPORT_COLUMN_MAPPING)
         
         ext = self.config.export_format
         filename = f"data/搜索结果_{keyword}_{timestamp}.{ext}"
@@ -5518,21 +5948,43 @@ class CrawlerApp:
         return filename
     
     # === 分析功能 ===
+    def _get_analysis_records(self):
+        """分析数据源：优先内存中本次爬取，否则回退数据库（不再依赖易损的导出文件）"""
+        if self.all_notes_data:
+            return list(self.all_notes_data)
+        return self._load_notes_from_db()
+
+    def _load_notes_from_db(self):
+        """从 SQLite 读取全部笔记，JSON 字段反序列化为 Python 对象"""
+        records = []
+        try:
+            conn = sqlite3.connect(self.config.db_path)
+            conn.row_factory = sqlite3.Row
+            for row in conn.execute("SELECT * FROM notes ORDER BY crawl_time DESC"):
+                note = dict(row)
+                for col in ('tags', 'image_urls', 'comments'):
+                    try:
+                        note[col] = json.loads(note.get(col) or '[]')
+                    except (ValueError, TypeError):
+                        note[col] = []
+                records.append(note)
+            conn.close()
+        except Exception as e:
+            self.log(f"读取数据库失败: {e}", "WARNING")
+        return records
+
     def _generate_charts(self):
         """生成图表"""
         if not HAS_MATPLOTLIB:
             messagebox.showwarning("提示", "需要安装matplotlib库")
             return
-        
-        if not self.all_notes_data:
-            # 从最新文件加载
-            self._load_latest_data()
-        
-        if not self.all_notes_data:
+
+        records = self._get_analysis_records()
+        if not records:
             messagebox.showinfo("提示", "没有数据可分析")
             return
-        
-        df = pd.DataFrame(self.all_notes_data)
+
+        df = pd.DataFrame(records)
         charts = DataAnalyzer.generate_charts(df, "data/charts")
         
         if charts:
@@ -5547,14 +5999,12 @@ class CrawlerApp:
             messagebox.showwarning("提示", "需要安装wordcloud和jieba库")
             return
         
-        if not self.all_notes_data:
-            self._load_latest_data()
-        
-        if not self.all_notes_data:
+        records = self._get_analysis_records()
+        if not records:
             messagebox.showinfo("提示", "没有数据可分析")
             return
-        
-        texts = [d.get('title', '') + ' ' + d.get('content', '') for d in self.all_notes_data]
+
+        texts = [d.get('title', '') + ' ' + d.get('content', '') for d in records]
         output = "data/wordcloud.png"
         
         result = DataAnalyzer.generate_wordcloud(texts, output)
@@ -5570,22 +6020,20 @@ class CrawlerApp:
             messagebox.showwarning("提示", "需要安装python-docx库")
             return
         
-        if not self.all_notes_data:
-            self._load_latest_data()
-        
-        if not self.all_notes_data:
+        records = self._get_analysis_records()
+        if not records:
             messagebox.showinfo("提示", "没有数据可分析")
             return
-        
-        df = pd.DataFrame(self.all_notes_data)
+
+        df = pd.DataFrame(records)
         stats = DataAnalyzer.generate_stats(df)
-        
+
         # 先生成图表
         charts = []
         if HAS_MATPLOTLIB:
             charts = DataAnalyzer.generate_charts(df, "data/charts")
-        
-        keyword = self.all_notes_data[0].get('keyword', '未知') if self.all_notes_data else '未知'
+
+        keyword = records[0].get('keyword', '未知') or '未知'
         output = f"data/分析报告_{keyword}_{int(time.time())}.docx"
         
         result = DataAnalyzer.generate_report(df, stats, charts, output, keyword)
@@ -5594,24 +6042,6 @@ class CrawlerApp:
             os.startfile(output)
         else:
             messagebox.showwarning("提示", "报告生成失败")
-    
-    def _load_latest_data(self):
-        """加载最新数据文件"""
-        if not os.path.exists("data"):
-            return
-        
-        files = [f for f in os.listdir("data") if f.startswith("搜索结果_") and f.endswith(".xlsx")]
-        if not files:
-            return
-        
-        files.sort(key=lambda x: os.path.getmtime(os.path.join("data", x)), reverse=True)
-        latest = os.path.join("data", files[0])
-        
-        try:
-            df = pd.read_excel(latest)
-            self.all_notes_data = df.to_dict('records')
-        except:
-            pass
     
     def _merge_data(self):
         """合并所有数据"""
@@ -5623,9 +6053,10 @@ class CrawlerApp:
         for f in os.listdir("data"):
             if f.startswith("搜索结果_") and f.endswith(".xlsx"):
                 try:
-                    df = pd.read_excel(os.path.join("data", f))
+                    # 归一化列名，否则中文列头下 note_link 去重永不生效
+                    df = normalize_df_columns(pd.read_excel(os.path.join("data", f)))
                     all_dfs.append(df)
-                except:
+                except Exception:
                     continue
         
         if not all_dfs:
@@ -5637,7 +6068,8 @@ class CrawlerApp:
             merged = merged.drop_duplicates(subset=['note_link'])
         
         output = f"data/合并数据_{int(time.time())}.xlsx"
-        merged.to_excel(output, index=False)
+        # 落盘时恢复中文列头，与"搜索结果_*"导出格式保持一致
+        merged.rename(columns=EXPORT_COLUMN_MAPPING).to_excel(output, index=False)
         
         messagebox.showinfo("完成", f"已合并 {len(merged)} 条数据\n保存到: {output}")
     
@@ -5668,9 +6100,10 @@ class CrawlerApp:
                     df = pd.read_csv(path)
                 else:
                     df = pd.read_json(path)
-                
+                df = normalize_df_columns(df)
+
                 notes = len(df)
-                images = df['image_count'].sum() if 'image_count' in df.columns else 0
+                images = int(df['image_count'].sum()) if 'image_count' in df.columns else 0
                 
                 self.history_tree.insert("", tk.END, values=(time_str, keyword, notes, images, f))
             except:
@@ -5717,14 +6150,17 @@ class CrawlerApp:
         )
         if path:
             self.db_path_var.set(path)
+            self.log("数据库路径已修改，重启程序后生效", "WARNING")
     
     def _on_closing(self):
         """程序退出时的处理"""
-        # 只保存窗口位置，大小固定
+        # 保存窗口位置与大小
         try:
             self.config.window_x = max(0, self.root.winfo_x())
             self.config.window_y = max(0, self.root.winfo_y())
-        except:
+            self.config.window_width = self.root.winfo_width()
+            self.config.window_height = self.root.winfo_height()
+        except tk.TclError:
             pass
         
         # 保存当前配置
