@@ -1,6 +1,15 @@
 # 小红书爬虫工具
 
+![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white) ![Playwright](https://img.shields.io/badge/Playwright-2EAD33?logo=playwright&logoColor=white) ![License](https://img.shields.io/badge/License-MIT-green)
+
+
 一个功能完整的小红书笔记爬虫工具，支持关键词搜索、主页推荐、博主主页爬取，具有图形化界面。
+
+
+
+### 应用界面
+
+![首页推荐流](images/app_feed.png)
 
 ## 功能特点
 
@@ -144,6 +153,14 @@ pip install matplotlib wordcloud jieba python-docx
 - 修复数据缓存问题（使用URL中的noteId）
 - 添加Live图过滤（只保留一张）
 - 优化GUI界面（斑马纹、排序、筛选、统计卡片）
+
+
+
+### 笔记详情与数据采集
+
+自动采集笔记正文、图片、评论等数据，按目录结构保存。
+
+![笔记详情](images/note_detail.png)
 
 ## License
 
