@@ -4156,7 +4156,6 @@ class CrawlerApp:
         n_comments = note.get('comment_count', 0) or len(comments)
         pub = note.get('publish_time') or ''
         ipr = note.get('ip_region') or ''
-        ntype = note.get('note_type') or '图文'
 
         sw = self.root.winfo_screenwidth()
         sh = self.root.winfo_screenheight()
@@ -4175,24 +4174,13 @@ class CrawlerApp:
         win.title(f"笔记详情 · {title[:40]}")
         win.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
         win.minsize(900, 560)
-        win.configure(fg_color=C['bg'])
+        # 深色底模拟小红书弹窗后的暗遮罩，中央浮一张一体白卡
+        win.configure(fg_color="#161616")
         try:
             win.transient(self.root)
             win.grab_set()
         except Exception:
             pass
-
-        top = ctk.CTkFrame(win, fg_color=C['card'], corner_radius=0, height=52)
-        top.pack(fill=tk.X)
-        top.pack_propagate(False)
-        # 品牌色竖条作为标题的视觉锚点
-        ctk.CTkFrame(top, fg_color=C['brand'], corner_radius=2,
-                     width=4, height=20).pack(side=tk.LEFT, padx=(SP_MD, SP_SM), pady=16)
-        ctk.CTkLabel(top, text="笔记详情", font=UI_FONT(FS_TITLE, bold=True),
-                     text_color=C['text']).pack(side=tk.LEFT)
-        ctk.CTkLabel(top, text=ntype, font=UI_FONT(FS_SMALL),
-                     text_color=C['brand'], fg_color=C['brand_soft'],
-                     corner_radius=8, padx=10, height=24).pack(side=tk.LEFT, padx=SP_SM)
 
         def _close_card(_e=None):
             try:
@@ -4205,28 +4193,45 @@ class CrawlerApp:
             except Exception:
                 pass
 
-        ctk.CTkButton(top, text="✕", width=32, height=32, corner_radius=16,
-                      command=_close_card, fg_color=C['card_alt'],
-                      hover_color=C['brand_soft'], text_color=C['text_sub'],
-                      font=UI_FONT(FS_BASE)).pack(side=tk.RIGHT, padx=SP_MD, pady=10)
-        # 顶栏与内容之间的分隔线，收住 52px 白条的下缘
-        ctk.CTkFrame(win, fg_color=C['border'], height=1).pack(fill=tk.X)
-
-        body = ctk.CTkFrame(win, fg_color="transparent")
-        body.pack(fill=tk.BOTH, expand=True, padx=SP_MD, pady=SP_MD)
+        # 一体式圆角白卡：左媒体右信息无缝相接、四周对称留边。
+        # 原先"内部标题栏 + 左右两张独立圆角卡 + 中缝"工具感重，
+        # 小红书原版就是暗遮罩上一张单卡、卡内两分区。
+        # 关闭入口 = 系统标题栏 ✕ + 媒体区左上角悬浮圆钮 + Esc。
+        body = ctk.CTkFrame(win, fg_color=C['card'], corner_radius=16)
+        body.pack(fill=tk.BOTH, expand=True, padx=26, pady=22)
         body.grid_columnconfigure(0, weight=5, uniform="card")
         body.grid_columnconfigure(1, weight=4, uniform="card")
         body.grid_rowconfigure(0, weight=1)
 
-        # 左：媒体（小红书式——图片用自身模糊放大版填充留白，
-        # 而非黑边；悬浮圆形翻页箭头 + 底部圆点指示）
-        left = ctk.CTkFrame(body, fg_color=C['card'], corner_radius=CARD_RADIUS)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, SP_SM))
+        # 左：媒体（图片用自身模糊放大版填充留白，而非黑边；
+        # 悬浮圆钮 关闭/‹/› + 底部圆点指示）
+        left = ctk.CTkFrame(body, fg_color=C['card'], corner_radius=0)
+        left.grid(row=0, column=0, sticky="nsew", padx=(2, 0), pady=2)
         left.grid_propagate(False)
-        canvas = tk.Canvas(left, bg=C['card'], highlightthickness=0, bd=0)
+        # 画布底 = 窗口遮罩色：圆角磨掉的角落透出它，与卡片外无缝衔接
+        canvas = tk.Canvas(left, bg="#161616", highlightthickness=0, bd=0)
         canvas.pack(fill=tk.BOTH, expand=True)
         idx_var = tk.IntVar(value=0)
         photo_hold = []  # 同时持有 bg + fg 的 PhotoImage 引用，防 GC
+        MEDIA_R = 14  # 与外层卡片 16px 圆角对齐（内缩 2px 边距）
+
+        def _round_left(im, radius=MEDIA_R):
+            """把图片左上/左下两角磨圆，右侧贴着信息栏保持直角。
+
+            tk.Canvas 无法被 CTkFrame 的圆角裁剪——画布方角会盖住卡片
+            圆角、在左上/左下露出白色台阶。只能反过来让画布**内容**带
+            圆角，缺口处透出与窗口遮罩同色的画布底。
+            """
+            mask = Image.new("L", im.size, 255)
+            dr = ImageDraw.Draw(mask)
+            h, d = im.height, radius * 2
+            dr.rectangle((0, 0, radius, radius), fill=0)
+            dr.pieslice((0, 0, d, d), 180, 270, fill=255)
+            dr.rectangle((0, h - radius, radius, h), fill=0)
+            dr.pieslice((0, h - d, d, h), 90, 180, fill=255)
+            out = Image.new("RGBA", im.size, (0, 0, 0, 0))
+            out.paste(im, (0, 0), mask)
+            return out
 
         def show_slot(i=None):
             canvas.delete("all")
@@ -4237,6 +4242,11 @@ class CrawlerApp:
                 cw = 520
             if ch <= 1:
                 ch = 640
+            # 白色圆角底：无图/加载失败时兜底，有图时被模糊背景盖住
+            backdrop = ImageTk.PhotoImage(
+                _round_left(Image.new("RGB", (cw, ch), C['card'])))
+            photo_hold.append(backdrop)
+            canvas.create_image(cw // 2, ch // 2, image=backdrop)
             if not slots:
                 canvas.create_text(cw // 2, ch // 2, text="暂无媒体",
                                    fill=C['text_faint'], font=UI_FONT(FS_TITLE))
@@ -4261,7 +4271,7 @@ class CrawlerApp:
                     bg = bg.crop((lft, top, lft + cw, top + ch))
                     bg = bg.filter(ImageFilter.GaussianBlur(30))
                     bg = ImageEnhance.Brightness(bg).enhance(0.78)
-                    bgph = ImageTk.PhotoImage(bg)
+                    bgph = ImageTk.PhotoImage(_round_left(bg))
                     photo_hold.append(bgph)
                     canvas.create_image(cw // 2, ch // 2, image=bgph)
                     # 前景：等比缩到 fit（留边），加圆角
@@ -4350,13 +4360,37 @@ class CrawlerApp:
                       for d in ('prev', 'next') for s in ('normal', 'hover', 'disabled')}
         arrow_state = {'prev': 'normal', 'next': 'normal'}
 
+        X_D = 36  # 关闭圆钮直径（小红书式：媒体图左上角深色半透明圆+白✕）
+
+        def _x_img(style):
+            fill_a = {'normal': 140, 'hover': 205}[style]
+            S = X_D * AR_SS
+            im = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+            dr = ImageDraw.Draw(im)
+            dr.ellipse((0, 0, S - 1, S - 1), fill=(20, 20, 20, fill_a))
+            # Lucide x：两条对角线 (6,6)-(18,18) / (18,6)-(6,18)，24 视窗
+            k = S / 24.0
+            w = max(2, round(2.0 * AR_SS))
+            r = w / 2 - 0.5
+            for x1, y1, x2, y2 in ((6, 6, 18, 18), (18, 6, 6, 18)):
+                dr.line((x1 * k, y1 * k, x2 * k, y2 * k), fill="#FFFFFF", width=w)
+                for x, y in ((x1 * k, y1 * k), (x2 * k, y2 * k)):
+                    dr.ellipse((x - r, y - r, x + r, y + r), fill="#FFFFFF")
+            im = im.resize((X_D, X_D), Image.Resampling.LANCZOS)
+            return ImageTk.PhotoImage(im)
+
+        x_imgs = {s: _x_img(s) for s in ('normal', 'hover')}
+
         def _sync_arrows(i):
-            """按当前页重画两枚箭头（show_slot 每次 delete all 后调用）。"""
+            """按当前页重画悬浮控件（show_slot 每次 delete all 后调用）。"""
             canvas.delete("nav")
-            if len(slots) <= 1:
-                return
             cw = canvas.winfo_width() or 520
             ch = canvas.winfo_height() or 640
+            # 关闭钮常驻（单图也要能关）
+            canvas.create_image(18 + X_D // 2, 18 + X_D // 2,
+                                image=x_imgs['normal'], tags=("nav", "nav_close"))
+            if len(slots) <= 1:
+                return
             for d, x, enabled in (('prev', 24 + AR_D // 2, i > 0),
                                   ('next', cw - 24 - AR_D // 2, i < len(slots) - 1)):
                 arrow_state[d] = 'normal' if enabled else 'disabled'
@@ -4382,6 +4416,34 @@ class CrawlerApp:
             canvas.tag_bind(f"nav_{_d}", "<Leave>", lambda e, d=_d: _arrow_leave(d))
             canvas.tag_bind(f"nav_{_d}", "<Button-1>", lambda e, d=_d: _arrow_click(d))
 
+        def _close_enter(_e=None):
+            canvas.itemconfig("nav_close", image=x_imgs['hover'])
+            canvas.configure(cursor="hand2")
+
+        def _close_leave(_e=None):
+            canvas.itemconfig("nav_close", image=x_imgs['normal'])
+            canvas.configure(cursor="")
+
+        canvas.tag_bind("nav_close", "<Enter>", _close_enter)
+        canvas.tag_bind("nav_close", "<Leave>", _close_leave)
+        # return "break" 阻断 canvas 全局点击，避免关闭时误触视频播放
+        canvas.tag_bind("nav_close", "<Button-1>",
+                        lambda e: (_close_card(), "break")[1])
+
+        def _close_enter(_e=None):
+            canvas.itemconfig("nav_close", image=x_imgs['hover'])
+            canvas.configure(cursor="hand2")
+
+        def _close_leave(_e=None):
+            canvas.itemconfig("nav_close", image=x_imgs['normal'])
+            canvas.configure(cursor="")
+
+        canvas.tag_bind("nav_close", "<Enter>", _close_enter)
+        canvas.tag_bind("nav_close", "<Leave>", _close_leave)
+        # return "break" 阻断 canvas 全局点击，否则视频笔记会被误播放
+        canvas.tag_bind("nav_close", "<Button-1>",
+                        lambda e: (_close_card(), "break")[1])
+
         canvas.bind("<Button-1>", on_canvas_click)
         canvas.bind("<Configure>", lambda e: show_slot())
         # 键盘操作：←/→ 翻页，Esc 关闭
@@ -4390,9 +4452,9 @@ class CrawlerApp:
         win.bind("<Escape>", lambda e: _close_card())
 
         # 右：信息 + 评论。顶部作者条固定，底部互动栏固定，中间评论可滚动
-        right = ctk.CTkFrame(body, fg_color=C['card'], corner_radius=CARD_RADIUS,
-                             border_width=1, border_color=C['border'])
-        right.grid(row=0, column=1, sticky="nsew")
+        # （transparent 融入一体白卡，不再自带圆角描边）
+        right = ctk.CTkFrame(body, fg_color="transparent", corner_radius=0)
+        right.grid(row=0, column=1, sticky="nsew", padx=(0, 2), pady=2)
         wrap_w = max(320, win_w // 2 - 80)
 
         # —— 顶部：作者条（头像 + 昵称 + 关注按钮），下带分隔线 ——
@@ -4407,12 +4469,9 @@ class CrawlerApp:
                      font=UI_FONT(FS_TITLE, bold=True)).pack(side=tk.LEFT, padx=(0, SP_SM))
         name_col = ctk.CTkFrame(author_row, fg_color="transparent")
         name_col.pack(side=tk.LEFT, fill=tk.X, expand=True, anchor="w")
+        # 小红书作者条只有昵称一行（发布时间/属地在正文尾部，见 meta_row）
         ctk.CTkLabel(name_col, text=author, font=UI_FONT(FS_BASE, bold=True),
                      text_color=C['text'], anchor="w").pack(fill=tk.X)
-        meta_bits = " · ".join(x for x in (pub, ipr) if x)
-        if meta_bits:
-            ctk.CTkLabel(name_col, text=meta_bits, font=UI_FONT(FS_SMALL - 1),
-                         text_color=C['text_faint'], anchor="w").pack(fill=tk.X)
         # 关注按钮：纯视觉对齐小红书（本地数据无法真正关注，点击提示）
         ctk.CTkButton(author_row, text="关注", width=64, height=30, corner_radius=15,
                       fg_color=C['brand'], hover_color=C['brand_hover'],
@@ -4495,26 +4554,31 @@ class CrawlerApp:
                          text_color=C['info'], anchor="w", justify="left",
                          wraplength=wrap_w).pack(fill=tk.X, pady=(0, SP_SM))
 
-        # 操作按钮（本应用工具，非小红书原生；压成一排次要小按钮）
-        act = ctk.CTkFrame(scroll, fg_color="transparent")
-        act.pack(fill=tk.X, pady=(SP_XS, SP_MD))
-        act_btns = [("打开原文", self._open_note_link, True),
-                    ("打开文件夹", self._open_images_folder, False)]
+        # 发布时间/属地行（小红书正文尾部的"编辑于"形态），右侧挂本应用
+        # 的工具入口——灰字链接 hover 变红，不再是三颗大按钮抢戏
+        meta_row = ctk.CTkFrame(scroll, fg_color="transparent")
+        meta_row.pack(fill=tk.X, pady=(SP_XS, SP_MD))
+        stamp = "  ".join(x for x in (pub, ipr) if x)
+        if stamp:
+            ctk.CTkLabel(meta_row, text=stamp, font=UI_FONT(FS_SMALL - 1),
+                         text_color=C['text_faint'], anchor="w").pack(side=tk.LEFT)
+
+        # 注意 side=RIGHT 是右→左依次排布：间距必须加在**右**侧
+        # （padx 左值只会把它推离更左的邻居，两个链接仍会贴死）
+        def _tool_link(text, cmd, gap=SP_MD):
+            lb = ctk.CTkLabel(meta_row, text=text, font=UI_FONT(FS_SMALL - 1),
+                              text_color=C['text_sub'], cursor="hand2")
+            lb.pack(side=tk.RIGHT, padx=(0, gap))
+            lb.bind("<Button-1>", lambda e: cmd())
+            lb.bind("<Enter>", lambda e: lb.configure(text_color=C['brand']))
+            lb.bind("<Leave>", lambda e: lb.configure(text_color=C['text_sub']))
+            return lb
+
+        _tool_link("打开原文", self._open_note_link, gap=0)  # 最右，不留外边距
+        _tool_link("打开文件夹", self._open_images_folder)
         if video:
-            act_btns.append(("播放视频",
-                             lambda p=video: os.startfile(p) if os.path.isfile(p) else None,
-                             False))
-        for txt, cmd, primary in act_btns:
-            if primary:
-                ctk.CTkButton(act, text=txt, width=88, height=28, corner_radius=14,
-                              command=cmd, font=UI_FONT(FS_SMALL)).pack(
-                    side=tk.LEFT, padx=(0, SP_XS))
-            else:
-                ctk.CTkButton(act, text=txt, width=94, height=28, corner_radius=14,
-                              fg_color=C['card_alt'], hover_color=C['brand_soft'],
-                              text_color=C['text_sub'], border_width=1,
-                              border_color=C['border'], command=cmd,
-                              font=UI_FONT(FS_SMALL)).pack(side=tk.LEFT, padx=(0, SP_XS))
+            _tool_link("播放视频",
+                       lambda p=video: os.startfile(p) if os.path.isfile(p) else None)
 
         ctk.CTkLabel(scroll, text=f"共 {n_comments} 条评论  ·  已抓取 {len(comments)} 条",
                      font=UI_FONT(FS_SMALL), text_color=C['text_sub'],
