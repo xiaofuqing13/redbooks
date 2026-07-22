@@ -1,15 +1,21 @@
 # 小红书爬虫工具
 
-![Python](https://img.shields.io/badge/Python-3776AB?logo=python&logoColor=white) ![Playwright](https://img.shields.io/badge/Playwright-2EAD33?logo=playwright&logoColor=white) ![License](https://img.shields.io/badge/License-MIT-green)
+![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white) ![DrissionPage](https://img.shields.io/badge/DrissionPage-Chromium%20automation-2EAD33) ![CustomTkinter](https://img.shields.io/badge/UI-CustomTkinter-FF2442) ![License](https://img.shields.io/badge/License-MIT-green)
 
 
 一个功能完整的小红书笔记爬虫工具，支持关键词搜索、主页推荐、博主主页爬取，具有图形化界面。
 
+## 界面预览
 
+> 以下均为应用真实运行截图（v5.4）。
 
-### 应用界面
+| 搜索爬取 | 爬取结果 |
+|:---:|:---:|
+| ![搜索爬取](docs/screenshots/main.png) | ![爬取结果](docs/screenshots/results.png) |
 
-![首页推荐流](images/app_feed.png)
+| 笔记详情卡片 | 数据分析 |
+|:---:|:---:|
+| ![笔记详情卡片](docs/screenshots/note_card.png) | ![数据分析](docs/screenshots/analysis.png) |
 
 ## 功能特点
 
@@ -104,13 +110,14 @@ redbooks/
 
 ### GUI功能
 
-- 斑马纹表格（奇偶行交替颜色）
-- 类型颜色区分（图文蓝色、视频橙色）
-- 点击表头排序
-- 搜索筛选（关键词+类型）
-- 统计卡片（总计、图文数、视频数、总点赞）
+- 小红书品牌红主题（v5.4 全界面统一 CustomTkinter 渲染）
+- 结果页数据源三选一：当前爬取 / 历史数据库 / 本地批次
+- 斑马纹表格、点击表头排序、搜索筛选（标题/作者/正文/关键词四列）
+- 统计药丸（总计、图文数、视频数、总点赞）与数据分析仪表盘
 - 右键菜单（复制、打开原文、删除）
-- 图片预览（分页、评论图片蓝色边框标记）
+- 小红书式笔记详情卡片：暗遮罩一体弹窗、模糊填充轮播、悬浮翻页圆钮、
+  流式评论区、上一条/下一条翻页
+- 跨运行去重开关：重复采集同一主题时自动跳过库里已有笔记
 
 ## 配置说明
 
@@ -138,7 +145,17 @@ pip install matplotlib wordcloud jieba python-docx
 
 ## 更新日志
 
-### v5.3（本次大修）
+### v5.4
+- 全界面重做为小红书品牌红主题：设计令牌单一来源、CustomTkinter 统一渲染、
+  卡片化布局、指标化仪表盘
+- 结果页视图理顺为数据源三选一（当前爬取/历史数据库/本地批次），批次控件
+  仅在批次模式可用；合并重复的"搜索/关键词"筛选框
+- 主页一站式：快捷预设/Cookie 状态前置、停止键即时反馈、爬完自动切结果页
+- 新增跨运行去重（默认关）：库里已有的笔记直接跳过，不再重复下载
+- 笔记详情重做为小红书式一体弹窗：暗遮罩、模糊填充轮播、悬浮翻页/关闭圆钮
+  （Lucide 图标）、流式评论区、上一条/下一条翻页、ESC 关闭
+
+### v5.3（大修）
 - 修复评论图片下载（此前调用不存在的方法，100% 静默失效）
 - 接线“博主主页/热门榜单”爬取类型与“点赞区间/笔记类型”筛选（此前引擎从不读取）
 - 数据库新增 `local_dir` 列，彻底解决图片预览张冠李戴（含历史数据回填）
@@ -155,12 +172,6 @@ pip install matplotlib wordcloud jieba python-docx
 - 优化GUI界面（斑马纹、排序、筛选、统计卡片）
 
 
-
-### 笔记详情与数据采集
-
-自动采集笔记正文、图片、评论等数据，按目录结构保存。
-
-![笔记详情](images/note_detail.png)
 
 ## License
 
